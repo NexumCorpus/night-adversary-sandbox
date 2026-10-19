@@ -32,3 +32,8 @@ not false alarms.
 **Procedure.** Raw review JSON (reviews, inline comments, issue comments) is saved to `results/raw/`. At least two raw reviews are read
 by hand before any counting. The counts go in `results/score.md` per class: bot vs nex vs git. Small n is stated plainly.
 Kill rule unchanged (frozen 2026-10-11; see above).
+
+**Selection (fixed before the first case PR).** All licensed SIG/RENAME cases. For CONTROL, the first case per source repo,
+skipping mlflow/mlflow, Azure/azure-devops-cli-extension and oss-slu/SpeechTranscription, which are too large to push whole.
+That gives 21 cases: 3 SIG, 5 RENAME, 13 CONTROL. PR titles are neutral, and the case label never appears in a branch, title or commit.
+Script: `replay_bot.py` in the Night Adversary directory (plan / push / fetch).
