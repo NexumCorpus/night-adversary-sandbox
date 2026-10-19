@@ -74,7 +74,7 @@ async def control_plane() -> AsyncIterator[ControlPlane]:
         repo=GitHubRepoRef(owner="my-org", repo="my-dags"),
         action=ReusableActionRef(uses="my-org/foundry-invoke-action@v1"),
     )
-    version = compile_definition(definition, options=options)
+    version = compile_definition_v2(definition, options=options)
     await control_plane.register_dag(version)
     yield control_plane
 

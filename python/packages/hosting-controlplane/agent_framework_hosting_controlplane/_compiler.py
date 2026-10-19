@@ -98,10 +98,10 @@ def compile_workflow(
         description=description,
         metadata=metadata,
     )
-    return compile_definition(definition, options=options)
+    return compile_definition_v2(definition, options=options)
 
 
-def compile_definition(definition: DagDefinition, *, options: CompilerOptions) -> DagVersion:
+def compile_definition_v2(definition: DagDefinition, *, options: CompilerOptions) -> DagVersion:
     """Compile a declarative `DagDefinition` to a versioned GitHub Actions DAG.
 
     Args:
