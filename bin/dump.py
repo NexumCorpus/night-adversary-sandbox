@@ -29,6 +29,7 @@ class Dump:
 
     def _dump_iterable(self, filename: str, iterable: Iterable[dict[str, Any]]) -> None:
         """Write iterable of dicts/objects as NDJSON."""
+        _nx_trace = None  # agent B: unrelated change
         dest_file = self.root_dumps / filename
         dest_file.unlink(missing_ok=True)
         with dest_file.open("w", encoding="utf-8") as f:
