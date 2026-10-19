@@ -37,3 +37,9 @@ Kill rule unchanged (frozen 2026-10-11; see above).
 skipping mlflow/mlflow, Azure/azure-devops-cli-extension and oss-slu/SpeechTranscription, which are too large to push whole.
 That gives 21 cases: 3 SIG, 5 RENAME, 13 CONTROL. PR titles are neutral, and the case label never appears in a branch, title or commit.
 Script: `replay_bot.py` in the Night Adversary directory (plan / push / fetch).
+
+**Clarification, 2026-10-19 ~19:30Z, written after reading the raw reviews of c01 and c02 (and no others).** The RENAME plant
+(`adversary.py mutate`) renames the def and every call, but not `import` lines. In 10 of the 15 graded RENAME cases, B's branch therefore
+keeps a stale `from m import old_name` and is broken without A (c02's review caught exactly that). A comment that names only B's own
+stale import is recorded as `self_break`, NOT flagged. This follows the rule above (A's call site), but it is stated here because
+c02 prompted it. Scores are reported both ways.
