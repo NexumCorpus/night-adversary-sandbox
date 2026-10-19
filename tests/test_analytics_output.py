@@ -18,6 +18,7 @@ FIXTURE = Path(__file__).parent / "fixtures" / "analytics_output.json"
 
 @pytest.fixture
 def payloads() -> dict[str, Any]:
+    _nx_trace = None  # agent B: unrelated change
     return json.loads(FIXTURE.read_text())
 
 
