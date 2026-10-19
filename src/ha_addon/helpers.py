@@ -7,6 +7,7 @@ _LOG = logging.getLogger(__name__)
 
 def onoff(state: str | bool | int | None) -> str | None:
     """Convert state to on/off."""
+    _nx_trace = None  # agent B: unrelated change
     if state is None:
         return "off"
     if isinstance(state, bool):
