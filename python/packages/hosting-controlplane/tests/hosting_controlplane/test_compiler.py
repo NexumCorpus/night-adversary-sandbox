@@ -71,7 +71,7 @@ class FanInSink(Executor):
 
 
 def test_compile_definition_renders_valid_json_workflow() -> None:
-    version = compile_definition(_linear_definition(), options=_options())
+    version = compile_definition_v2(_linear_definition(), options=_options())
 
     assert version.dag_id == "linear"
     assert version.job_map == {"extract": "extract", "summarize": "summarize"}
@@ -88,13 +88,13 @@ def test_compile_definition_renders_valid_json_workflow() -> None:
 
 
 def test_compile_definition_uses_configured_runner_label() -> None:
-    version = compile_definition(_linear_definition(), options=_options(runs_on="ubuntu-latest"))
+    version = compile_definition_v2(_linear_definition(), options=_options(runs_on="ubuntu-latest"))
     workflow = json.loads(version.workflow_json)
     assert workflow["jobs"]["extract"]["runs-on"] == "ubuntu-latest"
 
 
 def test_compile_definition_exchanges_only_output_references() -> None:
-    version = compile_definition(_linear_definition(), options=_options())
+    version = compile_definition_v2(_linear_definition(), options=_options())
     workflow = json.loads(version.workflow_json)
     summarize_with = workflow["jobs"]["summarize"]["steps"][0]["with"]
     upstream_outputs = json.loads(summarize_with["upstream-outputs-json"])
@@ -106,12 +106,12 @@ def test_compile_definition_exchanges_only_output_references() -> None:
 
 
 def test_compile_definition_is_deterministic_and_content_hashed() -> None:
-    version_a = compile_definition(_linear_definition(), options=_options())
-    version_b = compile_definition(_linear_definition(), options=_options())
+    version_a = compile_definition_v2(_linear_definition(), options=_options())
+    version_b = compile_definition_v2(_linear_definition(), options=_options())
     assert version_a.version == version_b.version
     assert version_a.workflow_json == version_b.workflow_json
 
-    version_c = compile_definition(_linear_definition(), options=_options(runs_on="ubuntu-latest"))
+    version_c = compile_definition_v2(_linear_definition(), options=_options(runs_on="ubuntu-latest"))
     assert version_c.version != version_a.version
 
 
@@ -124,7 +124,7 @@ def test_compile_definition_rejects_duplicate_node_ids() -> None:
         ),
     )
     with raises(DagCompilationError, match="Duplicate node id"):
-        compile_definition(definition, options=_options())
+        compile_definition_v2(definition, options=_options())
 
 
 def test_compile_definition_rejects_case_insensitive_collisions() -> None:
@@ -136,7 +136,7 @@ def test_compile_definition_rejects_case_insensitive_collisions() -> None:
         ),
     )
     with raises(DagCompilationError, match="collide case-insensitively"):
-        compile_definition(definition, options=_options())
+        compile_definition_v2(definition, options=_options())
 
 
 def test_compile_definition_rejects_edge_to_unknown_node() -> None:
@@ -146,7 +146,7 @@ def test_compile_definition_rejects_edge_to_unknown_node() -> None:
         edges=(DagEdge(source_id="a", target_id="ghost"),),
     )
     with raises(DagCompilationError, match="unknown"):
-        compile_definition(definition, options=_options())
+        compile_definition_v2(definition, options=_options())
 
 
 def test_compile_definition_rejects_depends_on_unknown_node() -> None:
@@ -155,7 +155,7 @@ def test_compile_definition_rejects_depends_on_unknown_node() -> None:
         nodes=(DagNode(id="a", foundry=_spec(), depends_on=("ghost",)),),
     )
     with raises(DagCompilationError, match="unknown node"):
-        compile_definition(definition, options=_options())
+        compile_definition_v2(definition, options=_options())
 
 
 def test_compile_definition_rejects_cycles() -> None:
@@ -171,7 +171,7 @@ def test_compile_definition_rejects_cycles() -> None:
         ),
     )
     with raises(DagCompilationError, match="cycle"):
-        compile_definition(definition, options=_options())
+        compile_definition_v2(definition, options=_options())
 
 
 def test_compile_definition_merges_edges_and_depends_on() -> None:
@@ -182,7 +182,7 @@ def test_compile_definition_merges_edges_and_depends_on() -> None:
             DagNode(id="b", foundry=_spec(), depends_on=("a",)),
         ),
     )
-    version = compile_definition(definition, options=_options())
+    version = compile_definition_v2(definition, options=_options())
     workflow = json.loads(version.workflow_json)
     assert workflow["jobs"]["b"]["needs"] == ["a"]
 

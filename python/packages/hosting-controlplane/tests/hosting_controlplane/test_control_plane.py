@@ -98,7 +98,7 @@ async def _make_control_plane(
         github_client=github_client,  # type: ignore[arg-type]
         webhook_secret=webhook_secret,
     )
-    version = compile_definition(_definition(), options=_options())
+    version = compile_definition_v2(_definition(), options=_options())
     await control_plane.register_dag(version)
     return control_plane, github_client
 

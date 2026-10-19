@@ -28,7 +28,7 @@ def _version(dag_id: str = "report", agent_id: str = "agent-a"):
         dag_id=dag_id,
         nodes=(DagNode(id="a", foundry=FoundryNodeSpec(agent_id=agent_id)),),
     )
-    return compile_definition(definition, options=_options())
+    return compile_definition_v2(definition, options=_options())
 
 
 async def test_register_is_idempotent_for_identical_content() -> None:
