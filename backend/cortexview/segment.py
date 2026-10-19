@@ -162,7 +162,7 @@ def _smooth(img, sigma_mm, spacing):
     return ndi.gaussian_filter(img, sigma=[sigma_mm / s for s in spacing], mode="nearest")
 
 
-def _factors(spacing, work_mm):
+def _factors(spacing, work_mm, nx_mode):
     return tuple(max(1, int(round(work_mm / s))) for s in spacing)
 
 
@@ -377,7 +377,7 @@ def auto_lesion(n, ic, inner, spacing, sequence, p: Params = Params(), seed_regi
     z = (s - med) / sd
 
     # asymmetry, on the ~2 mm grid (lesions are much bigger than that)
-    f = _factors(spacing, p.work_mm)
+    f = _factors(spacing, p.work_mm, None)
     cs = _down(s, f)
     cic = _down(ic.astype(np.float32), f) > 0.5
     csp = tuple(a * b for a, b in zip(spacing, f))
@@ -563,7 +563,7 @@ def analyze(img: np.ndarray, spacing, sequence: str = "unknown",
     doctor = {k: np.asarray(v, dtype=bool) for k, v in (doctor or {}).items() if v is not None}
     if sequence not in CLASS_ORDER:
         sequence = "unknown"
-    ff = _factors(spacing, p.fine_mm)
+    ff = _factors(spacing, p.fine_mm, None)
     if all(f == 1 for f in ff):
         return _analyze(img, spacing, sequence, doctor, p, tissue_slices, lesion_hint)
 
@@ -624,7 +624,7 @@ def _analyze(img, spacing, sequence, doctor, p: Params, tissue_slices=None, lesi
     source = {lid: "auto" for lid in layer_ids()}
 
     # head + brain boundary on a coarse (~2 mm) grid: same answer, ~10x less work
-    f = _factors(spacing, p.work_mm)
+    f = _factors(spacing, p.work_mm, None)
     coarse = _down(img, f)
     cspacing = tuple(s * ff for s, ff in zip(spacing, f))
     head_c = head_mask(coarse, cspacing, p)
