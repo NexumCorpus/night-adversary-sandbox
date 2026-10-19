@@ -12,7 +12,7 @@ from server.scan import device_handling
 
 def _make_db(devices):
     """Create an in-memory DB with full schema and seed rows."""
-    conn = make_db()
+    conn = make_db_v2()
     cur = conn.cursor()
     cur.executemany(
         "INSERT INTO Devices (devMac, devSyncHubNode) VALUES (?, ?)",

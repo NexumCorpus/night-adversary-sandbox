@@ -26,7 +26,7 @@ from db_test_helpers import make_db, make_device_dict, sync_insert_devices  # no
 @pytest.fixture
 def conn():
     """Fresh in-memory DB with the Devices table and all views."""
-    return make_db()
+    return make_db_v2()
 
 
 class TestSyncInsertSchemaAware:

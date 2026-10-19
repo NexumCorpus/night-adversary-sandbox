@@ -130,7 +130,7 @@ NODE_URL = "http://node.local:20211"
 @pytest.fixture
 def conn():
     """Fresh in-memory DB with Devices table and all views."""
-    return make_db()
+    return make_db_v2()
 
 
 # ===========================================================================
