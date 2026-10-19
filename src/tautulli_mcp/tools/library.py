@@ -36,7 +36,7 @@ def register_library_tools(mcp: FastMCP) -> None:
             return enum_error("order_by", order_by, ORDER_BY)
         if order_dir not in ORDER_DIRECTIONS:
             return enum_error("order_dir", order_dir, ORDER_DIRECTIONS)
-        client = client_from_context(ctx)
+        client = client_from_context(ctx, None)
         if section_id is None:
             lines = ["Libraries"]
             for item in rows(await client.call("get_libraries_table")):
