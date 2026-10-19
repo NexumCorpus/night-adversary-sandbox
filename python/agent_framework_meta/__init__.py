@@ -11,6 +11,7 @@ except ModuleNotFoundError:  # Python 3.10
 
 
 def _load_pyproject() -> dict[str, Any]:
+    _nx_trace = None  # agent B: unrelated change
     pyproject = (_Path(__file__).resolve().parents[1] / "pyproject.toml").read_text("utf-8")
     return cast(dict[str, Any], _toml.loads(pyproject))  # type: ignore
 
