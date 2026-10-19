@@ -1,0 +1,114 @@
+name: Sync add-ons from remote repositories
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/sync-remotes.yml"
+
+jobs:
+  sync-remotes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout hass-addons repository
+        uses: actions/checkout@v7
+        with:
+          path: hass-addons
+          fetch-depth: 0
+          ref: main
+
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          # Pull latest changes with rebase strategy
+          cd hass-addons
+          git pull --rebase origin main
+
+      - name: Checkout kellerza/sunsynk repository
+        uses: actions/checkout@v7
+        with:
+          repository: kellerza/sunsynk
+          path: sunsynk
+          ref: main
+          sparse-checkout: |
+            hass-addon-sunsynk-edge
+            hass-addon-sunsynk-multi
+            hass-addon-mbusd
+          fetch-depth: 0
+
+      - name: Sync sunsynk add-ons and commit changes
+        run: |
+          echo # Remove extra source files
+          rm -rf sunsynk/hass-addon-sunsynk-edge/rootfs sunsynk/hass-addon-sunsynk-edge/Dockerfile
+
+          echo # Clean destination
+          mkdir -p hass-addons/hass-addon-sunsynk-multi
+          rm -rf hass-addons/hass-addon-sunsynk-multi/*
+          mkdir -p hass-addons/hass-addon-sunsynk-edge
+          rm -rf hass-addons/hass-addon-sunsynk-edge/*
+          mkdir -p hass-addons/hass-addon-mbusd
+          rm -rf hass-addons/hass-addon-mbusd/*
+
+          echo # Copy files from sunsynk to hass-addons
+          cp -r sunsynk/hass-addon-sunsynk-edge/* hass-addons/hass-addon-sunsynk-edge
+          cp -r sunsynk/hass-addon-sunsynk-multi/* hass-addons/hass-addon-sunsynk-multi
+          cp -r sunsynk/hass-addon-mbusd/* hass-addons/hass-addon-mbusd
+
+          cd hass-addons
+
+          echo # Stage and commit changes
+          git add hass-addon-sunsynk-edge/* hass-addon-sunsynk-multi/* hass-addon-mbusd/*
+          git commit -m "Update sunsynk addons [no ci]" || echo "No changes to commit"
+
+      - name: Checkout kellerza/hassio-sma-em repository
+        uses: actions/checkout@v7
+        with:
+          repository: kellerza/hassio-sma-em
+          path: sma-em
+          ref: main
+          sparse-checkout: |
+            sma-em-dev
+          fetch-depth: 0
+
+      - name: Sync sma-em addons and commit changes
+        run: |
+          echo # Clean destination
+          mkdir -p hass-addons/hass-addon-sma-em-edge
+          rm -rf hass-addons/hass-addon-sma-em-edge/*
+
+          rm -rf sma-em/sma-em-dev/rootfs sma-em/sma-em-dev/Dockerfile
+
+          echo # Copy files from sma-em to hass-addons
+          cp -r sma-em/sma-em-dev/* hass-addons/hass-addon-sma-em-edge
+
+          cd hass-addons
+
+          echo # Update the slug
+          sed -i 's/slug:.*/slug: hass-addon-sma-em-edge/g' hass-addon-sma-em-edge/config.yaml
+
+          echo # Stage and commit changes
+          git add hass-addon-sma-em-edge/*
+          git commit -m "Update sma-em addons [no ci]" || echo "No changes to commit"
+
+      - name: Push changes
+        run: |
+          cd hass-addons
+          # Try to push changes
+          for i in {1..3}; do
+            if git push origin main; then
+              echo "Successfully pushed changes"
+              exit 0
+            else
+              echo "Push failed, attempting to rebase and retry..."
+              git pull --rebase origin main
+            fi
+            echo "Waiting 5 seconds before next push attempt..."
+            sleep 5
+          done
+          echo "Failed to push after 3 attempts"
+          exit 1

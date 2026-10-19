@@ -1,0 +1,74 @@
+---
+name: QSUSB64 Add-on
+description: Add-on for a QwikSwitch USB
+version: "0ecab9f"
+slug: hass-addon-qsusb64
+image: ghcr.io/kellerza/hass-addon-qsusb64
+url: https://github.com/kellerza/hass-addons
+services: ["mqtt:need"]
+hassio_api: true
+init: false
+devices:
+    - /dev/bus/usb
+    - /sys/class/hidraw
+usb: true
+udev: true
+arch:
+  - aarch64
+  - amd64
+options:
+  PREFIX: "qsusb"
+  BUTTONS:
+    - NAME: "Spare"
+      BUTTONS:
+        - "@1cbd31"
+        - "@1cbd32"
+        - "@1cbd35"
+        - "@1cbd36"
+  LIGHTS:
+    - ID: "@30e270"
+      KIND: "rel"
+      NAME: "Dining"
+  SWITCHES:
+    - ID: "@30e170"
+      NAME: "Pool pump"
+  BINARY_SENSORS:
+    - ID: ""
+      NAME: ""
+  SENSORS:
+    - ID: ""
+      NAME: ""
+  IGNORE:
+    - ID: ""
+      NAME: ""
+schema:
+  PREFIX: str
+  BUTTONS:
+    - NAME: str
+      MODEL: str?
+      BUTTONS:
+        - str
+  LIGHTS:
+    - ID: str
+      KIND: str
+      NAME: str
+  SWITCHES:
+    - ID: str
+      NAME: str
+  BINARY_SENSORS:
+    - ID: str
+      KIND: str?
+      NAME: str
+  SENSORS:
+    - ID: str
+      KIND: str?
+      NAME: str
+  IGNORE:
+    - ID: str
+      KIND: str?
+      NAME: str?
+  MQTT_HOST: str?
+  MQTT_PORT: int?
+  MQTT_USERNAME: str?
+  MQTT_PASSWORD: str?
+  DEBUG: int(0,5)?

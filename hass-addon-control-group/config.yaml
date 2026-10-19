@@ -1,0 +1,35 @@
+---
+name: Control group add-on
+description: Add-on to manage and control groups of entities based on templates
+version: "0ecab9f"
+slug: hass-addon-control-group
+image: ghcr.io/kellerza/hass-addon-control-group
+url: https://github.com/kellerza/hass-addons
+services: ["mqtt:need"]
+hassio_api: true
+hassio_role: homeassistant
+homeassistant_api: true
+init: false
+#apparmor: true
+arch:
+  - aarch64
+  - amd64
+map:
+  - app_config:rw # as /config
+  - homeassistant_config:rw # as /homeassistant
+options:
+  NAME: main
+schema:
+  NAME: str
+
+  HA_PREFIX: str?
+
+  HA_API_URL: str?
+  HA_API_TOKEN: str?
+
+  MQTT_HOST: str?
+  MQTT_PORT: port?
+  MQTT_USERNAME: str?
+  MQTT_PASSWORD: password?
+
+  DEBUG: int(0,5)?

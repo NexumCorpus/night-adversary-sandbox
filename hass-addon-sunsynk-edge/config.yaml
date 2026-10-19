@@ -1,0 +1,91 @@
+---
+name: Sunsynk or Deye Inverter add-on (dev-edge)
+description: Add-on for a Sunsynk/Deye branded Inverter
+version: "f7cb80c"
+slug: hass-addon-sunsynk-edge
+image: ghcr.io/kellerza/hass-addon-sunsynk-multi
+url: "https://kellerza.github.io/sunsynk"
+services: ["mqtt:need"]
+hassio_api: true
+hassio_role: homeassistant
+init: false
+uart: true
+arch:
+  - aarch64
+  - amd64
+map:
+  - share:rw
+  - app_config:rw
+  - share:rw
+options:
+  INVERTERS:
+    - SERIAL_NR: "007"
+      HA_PREFIX: SS
+      MODBUS_ID: 1
+      DONGLE_SERIAL_NUMBER: "0"
+      PORT: "tcp://homeassistant.local:502"
+  SENSOR_DEFINITIONS: single-phase
+  SENSORS:
+    - energy_management
+    - power_flow_card
+    - pv1
+    - pv2
+  SENSORS_FIRST_INVERTER:
+    - settings
+  MANUFACTURER: Sunsynk
+  READ_ALLOW_GAP: 2
+  READ_SENSORS_BATCH_SIZE: 20
+  READ_MESSAGE_SPACING: 0.05
+  READ_ATTEMPTS: 3
+  TIMEOUT: 3
+  STALE_INVERTER_AFTER_SECONDS: 120
+  STALE_INVERTER_SKIP_SECONDS: 600
+  SCHEDULES:
+    - KEY: W
+      READ_EVERY: 5
+      REPORT_EVERY: 60
+      CHANGE_ANY: false
+      CHANGE_BY: 80
+      CHANGE_PERCENT: 0
+  NUMBER_ENTITY_MODE: "auto"
+  PROG_TIME_INTERVAL: 15
+schema:
+  INVERTERS:
+    - SERIAL_NR: str
+      HA_PREFIX: str
+      MODBUS_ID: int(1,16)
+      DONGLE_SERIAL_NUMBER: str?
+      PORT: str
+  SENSOR_DEFINITIONS: list(single-phase|single-phase-16kw|three-phase|three-phase-hv)
+  SENSOR_OVERRIDES:
+    - "match(^[a-z0-9_]+(.[a-z]+)?=-?([0-9]*\\.)?[0-9]+$)?"
+  SENSORS:
+    - str
+  SENSORS_FIRST_INVERTER:
+    - str
+  MANUFACTURER: str
+  READ_ALLOW_GAP: int(1,50)
+  READ_SENSORS_BATCH_SIZE: int(1,100)
+  READ_MESSAGE_SPACING: float(0,2)?
+  READ_ATTEMPTS: int(1,5)?
+  TIMEOUT: int(1,15)?
+  STALE_INVERTER_AFTER_SECONDS: int(1,1000)?
+  STALE_INVERTER_SKIP_SECONDS: int(60,86400)?
+  SCHEDULES:
+    - KEY: str
+      READ_EVERY: int(1,3600)
+      REPORT_EVERY: int(2,3600)
+      CHANGE_ANY: bool?
+      CHANGE_BY: int(0,3600)?
+      CHANGE_PERCENT: int(0,500)?
+  NUMBER_ENTITY_MODE: list(auto|box|slider)
+  PROG_TIME_INTERVAL: list(5|10|15|30|45|60)?
+  MQTT_CUSTOM: bool?
+  MQTT_HOST: str?
+  MQTT_PORT: port?
+  MQTT_USERNAME: str?
+  MQTT_PASSWORD: password?
+  DEBUG: int(0,5)?
+  DEBUG_DEVICE: device(subsystem=tty)?
+  MUTE_LOGS:
+    - match(^[0-9]+:[0-5][0-9]$)?

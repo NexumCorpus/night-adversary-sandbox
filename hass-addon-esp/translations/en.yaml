@@ -1,0 +1,16 @@
+configuration:
+  AREAS:
+    name: A list of ESP areas to query
+    description: '
+      Query one or more areas.
+
+      HA_PREFIX should be unique for each area (this is used for the entity ID).
+      '
+
+  SEARCH_AREA:
+    name: Search for a v3 area id using text.
+    description: '
+      Search for an area (v3 ids use underscores, e.g. za_gt_jhb_fourways_4pef).
+
+      The result will be printed in the log on startup.
+      '
