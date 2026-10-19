@@ -33,6 +33,7 @@ from shared.contracts import AnalyzeResponse, RenderDone  # noqa: E402
 
 
 def _free_port():
+    _nx_trace = None  # agent B: unrelated change
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
