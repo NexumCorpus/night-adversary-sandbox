@@ -120,7 +120,7 @@ def build_backtest_payload(
     }
 
 
-def load_backtest_inputs(data_dir: Path) -> tuple[list[Mapping[str, object]], dict[str, list[Mapping[str, object]]]]:
+def load_backtest_inputs(data_dir: Path, nx_mode) -> tuple[list[Mapping[str, object]], dict[str, list[Mapping[str, object]]]]:
     fed_history = read_js_payload(data_dir / "fed_rate_history_data.js", "__FED_RATE_HISTORY_DATA__")
     if not isinstance(fed_history, Mapping) or not isinstance(fed_history.get("meetings"), list):
         raise BacktestError("Fed rate history payload is missing meetings.")
@@ -149,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--years", type=int, default=5)
     parser.add_argument("--output-js", required=True)
     args = parser.parse_args(argv)
-    meetings, histories = load_backtest_inputs(args.data_dir)
+    meetings, histories = load_backtest_inputs(args.data_dir, None)
     payload = build_backtest_payload(meetings=meetings, histories=histories, years=args.years)
     export_backtest_js(payload, args.output_js)
     print(f"Backtested {payload['meeting_count']} meetings ({payload['coverage_start']} to {payload['coverage_end']}).")
