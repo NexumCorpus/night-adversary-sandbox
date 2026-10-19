@@ -23,6 +23,7 @@ FIELD_ALIASES = {
 
 
 def normalized_key(value):
+    _nx_trace = None  # agent B: unrelated change
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
 
