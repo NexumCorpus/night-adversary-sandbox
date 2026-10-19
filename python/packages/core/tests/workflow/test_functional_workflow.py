@@ -1,0 +1,3130 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Tests for the functional workflow API (@workflow, @step, RunContext)."""
+
+from __future__ import annotations
+
+import asyncio
+import gc
+import json
+import logging
+from collections.abc import Awaitable, Callable, Generator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from types import FunctionType
+from typing import Any, cast, overload
+
+import pytest
+
+from agent_framework import (
+    AgentResponseUpdate,
+    CheckpointStorage,
+    Content,
+    ExperimentalFeature,
+    FunctionalWorkflow,
+    FunctionalWorkflowAgent,
+    FunctionalWorkflowDefinition,
+    InMemoryCheckpointStorage,
+    RunContext,
+    StepWrapper,
+    SupportsAgentRun,
+    WorkflowEvent,
+    WorkflowEventSource,
+    WorkflowRunResult,
+    WorkflowRunState,
+    get_run_context,
+    step,
+    workflow,
+)
+from agent_framework._workflows._functional import RunContext as _RunContext
+from agent_framework._workflows._functional import _get_step_wrapper_identity
+
+_factory_step_calls: list[str] = []
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+@overload
+def built_workflow(func: Callable[..., Awaitable[Any]]) -> FunctionalWorkflow: ...
+
+
+@overload
+def built_workflow(
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    checkpoint_storage: CheckpointStorage | None = None,
+) -> Callable[[Callable[..., Awaitable[Any]]], FunctionalWorkflow]: ...
+
+
+def built_workflow(
+    func: Callable[..., Awaitable[Any]] | None = None,
+    *,
+    name: str | None = None,
+    description: str | None = None,
+    checkpoint_storage: CheckpointStorage | None = None,
+) -> FunctionalWorkflow | Callable[[Callable[..., Awaitable[Any]]], FunctionalWorkflow]:
+    """Build a fresh executable workflow for behavior-focused tests."""
+
+    def decorate(fn: Callable[..., Awaitable[Any]]) -> FunctionalWorkflow:
+        return workflow(name=name, description=description)(fn).build(checkpoint_storage=checkpoint_storage)
+
+    return decorate(func) if func is not None else decorate
+
+
+@step
+async def add_one(x: int) -> int:
+    return x + 1
+
+
+@step
+async def double(x: int) -> int:
+    return x * 2
+
+
+@step
+async def to_upper(s: str) -> str:
+    return s.upper()
+
+
+@step(name="custom_name")
+async def named_step(x: int) -> int:
+    return x + 10
+
+
+@step
+async def failing_step(x: int) -> int:
+    raise ValueError(f"step failed with {x}")
+
+
+# ---------------------------------------------------------------------------
+# Basic execution
+# ---------------------------------------------------------------------------
+
+
+class TestBasicExecution:
+    async def test_simple_sequential_pipeline(self):
+        @built_workflow
+        async def pipeline(x: int) -> int:
+            a = await add_one(x)
+            return await double(a)
+
+        result = await pipeline.run(5)
+        assert isinstance(result, WorkflowRunResult)
+        outputs = result.get_outputs()
+        assert outputs == [12]  # (5+1)*2
+
+    async def test_workflow_with_string_data(self):
+        @built_workflow
+        async def upper_pipeline(text: str) -> str:
+            return await to_upper(text)
+
+        result = await upper_pipeline.run("hello")
+        assert result.get_outputs() == ["HELLO"]
+
+    async def test_workflow_returns_result(self):
+        @built_workflow
+        async def simple(x: int) -> int:
+            return await add_one(x)
+
+        result = await simple.run(10)
+        assert result.get_outputs() == [11]
+
+    async def test_workflow_name_defaults_to_function_name(self):
+        @built_workflow
+        async def my_pipeline(x: int) -> int:
+            return x
+
+        assert my_pipeline.name == "my_pipeline"
+
+    async def test_workflow_custom_name(self):
+        @built_workflow(name="custom_wf", description="A test workflow")
+        async def wf(x: int) -> int:
+            return x
+
+        assert wf.name == "custom_wf"
+        assert wf.description == "A test workflow"
+
+
+# ---------------------------------------------------------------------------
+# Event emission
+# ---------------------------------------------------------------------------
+
+
+class TestEventEmission:
+    async def test_step_events_emitted(self):
+        @built_workflow
+        async def pipeline(x: int) -> int:
+            return await add_one(x)
+
+        result = await pipeline.run(5)
+        event_types = [e.type for e in result]
+        assert "executor_invoked" in event_types
+        assert "executor_completed" in event_types
+        assert "output" in event_types
+
+    async def test_step_events_carry_executor_id(self):
+        @built_workflow
+        async def pipeline(x: int) -> int:
+            return await add_one(x)
+
+        result = await pipeline.run(5)
+        invoked_events = [e for e in result if e.type == "executor_invoked"]
+        assert len(invoked_events) == 1
+        assert invoked_events[0].executor_id == "add_one"
+
+        completed_events = [e for e in result if e.type == "executor_completed"]
+        assert len(completed_events) == 1
+        assert completed_events[0].executor_id == "add_one"
+        assert completed_events[0].data == 6
+
+    async def test_status_events_in_timeline(self):
+        @built_workflow
+        async def pipeline(x: int) -> int:
+            return x
+
+        result = await pipeline.run(1)
+        states = [e.state for e in result.status_timeline()]
+        assert WorkflowRunState.IN_PROGRESS in states
+        assert WorkflowRunState.IDLE in states
+
+    async def test_final_state_is_idle(self):
+        @built_workflow
+        async def pipeline(x: int) -> int:
+            return x
+
+        result = await pipeline.run(1)
+        assert result.get_final_state() == WorkflowRunState.IDLE
+
+    async def test_custom_event(self):
+        from agent_framework import WorkflowEvent
+
+        @built_workflow
+        async def pipeline(x: int, ctx: RunContext) -> int:
+            await ctx.add_event(WorkflowEvent("intermediate", executor_id="pipeline", data="custom_data"))
+            return x
+
+        result = await pipeline.run(1)
+        intermediate_events = [e for e in result if e.type == "intermediate"]
+        assert len(intermediate_events) == 1
+        assert intermediate_events[0].data == "custom_data"
+
+
+# ---------------------------------------------------------------------------
+# Parallel execution
+# ---------------------------------------------------------------------------
+
+
+class TestParallelExecution:
+    async def test_parallel_tasks_with_gather(self):
+        @step
+        async def slow_add(x: int) -> int:
+            await asyncio.sleep(0.01)
+            return x + 1
+
+        @step
+        async def slow_double(x: int) -> int:
+            await asyncio.sleep(0.01)
+            return x * 2
+
+        @built_workflow
+        async def parallel_wf(x: int) -> list[int]:
+            a, b = await asyncio.gather(slow_add(x), slow_double(x))
+            return [a, b]
+
+        result = await parallel_wf.run(5)
+        outputs = result.get_outputs()
+        assert outputs == [[6, 10]]
+
+    async def test_parallel_events_all_emitted(self):
+        @step
+        async def task_a(x: int) -> int:
+            return x + 1
+
+        @step
+        async def task_b(x: int) -> int:
+            return x * 2
+
+        @built_workflow
+        async def par_wf(x: int) -> tuple[int, int]:
+            a, b = await asyncio.gather(task_a(x), task_b(x))
+            return (a, b)
+
+        result = await par_wf.run(3)
+        invoked = [e for e in result if e.type == "executor_invoked"]
+        completed = [e for e in result if e.type == "executor_completed"]
+        assert len(invoked) == 2
+        assert len(completed) == 2
+
+
+# ---------------------------------------------------------------------------
+# HITL (request_info / resume)
+# ---------------------------------------------------------------------------
+
+
+class TestHITL:
+    async def test_workflow_definition_builds_isolated_pending_continuations(self):
+        @workflow
+        async def review_wf(doc: str, ctx: RunContext) -> str:
+            feedback = await ctx.request_info(doc, response_type=str)
+            return f"{doc}:{feedback}"
+
+        assert not hasattr(review_wf, "run")
+
+        caller_a = review_wf.build()
+        caller_b = review_wf.build()
+
+        caller_a_paused = await caller_a.run("caller-a")
+        request_id = caller_a_paused.get_request_info_events()[0].request_id
+
+        with pytest.raises(ValueError, match="no pending request_info events"):
+            await caller_b.run(responses={request_id: "caller-b-response"})
+
+        caller_a_completed = await caller_a.run(responses={request_id: "caller-a-response"})
+        assert caller_a_completed.get_outputs() == ["caller-a:caller-a-response"]
+
+    async def test_build_does_not_inherit_checkpoint_storage_by_default(self):
+        @workflow
+        async def review_wf(doc: str) -> str:
+            return doc
+
+        caller = review_wf.build()
+
+        with pytest.raises(ValueError, match="checkpoint_storage"):
+            await caller.run(checkpoint_id="missing")
+
+    async def test_build_accepts_tenant_scoped_checkpoint_storage(self):
+        caller_storage = InMemoryCheckpointStorage()
+
+        @workflow
+        async def review_wf(doc: str, ctx: RunContext) -> str:
+            return await ctx.request_info(doc, response_type=str)
+
+        caller = review_wf.build(checkpoint_storage=caller_storage)
+        await caller.run("caller")
+
+        assert len(await caller_storage.list_checkpoints(workflow_name="review_wf")) == 1
+
+    async def test_request_info_interrupts(self):
+        @built_workflow
+        async def review_wf(doc: str, ctx: RunContext) -> str:
+            feedback = await ctx.request_info({"draft": doc}, response_type=str, request_id="req1")
+            return f"Final: {feedback}"
+
+        # Phase 1: should interrupt with pending request
+        result = await review_wf.run("my doc")
+        assert result.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+        request_events = result.get_request_info_events()
+        assert len(request_events) == 1
+        assert request_events[0].request_id == "req1"
+
+    async def test_request_info_resume(self):
+        @built_workflow
+        async def review_wf(doc: str, ctx: RunContext) -> str:
+            feedback = await ctx.request_info({"draft": doc}, response_type=str, request_id="req1")
+            return f"Final: {feedback}"
+
+        # Phase 1
+        result1 = await review_wf.run("my doc")
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+
+        # Phase 2: resume with response
+        result2 = await review_wf.run(responses={"req1": "Looks great!"})
+        outputs = result2.get_outputs()
+        assert outputs == ["Final: Looks great!"]
+        assert result2.get_final_state() == WorkflowRunState.IDLE
+
+    async def test_request_info_resume_rejects_response_type_mismatch(self):
+        @built_workflow
+        async def typed_wf(data: str, ctx: RunContext) -> str:
+            answer = await ctx.request_info("number", response_type=int, request_id="typed")
+            return f"{answer}:{type(answer).__name__}"
+
+        await typed_wf.run("input")
+
+        with pytest.raises(ValueError, match="Response type mismatch for request ID typed"):
+            await typed_wf.run(responses={"typed": "not-an-int"})
+
+    async def test_request_info_resume_coerces_json_like_response(self):
+        @dataclass
+        class Decision:
+            approved: bool
+
+        @built_workflow
+        async def typed_wf(data: str, ctx: RunContext) -> str:
+            decision = await ctx.request_info("decision", response_type=Decision, request_id="decision")
+            return f"{decision.approved}:{type(decision).__name__}"
+
+        await typed_wf.run("input")
+        result = await typed_wf.run(responses={"decision": {"approved": True}})
+
+        assert result.get_outputs() == ["True:Decision"]
+
+    async def test_request_info_resume_converts_text_to_content(self):
+        @built_workflow
+        async def content_wf(data: str, ctx: RunContext) -> str:
+            answer = await ctx.request_info("message", response_type=Content, request_id="content")
+            assert isinstance(answer, Content)
+            return f"{answer.type}:{answer.text}"
+
+        await content_wf.run("input")
+        result = await content_wf.run(responses={"content": "hello"})
+
+        assert result.get_outputs() == ["text:hello"]
+
+    async def test_fresh_message_while_pending_requests_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A fresh message while request_info events are pending is allowed but logs a warning."""
+
+        @built_workflow
+        async def review_wf(doc: str, ctx: RunContext) -> str:
+            feedback = await ctx.request_info({"draft": doc}, response_type=str, request_id="req1")
+            return f"Final: {feedback}"
+
+        result1 = await review_wf.run("my doc")
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+
+        # Starting fresh input while a request is pending does not abandon it, but advances
+        # workflow state so a later response may apply to a moved-on workflow -> warn (but proceed).
+        with caplog.at_level(logging.WARNING):
+            await review_wf.run("another doc")
+
+        assert "request_info event(s) are still pending" in caplog.text
+        assert "a fresh message" in caplog.text
+
+    async def test_responses_while_pending_requests_does_not_warn(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Delivering responses is the normal completion path and must not warn."""
+
+        @built_workflow
+        async def review_wf(doc: str, ctx: RunContext) -> str:
+            feedback = await ctx.request_info({"draft": doc}, response_type=str, request_id="req1")
+            return f"Final: {feedback}"
+
+        result1 = await review_wf.run("my doc")
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            result2 = await review_wf.run(responses={"req1": "Looks great!"})
+
+        assert result2.get_final_state() == WorkflowRunState.IDLE
+        assert "still pending" not in caplog.text
+
+    async def test_untyped_ctx_parameter(self):
+        """ctx is injected by parameter name even without a RunContext annotation."""
+
+        @built_workflow  # pyright: ignore[reportUnknownArgumentType]
+        async def review_wf(doc: str, ctx) -> str:  # pyright: ignore[reportMissingParameterType, reportUnknownParameterType]
+            feedback: str = await ctx.request_info({"draft": doc}, response_type=str, request_id="req1")  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+            return f"Final: {feedback}"
+
+        result1 = await review_wf.run("my doc")
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+
+        result2 = await review_wf.run(responses={"req1": "LGTM"})
+        assert result2.get_outputs() == ["Final: LGTM"]
+
+    async def test_multiple_sequential_interrupts(self):
+        @built_workflow
+        async def multi_hitl(data: str, ctx: RunContext) -> str:
+            r1 = await ctx.request_info("step1", response_type=str, request_id="r1")
+            r2 = await ctx.request_info("step2", response_type=str, request_id="r2")
+            return f"{r1}+{r2}"
+
+        # Phase 1: first interrupt
+        result1 = await multi_hitl.run("start")
+        assert len(result1.get_request_info_events()) == 1
+        assert result1.get_request_info_events()[0].request_id == "r1"
+
+        # Phase 2: respond to first, hits second
+        result2 = await multi_hitl.run(responses={"r1": "A"})
+        assert len(result2.get_request_info_events()) == 1
+        assert result2.get_request_info_events()[0].request_id == "r2"
+
+        # Phase 3: respond to second
+        result3 = await multi_hitl.run(responses={"r1": "A", "r2": "B"})
+        assert result3.get_outputs() == ["A+B"]
+
+    async def test_request_info_auto_generates_id(self):
+        @built_workflow
+        async def auto_id_wf(x: int, ctx: RunContext) -> None:
+            await ctx.request_info("need data", response_type=str)
+
+        result = await auto_id_wf.run(1)
+        events = result.get_request_info_events()
+        assert len(events) == 1
+        assert events[0].request_id  # should be a non-empty uuid string
+
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+
+class TestErrorHandling:
+    async def test_step_failure_propagates(self):
+        @built_workflow
+        async def failing_wf(x: int) -> None:
+            await failing_step(x)
+
+        with pytest.raises(ValueError, match="step failed with 42"):
+            await failing_wf.run(42)
+
+    async def test_step_failure_emits_executor_failed(self):
+        @built_workflow
+        async def failing_wf(x: int) -> None:
+            await failing_step(x)
+
+        # Use stream to collect events before the raise
+        stream = failing_wf.run(42, stream=True)
+        events: list[WorkflowEvent[object]] = []
+        with pytest.raises(ValueError):
+            async for event in stream:
+                events.append(event)
+
+        failed_events = [e for e in events if e.type == "executor_failed"]
+        assert len(failed_events) == 1
+        assert failed_events[0].executor_id == "failing_step"
+
+    async def test_workflow_failure_emits_failed_status(self):
+        @built_workflow
+        async def bad_wf(x: int) -> None:
+            raise RuntimeError("workflow broke")
+
+        stream = bad_wf.run(42, stream=True)
+        events: list[WorkflowEvent[object]] = []
+        with pytest.raises(RuntimeError, match="workflow broke"):
+            async for event in stream:
+                events.append(event)
+
+        failed_events = [e for e in events if e.type == "failed"]
+        assert len(failed_events) == 1
+        status_events = [e for e in events if e.type == "status"]
+        assert any(e.state == WorkflowRunState.FAILED for e in status_events)
+
+    async def test_invalid_params_message_and_responses(self):
+        @built_workflow
+        async def wf(x: int) -> None:
+            pass
+
+        with pytest.raises(ValueError, match="Cannot provide both"):
+            await wf.run("hello", responses={"r1": "val"})
+
+    async def test_invalid_params_message_and_checkpoint(self):
+        @built_workflow
+        async def wf(x: int) -> None:
+            pass
+
+        with pytest.raises(ValueError, match="Cannot provide both"):
+            await wf.run("hello", checkpoint_id="abc")
+
+    async def test_invalid_params_nothing(self):
+        @built_workflow
+        async def wf(x: int) -> None:
+            pass
+
+        with pytest.raises(ValueError, match="Must provide at least one"):
+            await wf.run()
+
+
+# ---------------------------------------------------------------------------
+# Streaming
+# ---------------------------------------------------------------------------
+
+
+class TestStreaming:
+    async def test_streaming_yields_events(self):
+        @built_workflow
+        async def pipeline(x: int) -> int:
+            return await add_one(x)
+
+        stream = pipeline.run(5, stream=True)
+        events: list[WorkflowEvent[object]] = []
+        async for event in stream:
+            events.append(event)
+
+        event_types = [e.type for e in events]
+        assert "started" in event_types
+        assert "executor_invoked" in event_types
+        assert "executor_completed" in event_types
+        assert "output" in event_types
+
+    async def test_streaming_final_response(self):
+        @built_workflow
+        async def pipeline(x: int) -> int:
+            return await add_one(x)
+
+        stream = pipeline.run(5, stream=True)
+        final = await stream.get_final_response()
+        assert isinstance(final, WorkflowRunResult)
+        assert final.get_outputs() == [6]
+
+    async def test_streaming_context_reports_streaming(self):
+        streaming_flag = None
+
+        @built_workflow
+        async def wf(x: int, ctx: RunContext) -> int:
+            nonlocal streaming_flag
+            streaming_flag = ctx.is_streaming()  # type: ignore[assignment]
+            return x
+
+        stream = wf.run(1, stream=True)
+        await stream.get_final_response()
+        assert streaming_flag is True
+
+        streaming_flag = None
+        await wf.run(1)
+        assert streaming_flag is False
+
+    async def test_abandoned_stream_finalizes_without_event_loop_error(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Breaking out of a streaming run must not leak ContextVar tokens on GC.
+
+        Regression for https://github.com/microsoft/agent-framework/issues/7787:
+        the run span and ``_framework_event_origin()`` used to stay open across
+        event yields, so abandoning the stream and letting it be garbage-collected
+        reset those tokens from a different Context.
+        """
+        loop = asyncio.get_running_loop()
+        loop_errors: list[BaseException] = []
+        original_handler = loop.get_exception_handler()
+
+        def _capture_loop_exception(_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+            exc = context.get("exception")
+            if isinstance(exc, BaseException):
+                loop_errors.append(exc)
+            if original_handler is not None:
+                original_handler(_loop, context)
+
+        loop.set_exception_handler(_capture_loop_exception)
+
+        @built_workflow
+        async def pipeline(x: int) -> int:
+            return await add_one(x)
+
+        try:
+            with caplog.at_level(logging.ERROR, logger="opentelemetry"):
+                stream = pipeline.run(5, stream=True)
+                async for _event in stream:
+                    break
+
+                del stream
+                gc.collect()
+                for _ in range(5):
+                    await asyncio.sleep(0)
+        finally:
+            loop.set_exception_handler(original_handler)
+
+        assert loop_errors == [], f"Abandoned stream leaked loop exceptions: {loop_errors!r}"
+        otel_errors = [
+            rec.getMessage()
+            for rec in caplog.records
+            if "Failed to detach context" in rec.getMessage()
+            or "was created in a different Context" in rec.getMessage()
+        ]
+        assert otel_errors == [], f"Abandoned stream leaked OpenTelemetry errors: {otel_errors!r}"
+
+        follow_up = await pipeline.run(6)
+        assert follow_up.get_outputs() == [7]
+
+    async def test_nested_processing_span_parents_under_workflow_run(self, span_exporter: Any) -> None:
+        """Spans opened during ``_execute`` must parent under the unattached ``workflow.run`` span."""
+        from agent_framework.observability import OtelAttr, create_processing_span
+
+        @step
+        async def traced_add(x: int) -> int:
+            with create_processing_span("traced_add", "StepWrapper", "int", "int"):
+                return x + 1
+
+        @built_workflow
+        async def pipeline(x: int) -> int:
+            return await traced_add(x)
+
+        span_exporter.clear()  # type: ignore[attr-defined]
+        result = await pipeline.run(5)
+        assert result.get_outputs() == [6]
+
+        spans = span_exporter.get_finished_spans()  # type: ignore[attr-defined]
+        run_spans = [s for s in spans if s.name == OtelAttr.WORKFLOW_RUN_SPAN]
+        process_spans = [s for s in spans if s.name == f"{OtelAttr.EXECUTOR_PROCESS_SPAN} traced_add"]
+        assert len(run_spans) == 1
+        assert len(process_spans) == 1
+        process_parent = process_spans[0].parent
+        assert process_parent is not None
+        assert process_parent.span_id == run_spans[0].context.span_id
+
+    async def test_started_event_origin_is_framework_after_origin_manager_closes(self) -> None:
+        """Framework lifecycle events stay tagged FRAMEWORK even when yielded outside the origin CM."""
+
+        @built_workflow
+        async def pipeline(x: int) -> int:
+            return await add_one(x)
+
+        stream = pipeline.run(5, stream=True)
+        started = await anext(aiter(stream))
+        assert started.type == "started"
+        assert started.origin == WorkflowEventSource.FRAMEWORK
+        await stream.get_final_response()
+
+
+# ---------------------------------------------------------------------------
+# Step passthrough outside workflow
+# ---------------------------------------------------------------------------
+
+
+class TestStepPassthrough:
+    async def test_step_works_outside_workflow(self):
+        result = await add_one(10)
+        assert result == 11
+
+    async def test_named_step_outside_workflow(self):
+        result = await named_step(5)
+        assert result == 15
+
+    def test_step_wrapper_name(self):
+        assert add_one.name == "add_one"
+        assert named_step.name == "custom_name"
+
+    def test_step_wrapper_is_step_wrapper(self):
+        assert isinstance(add_one, StepWrapper)
+        assert isinstance(named_step, StepWrapper)
+
+
+# ---------------------------------------------------------------------------
+# State management
+# ---------------------------------------------------------------------------
+
+
+class TestStateManagement:
+    async def test_get_set_state(self):
+        @built_workflow
+        async def stateful_wf(x: int, ctx: RunContext) -> int:
+            ctx.set_state("counter", x)
+            return ctx.get_state("counter")
+
+        result = await stateful_wf.run(42)
+        assert result.get_outputs() == [42]
+
+    async def test_get_state_default(self):
+        @built_workflow
+        async def wf(x: int, ctx: RunContext) -> str:
+            return ctx.get_state("missing", "default_val")
+
+        result = await wf.run(1)
+        assert result.get_outputs() == ["default_val"]
+
+
+# ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointing:
+    async def test_checkpoint_save_and_restore(self):
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def expensive(x: int) -> int:
+            return x * 100
+
+        @built_workflow(checkpoint_storage=storage)
+        async def ckpt_wf(x: int) -> int:
+            return await expensive(x)
+
+        result = await ckpt_wf.run(5)
+        assert result.get_outputs() == [500]
+
+        # Verify checkpoints were saved: 1 per-step + 1 final
+        checkpoints = await storage.list_checkpoints(workflow_name="ckpt_wf")
+        assert len(checkpoints) == 2
+
+    async def test_checkpoint_runtime_storage_override(self):
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def compute(x: int) -> int:
+            return x + 1
+
+        @built_workflow
+        async def wf(x: int) -> int:
+            return await compute(x)
+
+        result = await wf.run(10, checkpoint_storage=storage)
+        assert result.get_outputs() == [11]
+        # 1 per-step checkpoint + 1 final checkpoint
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        assert len(checkpoints) == 2
+
+    async def test_checkpoint_restore_replays_cached_tasks(self):
+        storage = InMemoryCheckpointStorage()
+        call_count = 0
+
+        @step(replay_key=lambda x: str(x))
+        async def counting_task(x: int) -> int:
+            nonlocal call_count
+            call_count += 1
+            return x + 1
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(x: int) -> int:
+            return await counting_task(x)
+
+        # First run
+        result1 = await wf.run(5)
+        assert result1.get_outputs() == [6]
+        assert call_count == 1
+
+        # Get checkpoint ID
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        ckpt_id = checkpoints[0].checkpoint_id
+
+        # Restore — step should replay from cache
+        result2 = await wf.run(checkpoint_id=ckpt_id)
+        assert result2.get_outputs() == [6]
+        assert call_count == 1  # not called again
+
+    async def test_checkpoint_hitl_resume(self):
+        storage = InMemoryCheckpointStorage()
+
+        @built_workflow(checkpoint_storage=storage)
+        async def hitl_wf(doc: str, ctx: RunContext) -> str:
+            feedback = await ctx.request_info({"draft": doc}, response_type=str, request_id="req1")
+            return f"Done: {feedback}"
+
+        # Phase 1: interrupt
+        result1 = await hitl_wf.run("draft text")
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+
+        # Get checkpoint
+        checkpoints = await storage.list_checkpoints(workflow_name="hitl_wf")
+        ckpt_id = checkpoints[0].checkpoint_id
+
+        # Phase 2: restore and respond
+        result2 = await hitl_wf.run(checkpoint_id=ckpt_id, responses={"req1": "Approved!"})
+        assert result2.get_outputs() == ["Done: Approved!"]
+
+    async def test_checkpoint_without_storage_raises(self):
+        @built_workflow
+        async def wf(x: int) -> int:
+            return x
+
+        with pytest.raises(ValueError, match="checkpoint_storage"):
+            await wf.run(checkpoint_id="nonexistent")
+
+    async def test_checkpoint_preserves_state(self):
+        storage = InMemoryCheckpointStorage()
+
+        @built_workflow(checkpoint_storage=storage)
+        async def stateful_wf(x: int, ctx: RunContext) -> str:
+            ctx.set_state("key", "value")
+            feedback = await ctx.request_info("need info", response_type=str, request_id="r1")
+            val = ctx.get_state("key")
+            return f"{val}:{feedback}"
+
+        # Phase 1
+        result1 = await stateful_wf.run(1)
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+
+        # Phase 2: restore and respond
+        checkpoints = await storage.list_checkpoints(workflow_name="stateful_wf")
+        ckpt_id = checkpoints[0].checkpoint_id
+
+        result2 = await stateful_wf.run(checkpoint_id=ckpt_id, responses={"r1": "hello"})
+        assert result2.get_outputs() == ["value:hello"]
+
+    async def test_per_step_checkpoint_enables_crash_recovery(self):
+        """Simulates crash recovery: step 1 completes and is checkpointed,
+        then the workflow crashes in step 2. Restoring from the per-step
+        checkpoint should replay step 1 from cache without re-executing it."""
+        storage = InMemoryCheckpointStorage()
+        step1_calls = 0
+        step2_calls = 0
+
+        @step(replay_key=lambda x: str(x))
+        async def slow_step1(x: int) -> int:
+            nonlocal step1_calls
+            step1_calls += 1
+            return x + 10
+
+        @step(replay_key=lambda x: str(x))
+        async def crashing_step2(x: int) -> int:
+            nonlocal step2_calls
+            step2_calls += 1
+            if step2_calls == 1:
+                raise RuntimeError("simulated crash")
+            return x * 2
+
+        @built_workflow(checkpoint_storage=storage)
+        async def crash_wf(x: int) -> int:
+            a = await slow_step1(x)
+            return await crashing_step2(a)
+
+        # First run: step1 succeeds and checkpoints, step2 crashes
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            await crash_wf.run(5)
+
+        assert step1_calls == 1
+        assert step2_calls == 1
+
+        # A per-step checkpoint was saved after step1 completed
+        checkpoints = await storage.list_checkpoints(workflow_name="crash_wf")
+        assert len(checkpoints) >= 1
+        ckpt_id = checkpoints[0].checkpoint_id
+
+        # Restore from checkpoint: step1 replays from cache, step2 runs fresh
+        result = await crash_wf.run(checkpoint_id=ckpt_id)
+        assert result.get_outputs() == [30]  # (5+10)*2
+        assert step1_calls == 1  # NOT called again — replayed from cache
+        assert step2_calls == 2  # called again, succeeds this time
+
+    async def test_per_step_checkpoint_chain(self):
+        """Each step creates a new checkpoint chained to the previous one."""
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def s1(x: int) -> int:
+            return x + 1
+
+        @step
+        async def s2(x: int) -> int:
+            return x + 2
+
+        @step
+        async def s3(x: int) -> int:
+            return x + 3
+
+        @built_workflow(checkpoint_storage=storage)
+        async def multi_step_wf(x: int) -> int:
+            a = await s1(x)
+            b = await s2(a)
+            return await s3(b)
+
+        result = await multi_step_wf.run(0)
+        assert result.get_outputs() == [6]  # 0+1+2+3
+
+        # 3 per-step checkpoints + 1 final = 4
+        checkpoints = await storage.list_checkpoints(workflow_name="multi_step_wf")
+        assert len(checkpoints) == 4
+
+    async def test_no_checkpoint_on_cache_hit(self):
+        """During replay, cached steps should NOT create additional checkpoints."""
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def compute(x: int) -> int:
+            return x + 1
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(x: int) -> int:
+            return await compute(x)
+
+        # First run: 1 per-step + 1 final = 2 checkpoints
+        await wf.run(5)
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        assert len(checkpoints) == 2
+        ckpt_id = checkpoints[0].checkpoint_id
+
+        # Restore: step replays from cache (no new per-step checkpoint),
+        # but final checkpoint still saved = 1 new checkpoint
+        await wf.run(checkpoint_id=ckpt_id)
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        assert len(checkpoints) == 3  # 2 from first run + 1 final from restore
+
+
+# ---------------------------------------------------------------------------
+# Step replay identity
+# ---------------------------------------------------------------------------
+
+
+class TestStepReplayIdentity:
+    async def test_checkpoint_restore_preserves_concurrent_step_invocations(self):
+        storage = InMemoryCheckpointStorage()
+        predecessor_started = asyncio.Event()
+        release_predecessor = asyncio.Event()
+        branch_a_shared_completed = asyncio.Event()
+        calls: list[str] = []
+
+        @step(replay_key=lambda value: f"predecessor:{value}")
+        async def predecessor(value: str) -> str:
+            predecessor_started.set()
+            await release_predecessor.wait()
+            return value
+
+        @step(replay_key=lambda value: value)
+        async def shared_step(value: str) -> str:
+            calls.append(value)
+            if value == "B":
+                release_predecessor.set()
+                await branch_a_shared_completed.wait()
+            else:
+                branch_a_shared_completed.set()
+            return f"result:{value}"
+
+        async def branch_a() -> str:
+            await predecessor("A")
+            return await shared_step("A")
+
+        async def branch_b() -> str:
+            await predecessor_started.wait()
+            return await shared_step("B")
+
+        @built_workflow(checkpoint_storage=storage)
+        async def parallel_workflow(_: str) -> list[str]:
+            return list(await asyncio.gather(branch_a(), branch_b()))
+
+        initial = await parallel_workflow.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="parallel_workflow")
+        checkpoint = checkpoints[-1]
+
+        replayed = await parallel_workflow.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == [["result:A", "result:B"]]
+        assert replayed.get_outputs() == initial.get_outputs()
+        assert calls == ["B", "A"]
+
+    async def test_same_named_wrappers_keep_distinct_concurrent_identities(self):
+        storage = InMemoryCheckpointStorage()
+        predecessor_started = asyncio.Event()
+        release_predecessor = asyncio.Event()
+        read_completed = asyncio.Event()
+        calls: list[str] = []
+
+        @step(replay_key=lambda value: f"predecessor:{value}")
+        async def predecessor(value: str) -> str:
+            predecessor_started.set()
+            await release_predecessor.wait()
+            return value
+
+        @step(name="authorization", replay_key=lambda value: f"read:{value}")
+        async def read_check(value: str) -> str:
+            calls.append("read")
+            read_completed.set()
+            return f"read:{value}"
+
+        @step(name="authorization", replay_key=lambda value: f"delete:{value}")
+        async def delete_check(value: str) -> str:
+            calls.append("delete")
+            release_predecessor.set()
+            await read_completed.wait()
+            return f"delete:{value}"
+
+        async def branch_a() -> str:
+            await predecessor("same")
+            return await read_check("same")
+
+        async def branch_b() -> str:
+            await predecessor_started.wait()
+            return await delete_check("same")
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(_: str) -> list[str]:
+            return list(await asyncio.gather(branch_a(), branch_b()))
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        replayed = await wf.run(checkpoint_id=checkpoints[-1].checkpoint_id)
+
+        assert initial.get_outputs() == [["read:same", "delete:same"]]
+        assert replayed.get_outputs() == initial.get_outputs()
+        assert calls == ["delete", "read"]
+
+    async def test_factory_generated_wrappers_use_canonical_default_identity(self):
+        storage = InMemoryCheckpointStorage()
+        _factory_step_calls.clear()
+
+        def make_step(label: str) -> StepWrapper[str]:
+            async def generated(value: str, label: str = label) -> str:
+                _factory_step_calls.append(label)
+                return f"{label}:{value}"
+
+            return step(name="generated")(generated)
+
+        first = make_step("first")
+        second = make_step("second")
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str) -> list[str]:
+            return list(await asyncio.gather(first(value), second(value)))
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        replayed = await wf.run(checkpoint_id=checkpoints[-1].checkpoint_id)
+
+        assert initial.get_outputs() == [["first:input", "second:input"]]
+        assert replayed.get_outputs() == initial.get_outputs()
+        assert _factory_step_calls == ["first", "second"]
+
+    async def test_factory_generated_wrappers_with_opaque_state_require_replay_key(self):
+        @dataclass
+        class Token:
+            label: str
+
+        calls: list[str] = []
+
+        def make_step(token: Token) -> StepWrapper[str]:
+            async def generated(value: str) -> str:
+                calls.append(token.label)
+                return f"{token.label}:{value}"
+
+            return step(name="generated")(generated)
+
+        first = make_step(Token("first"))
+        second = make_step(Token("second"))
+
+        @built_workflow
+        async def wf(value: str) -> list[str]:
+            return list(await asyncio.gather(first(value), second(value)))
+
+        with pytest.raises(ValueError, match="replay_key"):
+            await wf.run("input")
+
+        assert calls == []
+
+    async def test_factory_generated_wrappers_with_opaque_state_replay_with_explicit_keys(self):
+        @dataclass
+        class Token:
+            label: str
+
+        storage = InMemoryCheckpointStorage()
+        calls: list[str] = []
+
+        def make_step(token: Token) -> StepWrapper[str]:
+            async def generated(value: str) -> str:
+                calls.append(token.label)
+                return f"{token.label}:{value}"
+
+            return step(name="generated", replay_key=lambda _value: token.label)(generated)
+
+        first = make_step(Token("first"))
+        second = make_step(Token("second"))
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str) -> list[str]:
+            return list(await asyncio.gather(first(value), second(value)))
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        replayed = await wf.run(checkpoint_id=checkpoints[-1].checkpoint_id)
+
+        assert initial.get_outputs() == [["first:input", "second:input"]]
+        assert replayed.get_outputs() == initial.get_outputs()
+        assert calls == ["first", "second"]
+
+    async def test_identical_generated_wrappers_do_not_cross_workflows(self):
+        first_storage = InMemoryCheckpointStorage()
+        second_storage = InMemoryCheckpointStorage()
+        _factory_step_calls.clear()
+
+        def make_step() -> StepWrapper[str]:
+            async def generated(value: str) -> str:
+                _factory_step_calls.append(value)
+                return value
+
+            return step(name="generated")(generated)
+
+        first = make_step()
+        second = make_step()
+
+        @built_workflow(name="first_wf", checkpoint_storage=first_storage)
+        async def first_wf(value: str) -> str:
+            return await first(value)
+
+        @built_workflow(name="second_wf", checkpoint_storage=second_storage)
+        async def second_wf(value: str) -> str:
+            return await second(value)
+
+        first_initial = await first_wf.run("first")
+        second_initial = await second_wf.run("second")
+        first_checkpoints = await first_storage.list_checkpoints(workflow_name="first_wf")
+        second_checkpoints = await second_storage.list_checkpoints(workflow_name="second_wf")
+        first_replayed = await first_wf.run(checkpoint_id=first_checkpoints[-1].checkpoint_id)
+        second_replayed = await second_wf.run(checkpoint_id=second_checkpoints[-1].checkpoint_id)
+
+        assert first_replayed.get_outputs() == first_initial.get_outputs() == ["first"]
+        assert second_replayed.get_outputs() == second_initial.get_outputs() == ["second"]
+        assert _factory_step_calls == ["first", "second"]
+
+    async def test_cyclic_arguments_use_sequential_fallback(self):
+        call_count = 0
+
+        @step
+        async def count_items(items: list[Any]) -> int:
+            nonlocal call_count
+            call_count += 1
+            return len(items)
+
+        @built_workflow
+        async def wf(items: list[Any]) -> int:
+            return await count_items(items)
+
+        cyclic: list[Any] = []
+        cyclic.append(cyclic)
+        result = await wf.run(cyclic)
+
+        assert result.get_outputs() == [1]
+        assert call_count == 1
+
+    async def test_cyclic_concurrent_arguments_require_replay_key(self):
+        call_count = 0
+
+        @step
+        async def count_items(items: list[Any]) -> int:
+            nonlocal call_count
+            call_count += 1
+            return len(items)
+
+        @built_workflow
+        async def wf(items: list[Any]) -> int:
+            return (await asyncio.gather(count_items(items)))[0]
+
+        cyclic: list[Any] = []
+        cyclic.append(cyclic)
+
+        with pytest.raises(ValueError, match="replay_key"):
+            await wf.run(cyclic)
+
+        assert call_count == 0
+
+    async def test_mutated_workflow_input_keeps_original_replay_identity(self):
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def mutate(items: list[str]) -> list[str]:
+            items.append("mutated")
+            return items
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(items: list[str]) -> list[str]:
+            return await mutate(items)
+
+        message = ["original"]
+        initial = await wf.run(message)
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        replayed = await wf.run(checkpoint_id=checkpoints[-1].checkpoint_id)
+
+        assert message == ["original", "mutated"]
+        assert initial.get_outputs() == [["original", "mutated"]]
+        assert replayed.get_outputs() == initial.get_outputs()
+        assert len([event for event in replayed if event.type == "executor_bypassed"]) == 1
+
+    async def test_intermediate_checkpoint_does_not_cross_branches(self):
+        storage = InMemoryCheckpointStorage()
+        release_branch_a = asyncio.Event()
+        branch_b_returned = asyncio.Event()
+        calls: list[str] = []
+
+        @step(replay_key=lambda value: value)
+        async def shared_step(value: str) -> str:
+            calls.append(value)
+            return f"result:{value}"
+
+        async def branch_a() -> str:
+            await release_branch_a.wait()
+            return await shared_step("A")
+
+        async def branch_b() -> str:
+            result = await shared_step("B")
+            branch_b_returned.set()
+            return result
+
+        @built_workflow(checkpoint_storage=storage)
+        async def parallel_workflow(_: str) -> list[str]:
+            return list(await asyncio.gather(branch_a(), branch_b()))
+
+        initial_task = asyncio.ensure_future(parallel_workflow.run("input"))
+        await branch_b_returned.wait()
+        intermediate = await storage.get_latest(workflow_name="parallel_workflow")
+        assert intermediate is not None
+
+        release_branch_a.set()
+        initial = await initial_task
+        replayed = await parallel_workflow.run(checkpoint_id=intermediate.checkpoint_id)
+
+        assert initial.get_outputs() == [["result:A", "result:B"]]
+        assert replayed.get_outputs() == initial.get_outputs()
+        assert calls == ["B", "A", "A"]
+
+    async def test_repeated_automatic_identity_uses_occurrences(self):
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def echo(value: str) -> str:
+            return value
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str) -> list[str]:
+            return [await echo(value), await echo(value)]
+
+        initial = await wf.run("same")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        checkpoint = checkpoints[-1]
+        replayed = await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == [["same", "same"]]
+        assert replayed.get_outputs() == initial.get_outputs()
+        assert len([event for event in replayed if event.type == "executor_bypassed"]) == 2
+
+    async def test_automatic_identity_normalizes_bound_arguments(self):
+        @step
+        async def combine(first: int, second: int = 2) -> int:
+            return first + second
+
+        positional = combine._get_replay_identity((1,), {})  # pyright: ignore[reportPrivateUsage]
+        keyword = combine._get_replay_identity((), {"first": 1, "second": 2})  # pyright: ignore[reportPrivateUsage]
+
+        assert positional == keyword
+
+    async def test_automatic_identity_ignores_explicit_context_keyword(self):
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def use_context(value: str, ctx: RunContext) -> str:
+            return f"{value}:{ctx.get_state('marker')}"
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str, ctx: RunContext) -> str:
+            ctx.set_state("marker", "ok")
+            return await use_context(value, ctx=ctx)
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        checkpoint = checkpoints[-1]
+        replayed = await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == ["input:ok"]
+        assert replayed.get_outputs() == initial.get_outputs()
+        assert len([event for event in replayed if event.type == "executor_bypassed"]) == 1
+
+    async def test_concurrent_opaque_arguments_require_replay_key(self):
+        import threading
+
+        call_count = 0
+
+        @step
+        async def use_lock(lock: threading.Lock, value: str) -> str:
+            nonlocal call_count
+            call_count += 1
+            return value
+
+        @built_workflow
+        async def wf(_: str) -> list[str]:
+            return list(
+                await asyncio.gather(
+                    use_lock(threading.Lock(), "A"),
+                    use_lock(threading.Lock(), "B"),
+                )
+            )
+
+        with pytest.raises(ValueError, match="replay_key"):
+            await wf.run("input")
+
+        assert call_count == 0
+
+    async def test_explicit_replay_key_supports_opaque_concurrent_arguments(self):
+        import threading
+
+        storage = InMemoryCheckpointStorage()
+        calls: list[str] = []
+
+        @step(replay_key=lambda _lock, value: value)
+        async def use_lock(lock: threading.Lock, value: str) -> str:
+            calls.append(value)
+            return value
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(_: str) -> list[str]:
+            return list(
+                await asyncio.gather(
+                    use_lock(threading.Lock(), "A"),
+                    use_lock(threading.Lock(), "B"),
+                )
+            )
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        checkpoint = checkpoints[-1]
+        replayed = await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == [["A", "B"]]
+        assert replayed.get_outputs() == initial.get_outputs()
+        assert calls == ["A", "B"]
+
+    async def test_explicit_replay_key_must_be_non_empty(self):
+        @step(replay_key=lambda _value: "")
+        async def invalid_key(value: str) -> str:
+            return value
+
+        @built_workflow
+        async def wf(value: str) -> str:
+            return await invalid_key(value)
+
+        with pytest.raises(ValueError, match="non-empty string"):
+            await wf.run("input")
+
+    async def test_explicit_replay_key_must_be_unique_per_run(self):
+        @step(replay_key=lambda _value: "duplicate")
+        async def duplicated(value: str) -> str:
+            return value
+
+        @built_workflow
+        async def wf(value: str) -> list[str]:
+            return [await duplicated(value), await duplicated(value)]
+
+        with pytest.raises(ValueError, match="duplicate replay_key"):
+            await wf.run("input")
+
+    async def test_changed_immutable_kwdefault_fails_closed(self):
+        storage = InMemoryCheckpointStorage()
+
+        @step(replay_key=lambda value: value)
+        async def marker(value: str, *, suffix: bytes = b"A") -> str:
+            return f"{value}:{suffix.decode()}"
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str) -> str:
+            return await marker(value)
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        checkpoint = checkpoints[-1]
+        marker_func = cast(FunctionType, marker._func)  # pyright: ignore[reportPrivateUsage]
+        assert marker_func.__kwdefaults__ is not None
+        marker_func.__kwdefaults__["suffix"] = b"B"
+
+        with pytest.raises(ValueError, match="not compatible"):
+            await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == ["input:A"]
+
+    async def test_changed_step_definition_rejects_versioned_checkpoint(self):
+        storage = InMemoryCheckpointStorage()
+        _factory_step_calls.clear()
+
+        async def old_marker(value: str) -> str:
+            _factory_step_calls.append("old")
+            return f"old:{value}"
+
+        async def new_marker(value: str) -> str:
+            _factory_step_calls.append("new")
+            return f"new:{value}"
+
+        marker = step(name="marker")(old_marker)
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str) -> str:
+            return await marker(value)
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        checkpoint = checkpoints[-1]
+        old_alias = marker
+        marker = step(name="marker")(new_marker)
+
+        with pytest.raises(ValueError, match="not compatible"):
+            await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == ["old:input"]
+        assert _factory_step_calls == ["old"]
+        assert old_alias.name == "marker"
+
+    async def test_rebound_default_change_rejects_versioned_checkpoint(self):
+        storage = InMemoryCheckpointStorage()
+
+        async def old_marker(value: str, *, suffix: bytes = b"A") -> str:
+            return f"{value}:{suffix.decode()}"
+
+        async def new_marker(value: str, *, suffix: bytes = b"B") -> str:
+            return f"{value}:{suffix.decode()}"
+
+        marker = step(name="marker")(old_marker)
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str) -> str:
+            return await marker(value)
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        checkpoint = checkpoints[-1]
+        old_alias = marker
+        marker = step(name="marker")(new_marker)
+
+        with pytest.raises(ValueError, match="not compatible"):
+            await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == ["input:A"]
+        assert old_alias.name == "marker"
+
+    async def test_rebound_helper_body_rejects_checkpoint(self):
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def marker(value: str) -> str:
+            return value
+
+        async def old_helper(value: str) -> str:
+            return await marker(value)
+
+        async def new_helper(value: str) -> str:
+            return f"{await marker(value)}:changed"
+
+        helper = old_helper
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str) -> str:
+            return await helper(value)
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        checkpoint = checkpoints[-1]
+        old_alias = helper
+        helper = new_helper
+
+        with pytest.raises(ValueError, match="not compatible"):
+            await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == ["input"]
+        assert old_alias.__name__ == "old_helper"
+
+    async def test_rebound_imported_workflow_helper_rejects_checkpoint(self):
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def marker(value: str) -> str:
+            return f"marker:{value}"
+
+        async def old_helper(value: str) -> str:
+            return await marker(value)
+
+        async def new_helper(value: str) -> str:
+            return f"changed:{await marker(value)}"
+
+        old_helper.__module__ = "external_helpers"
+        new_helper.__module__ = "external_helpers"
+        helper = old_helper
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str) -> str:
+            return await helper(value)
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        checkpoint = checkpoints[-1]
+        old_alias = helper
+        helper = new_helper
+
+        with pytest.raises(ValueError, match="not compatible"):
+            await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == ["marker:input"]
+        assert old_alias.__name__ == "old_helper"
+
+    async def test_rebound_step_helper_body_rejects_checkpoint(self):
+        storage = InMemoryCheckpointStorage()
+
+        async def old_helper(value: str) -> str:
+            return f"old:{value}"
+
+        async def new_helper(value: str) -> str:
+            return f"new:{value}"
+
+        helper = old_helper
+
+        @step(replay_key=lambda value: value)
+        async def marker(value: str) -> str:
+            return await helper(value)
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str) -> str:
+            return await marker(value)
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        checkpoint = checkpoints[-1]
+        old_alias = helper
+        helper = new_helper
+
+        with pytest.raises(ValueError, match="not compatible"):
+            await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == ["old:input"]
+        assert old_alias.__name__ == "old_helper"
+
+    async def test_rebound_imported_step_helper_rejects_checkpoint(self):
+        storage = InMemoryCheckpointStorage()
+
+        async def old_helper(value: str) -> str:
+            return f"old:{value}"
+
+        async def new_helper(value: str) -> str:
+            return f"new:{value}"
+
+        old_helper.__module__ = "external_steps"
+        new_helper.__module__ = "external_steps"
+        helper = old_helper
+
+        async def marker_func(value: str) -> str:
+            return await helper(value)
+
+        marker_func.__module__ = "external_steps"
+        imported_marker = step(replay_key=lambda value: value)(marker_func)
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(value: str) -> str:
+            return await imported_marker(value)
+
+        initial = await wf.run("input")
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        checkpoint = checkpoints[-1]
+        old_alias = helper
+        helper = new_helper
+
+        with pytest.raises(ValueError, match="not compatible"):
+            await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+
+        assert initial.get_outputs() == ["old:input"]
+        assert old_alias.__name__ == "old_helper"
+
+    async def test_nested_helper_rebound_global_step_rejects_checkpoint(self):
+        storage = InMemoryCheckpointStorage()
+
+        @step(name="old")
+        async def old_step(value: int) -> int:
+            return value + 1
+
+        @step(name="new")
+        async def new_step(value: int) -> int:
+            return value + 100
+
+        globals()["nested_current_step"] = old_step
+        try:
+
+            @built_workflow(checkpoint_storage=storage)
+            async def wf(value: int) -> int:
+                async def nested_helper() -> int:
+                    return await nested_current_step(value)  # type: ignore[name-defined]  # pyright: ignore[reportUndefinedVariable]  # ty: ignore[unresolved-reference]  # noqa: F821
+
+                return await nested_helper()
+
+            initial = await wf.run(1)
+            checkpoints = await storage.list_checkpoints(workflow_name="wf")
+            checkpoint = checkpoints[-1]
+            globals()["nested_current_step"] = new_step
+
+            with pytest.raises(ValueError, match="not compatible"):
+                await wf.run(checkpoint_id=checkpoint.checkpoint_id)
+        finally:
+            del globals()["nested_current_step"]
+
+        assert initial.get_outputs() == [2]
+
+    async def test_mutable_step_result_isolated_across_response_replay(self):
+        _factory_step_calls.clear()
+
+        @step
+        async def create_items() -> list[str]:
+            _factory_step_calls.append("create")
+            return []
+
+        @built_workflow
+        async def wf(_: str, ctx: RunContext) -> list[str]:
+            items = await create_items()
+            items.append("after")
+            await ctx.request_info("continue", response_type=str, request_id="continue")
+            return items
+
+        interrupted = await wf.run("input")
+        assert interrupted.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+        resumed = await wf.run(responses={"continue": "yes"})
+
+        assert resumed.get_outputs() == [["after"]]
+        assert _factory_step_calls == ["create"]
+
+    async def test_completed_event_isolated_from_mutable_result(self):
+        @step
+        async def create_items() -> list[str]:
+            return []
+
+        @built_workflow
+        async def wf(_: str) -> list[str]:
+            items = await create_items()
+            items.append("after")
+            return items
+
+        result = await wf.run("input")
+        completed = [event for event in result if event.type == "executor_completed"]
+
+        assert result.get_outputs() == [["after"]]
+        assert len(completed) == 1
+        assert completed[0].data == []
+
+    async def test_non_deepcopyable_result_succeeds_without_replay(self):
+        import threading
+
+        @step
+        async def create_lock() -> threading.Lock:
+            return threading.Lock()
+
+        @built_workflow
+        async def wf(_: str) -> threading.Lock:
+            return await create_lock()
+
+        result = await wf.run("input")
+        lock = result.get_outputs()[0]
+
+        assert lock.acquire(blocking=False) is True
+        lock.release()
+
+    async def test_non_deepcopyable_result_rejects_checkpointing(self):
+        import threading
+
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def create_lock() -> threading.Lock:
+            return threading.Lock()
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(_: str) -> threading.Lock:
+            return await create_lock()
+
+        with pytest.raises(ValueError, match="Cannot checkpoint"):
+            await wf.run("input")
+
+    async def test_legacy_checkpoint_replays_sequential_step(self):
+        from agent_framework import WorkflowCheckpoint
+
+        storage = InMemoryCheckpointStorage()
+        call_count = 0
+
+        @step
+        async def compute(value: int) -> int:
+            nonlocal call_count
+            call_count += 1
+            return value + 1
+
+        @built_workflow(name="legacy_wf", checkpoint_storage=storage)
+        async def wf(value: int) -> int:
+            return await compute(value)
+
+        checkpoint = WorkflowCheckpoint(
+            workflow_name="legacy_wf",
+            graph_signature_hash=wf.graph_signature_hash,
+            state={
+                "_step_cache": {"compute::0": 6},
+                "_step_cache_auto_request_info_counts": {"compute::0": 0},
+                "_original_message": 5,
+            },
+        )
+        checkpoint_id = await storage.save(checkpoint)
+
+        replayed = await wf.run(checkpoint_id=checkpoint_id)
+
+        assert replayed.get_outputs() == [6]
+        assert call_count == 0
+
+    async def test_legacy_checkpoint_rejects_concurrent_cache_hit(self):
+        from agent_framework import WorkflowCheckpoint
+
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def shared_step(value: str) -> str:
+            return f"result:{value}"
+
+        @built_workflow(name="legacy_parallel", checkpoint_storage=storage)
+        async def wf(_: str) -> list[str]:
+            return list(await asyncio.gather(shared_step("A"), shared_step("B")))
+
+        checkpoint = WorkflowCheckpoint(
+            workflow_name="legacy_parallel",
+            graph_signature_hash=wf.graph_signature_hash,
+            state={
+                "_step_cache": {"shared_step::0": "result:B"},
+                "_step_cache_auto_request_info_counts": {"shared_step::0": 0},
+                "_original_message": "input",
+            },
+        )
+        checkpoint_id = await storage.save(checkpoint)
+
+        with pytest.raises(ValueError, match="legacy order-based cache entry"):
+            await wf.run(checkpoint_id=checkpoint_id)
+
+    async def test_legacy_checkpoint_rejects_root_hit_while_child_is_active(self):
+        from agent_framework import WorkflowCheckpoint
+
+        storage = InMemoryCheckpointStorage()
+        child_started = asyncio.Event()
+        release_child = asyncio.Event()
+
+        @step
+        async def shared_step(value: str) -> str:
+            return f"result:{value}"
+
+        async def active_child() -> None:
+            child_started.set()
+            await release_child.wait()
+
+        @built_workflow(name="legacy_root_parallel", checkpoint_storage=storage)
+        async def wf(_: str) -> str:
+            child = asyncio.create_task(active_child())
+            await child_started.wait()
+            try:
+                return await shared_step("root")
+            finally:
+                release_child.set()
+                await child
+
+        checkpoint = WorkflowCheckpoint(
+            workflow_name="legacy_root_parallel",
+            graph_signature_hash=wf.graph_signature_hash,
+            state={
+                "_step_cache": {"shared_step::0": "result:branch"},
+                "_step_cache_auto_request_info_counts": {"shared_step::0": 0},
+                "_original_message": "input",
+            },
+        )
+        checkpoint_id = await storage.save(checkpoint)
+
+        with pytest.raises(ValueError, match="legacy order-based cache entry"):
+            await wf.run(checkpoint_id=checkpoint_id)
+
+    async def test_legacy_sequential_replay_ignores_unrelated_caller_task(self):
+        from agent_framework import WorkflowCheckpoint
+
+        storage = InMemoryCheckpointStorage()
+        workflow_waiting = asyncio.Event()
+        release_workflow = asyncio.Event()
+        release_unrelated = asyncio.Event()
+
+        @step
+        async def compute(value: int) -> int:
+            return value + 1
+
+        @built_workflow(name="legacy_sequential", checkpoint_storage=storage)
+        async def wf(value: int) -> int:
+            workflow_waiting.set()
+            await release_workflow.wait()
+            return await compute(value)
+
+        checkpoint = WorkflowCheckpoint(
+            workflow_name="legacy_sequential",
+            graph_signature_hash=wf.graph_signature_hash,
+            state={
+                "_step_cache": {"compute::0": 6},
+                "_step_cache_auto_request_info_counts": {"compute::0": 0},
+                "_original_message": 5,
+            },
+        )
+        checkpoint_id = await storage.save(checkpoint)
+        loop = asyncio.get_running_loop()
+        original_factory = loop.get_task_factory()
+
+        replay_task = asyncio.ensure_future(wf.run(checkpoint_id=checkpoint_id))
+        await workflow_waiting.wait()
+        unrelated_task = asyncio.create_task(release_unrelated.wait())
+        release_workflow.set()
+        replayed = await replay_task
+
+        assert replayed.get_outputs() == [6]
+        assert loop.get_task_factory() is original_factory
+
+        release_unrelated.set()
+        await unrelated_task
+
+    async def test_task_tracking_preserves_existing_loop_factory(self):
+        loop = asyncio.get_running_loop()
+        original_factory = loop.get_task_factory()
+        created_tasks: list[asyncio.Future[Any]] = []
+
+        def custom_factory(
+            task_loop: asyncio.AbstractEventLoop,
+            coro: Any,
+            **kwargs: Any,
+        ) -> asyncio.Future[Any]:
+            task = asyncio.Task(coro, loop=task_loop, **kwargs)
+            created_tasks.append(task)
+            return task
+
+        loop.set_task_factory(custom_factory)
+        try:
+
+            @step
+            async def compute(value: int) -> int:
+                return value + 1
+
+            @built_workflow
+            async def wf(value: int) -> int:
+                return (await asyncio.gather(compute(value)))[0]
+
+            result = await wf.run(1)
+
+            assert result.get_outputs() == [2]
+            assert created_tasks
+            assert loop.get_task_factory() is custom_factory
+        finally:
+            loop.set_task_factory(original_factory)
+
+    async def test_versioned_identity_precedes_unrelated_legacy_entry(self):
+        from agent_framework import WorkflowCheckpoint
+
+        storage = InMemoryCheckpointStorage()
+        calls: list[str] = []
+
+        @step(replay_key=lambda value: value)
+        async def mixed(value: str) -> str:
+            calls.append(value)
+            return f"live:{value}"
+
+        @built_workflow(name="mixed_wf", checkpoint_storage=storage)
+        async def wf(_: str) -> str:
+            return (await asyncio.gather(mixed("child")))[0]
+
+        replay_identity = mixed._get_replay_identity(("child",), {})  # pyright: ignore[reportPrivateUsage]
+        assert replay_identity is not None
+        identity_kind, identity = replay_identity
+        assert identity_kind == "explicit"
+        key_ctx = _RunContext("mixed_wf")
+        versioned_key = key_ctx._get_explicit_step_cache_key(  # pyright: ignore[reportPrivateUsage]
+            "mixed",
+            mixed._wrapper_source_identity,  # pyright: ignore[reportPrivateUsage]
+            identity,
+        )
+        checkpoint = WorkflowCheckpoint(
+            workflow_name="mixed_wf",
+            graph_signature_hash=wf.graph_signature_hash,
+            state={
+                "_step_cache": {
+                    "mixed::0": "legacy:other-call",
+                    versioned_key: "cached:child",
+                },
+                "_step_cache_auto_request_info_counts": {
+                    "mixed::0": 0,
+                    versioned_key: 0,
+                },
+                "_original_message": "input",
+            },
+        )
+        checkpoint_id = await storage.save(checkpoint)
+
+        replayed = await wf.run(checkpoint_id=checkpoint_id)
+
+        assert replayed.get_outputs() == ["cached:child"]
+        assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Branching / control flow
+# ---------------------------------------------------------------------------
+
+
+class TestControlFlow:
+    async def test_if_else_branching(self):
+        @dataclass
+        class Classification:
+            is_spam: bool
+
+        @step
+        async def classify(text: str) -> Classification:
+            return Classification(is_spam="spam" in text.lower())
+
+        @step
+        async def process_normal(text: str) -> str:
+            return f"processed: {text}"
+
+        @step
+        async def quarantine(text: str) -> str:
+            return f"quarantined: {text}"
+
+        @built_workflow
+        async def email_pipeline(email: str) -> str:
+            cl = await classify(email)
+            if cl.is_spam:
+                result = await quarantine(email)
+            else:
+                result = await process_normal(email)
+            return result
+
+        result_spam = await email_pipeline.run("Buy spam now!")
+        assert result_spam.get_outputs() == ["quarantined: Buy spam now!"]
+
+        result_normal = await email_pipeline.run("Hello friend")
+        assert result_normal.get_outputs() == ["processed: Hello friend"]
+
+
+# ---------------------------------------------------------------------------
+# Nested workflow calls
+# ---------------------------------------------------------------------------
+
+
+class TestNestedWorkflows:
+    async def test_nested_workflow_as_task(self):
+        @step
+        async def step_a(x: int) -> int:
+            return x + 1
+
+        @built_workflow
+        async def inner_wf(x: int) -> int:
+            return await step_a(x)
+
+        @step
+        async def call_inner(x: int) -> int:
+            result = await inner_wf.run(x)
+            return result.get_outputs()[0]
+
+        @built_workflow
+        async def outer_wf(x: int) -> int:
+            return await call_inner(x)
+
+        result = await outer_wf.run(5)
+        assert result.get_outputs() == [6]
+
+
+# ---------------------------------------------------------------------------
+# as_agent()
+# ---------------------------------------------------------------------------
+
+
+class TestAsAgent:
+    async def test_as_agent_returns_agent(self):
+        @built_workflow
+        async def wf(x: int) -> str:
+            return f"result: {x}"
+
+        agent = wf.as_agent()
+        assert agent.name == "wf"
+
+    async def test_as_agent_custom_name(self):
+        @built_workflow
+        async def wf(x: int) -> int:
+            return x
+
+        agent = wf.as_agent(name="my_agent")
+        assert agent.name == "my_agent"
+
+    async def test_as_agent_run(self):
+        @built_workflow
+        async def wf(x: int) -> int:
+            return await add_one(x)
+
+        agent = wf.as_agent()
+        response = await agent.run(10)
+        assert response.text == "11"
+
+    async def test_as_agent_run_streaming(self):
+        @built_workflow
+        async def wf(x: int) -> str:
+            return f"result: {x}"
+
+        agent = wf.as_agent()
+        stream = agent.run(10, stream=True)
+        updates: list[AgentResponseUpdate] = []
+        async for update in stream:
+            updates.append(update)
+        assert len(updates) == 1
+        assert updates[0].text == "result: 10"
+
+        response = await stream.get_final_response()
+        assert len(response.messages) >= 1
+
+    async def test_as_agent_has_id_and_description(self):
+        @built_workflow(description="A test workflow")
+        async def wf(x: int) -> int:
+            return x
+
+        agent = wf.as_agent(name="my_agent")
+        assert agent.id == "FunctionalWorkflowAgent_my_agent"
+        assert agent.description == "A test workflow"
+
+    async def test_as_agent_implements_supports_agent_run(self):
+        @built_workflow
+        async def wf(x: int) -> int:
+            return x
+
+        assert isinstance(wf.as_agent(), SupportsAgentRun)
+
+
+# ---------------------------------------------------------------------------
+# Concurrent execution guard
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrencyGuard:
+    async def test_concurrent_run_raises(self):
+        @built_workflow
+        async def slow_wf(x: int) -> int:
+            await asyncio.sleep(0.1)
+            return x
+
+        # Start first run
+        stream = slow_wf.run(1, stream=True)
+
+        # Try to start second run while first is active
+        with pytest.raises(RuntimeError, match="already running"):
+            slow_wf.run(2, stream=True)
+
+        # Consume the stream to clean up
+        await stream.get_final_response()
+
+    async def test_run_after_completion(self):
+        @built_workflow
+        async def wf(x: int) -> int:
+            return x
+
+        result1 = await wf.run(1)
+        assert result1.get_outputs() == [1]
+
+        # Should be able to run again after first completes
+        result2 = await wf.run(2)
+        assert result2.get_outputs() == [2]
+
+
+# ---------------------------------------------------------------------------
+# Decorator forms
+# ---------------------------------------------------------------------------
+
+
+class TestDecoratorForms:
+    def test_step_bare_decorator(self):
+        @step
+        async def my_step(x: int) -> int:
+            return x
+
+        assert isinstance(my_step, StepWrapper)
+        assert my_step.name == "my_step"
+
+    def test_step_with_name(self):
+        @step(name="renamed")
+        async def my_step(x: int) -> int:
+            return x
+
+        assert isinstance(my_step, StepWrapper)
+        assert my_step.name == "renamed"
+
+    def test_workflow_bare_decorator(self):
+        @workflow
+        async def my_wf(x: int) -> None:
+            pass
+
+        assert isinstance(my_wf, FunctionalWorkflowDefinition)
+        assert my_wf.name == "my_wf"
+
+    def test_workflow_with_params(self):
+        @workflow(name="custom", description="desc")
+        async def my_wf(x: int) -> None:
+            pass
+
+        assert isinstance(my_wf, FunctionalWorkflowDefinition)
+        assert my_wf.name == "custom"
+        assert my_wf.description == "desc"
+
+
+# ---------------------------------------------------------------------------
+# include_status_events
+# ---------------------------------------------------------------------------
+
+
+class TestIncludeStatusEvents:
+    async def test_status_events_excluded_by_default(self):
+        @built_workflow
+        async def wf(x: int) -> int:
+            return x
+
+        result = await wf.run(1)
+        status_in_list = [e for e in result if e.type == "status"]
+        assert len(status_in_list) == 0
+
+    async def test_status_events_included_when_requested(self):
+        @built_workflow
+        async def wf(x: int) -> int:
+            return x
+
+        result = await wf.run(1, include_status_events=True)
+        status_in_list = [e for e in result if e.type == "status"]
+        assert len(status_in_list) > 0
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+
+class TestEdgeCases:
+    async def test_workflow_with_no_tasks(self):
+        @built_workflow
+        async def no_tasks(x: int) -> int:
+            return x * 2
+
+        result = await no_tasks.run(5)
+        assert result.get_outputs() == [10]
+
+    async def test_workflow_with_no_output(self):
+        @built_workflow
+        async def silent_wf(x: int) -> None:
+            pass  # returns None — no output emitted
+
+        result = await silent_wf.run(5)
+        assert result.get_outputs() == []
+
+    async def test_return_value_auto_yields_output(self):
+        """Returning a non-None value automatically emits it as an output."""
+
+        @built_workflow
+        async def wf(x: int) -> int:
+            return x * 3
+
+        result = await wf.run(5)
+        assert result.get_outputs() == [15]
+
+    async def test_step_called_multiple_times(self):
+        @built_workflow
+        async def wf(x: int) -> int:
+            a = await add_one(x)
+            b = await add_one(a)
+            return await add_one(b)
+
+        result = await wf.run(0)
+        assert result.get_outputs() == [3]  # 0+1+1+1
+
+        # Should have 3 invoked and 3 completed events for add_one
+        invoked = [e for e in result if e.type == "executor_invoked"]
+        completed = [e for e in result if e.type == "executor_completed"]
+        assert len(invoked) == 3
+        assert len(completed) == 3
+
+
+# ---------------------------------------------------------------------------
+# Recovery after errors
+# ---------------------------------------------------------------------------
+
+
+class TestRecoveryAfterErrors:
+    async def test_run_after_failure_is_allowed(self):
+        @built_workflow
+        async def wf(x: int) -> int:
+            if x == 1:
+                raise RuntimeError("boom")
+            return x
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await wf.run(1)
+
+        # Must be able to run again after the failure
+        result = await wf.run(2)
+        assert result.get_outputs() == [2]
+
+    async def test_step_sync_function_raises(self):
+        with pytest.raises(TypeError, match="async functions"):
+
+            @step  # type: ignore[arg-type, call-overload]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]  # pyright: ignore[reportArgumentType]
+            def not_async(x: int) -> int:  # pyright: ignore[reportUnusedFunction]
+                return x
+
+
+# ---------------------------------------------------------------------------
+# WorkflowInterrupted is BaseException
+# ---------------------------------------------------------------------------
+
+
+class TestWorkflowInterruptedIsBaseException:
+    async def test_except_exception_does_not_catch_interrupt(self):
+        """User code with ``except Exception`` should not catch WorkflowInterrupted."""
+        caught = False
+
+        @built_workflow
+        async def wf(x: int, ctx: RunContext) -> str:
+            nonlocal caught
+            try:
+                return await ctx.request_info("need review", response_type=str, request_id="r1")
+            except Exception:
+                # This should NOT catch WorkflowInterrupted
+                caught = True
+                return "caught!"
+
+        result = await wf.run("data")
+        # Should have a pending request, NOT "caught!"
+        assert result.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+        assert result.get_outputs() == []
+        assert caught is False
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint validation
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointValidation:
+    def test_wrapper_identity_includes_code_constants(self):
+        async def plus_one(value: int) -> int:
+            return value + 1
+
+        async def plus_two(value: int) -> int:
+            return value + 2
+
+        first = FunctionType(plus_one.__code__.replace(co_firstlineno=1), globals(), "generated")
+        second = FunctionType(plus_two.__code__.replace(co_firstlineno=1), globals(), "generated")
+        first.__module__ = second.__module__ = "test_module"
+        first.__qualname__ = second.__qualname__ = "generated"
+
+        first_identity, first_is_durable = _get_step_wrapper_identity(first)
+        second_identity, second_is_durable = _get_step_wrapper_identity(second)
+
+        assert first_is_durable is True
+        assert second_is_durable is True
+        assert first_identity != second_identity
+
+    def test_wrapper_identity_includes_defaults_and_closure_state(self):
+        async def template(value: int = 0) -> int:
+            return value
+
+        first_default = FunctionType(template.__code__, globals(), "generated", (1,))
+        second_default = FunctionType(template.__code__, globals(), "generated", (2,))
+        first_default.__module__ = second_default.__module__ = "test_module"
+        first_default.__qualname__ = second_default.__qualname__ = "generated"
+
+        def make(label: str) -> Callable[[int], Awaitable[str]]:
+            async def generated(value: int) -> str:
+                return f"{label}:{value}"
+
+            return generated
+
+        first_closure = make("first")
+        second_closure = make("second")
+
+        assert _get_step_wrapper_identity(first_default)[0] != _get_step_wrapper_identity(second_default)[0]
+        first_closure_identity, first_closure_is_durable = _get_step_wrapper_identity(first_closure)
+        second_closure_identity, second_closure_is_durable = _get_step_wrapper_identity(second_closure)
+        assert first_closure_is_durable is False
+        assert second_closure_is_durable is False
+        assert first_closure_identity != second_closure_identity
+
+    def test_wrapper_identity_marks_mutable_closure_state_non_durable(self):
+        state = ["A"]
+
+        async def generated(value: str) -> str:
+            return f"{state[0]}:{value}"
+
+        _, is_durable = _get_step_wrapper_identity(generated)
+
+        assert is_durable is False
+
+    def test_attribute_name_does_not_discover_same_named_global_helper(self):
+        @step
+        async def unrelated_step(value: str) -> str:
+            return value
+
+        async def unrelated_helper(value: str) -> str:
+            return await unrelated_step(value)
+
+        class Client:
+            async def signature_probe(self, value: str) -> str:
+                return value
+
+        client = Client()
+        globals()["signature_probe"] = unrelated_helper
+        try:
+
+            @built_workflow
+            async def wf(value: str) -> str:
+                return await client.signature_probe(value)
+
+            wrappers, _ = wf._discover_workflow_dependencies(wf._func)  # pyright: ignore[reportPrivateUsage]
+        finally:
+            del globals()["signature_probe"]
+
+        assert unrelated_step not in wrappers
+
+    async def test_checkpoint_signature_mismatch_raises(self):
+        from agent_framework import WorkflowCheckpoint
+
+        storage = InMemoryCheckpointStorage()
+
+        @built_workflow(name="my_wf", checkpoint_storage=storage)
+        async def wf(x: int) -> int:
+            return x
+
+        # Manually create a checkpoint with a different signature hash
+        bad_checkpoint = WorkflowCheckpoint(
+            workflow_name="my_wf",
+            graph_signature_hash="totally_different_hash",
+            state={"_step_cache": {}, "_original_message": 1},
+        )
+        ckpt_id = await storage.save(bad_checkpoint)
+
+        # Should fail due to hash mismatch
+        with pytest.raises(ValueError, match="not compatible"):
+            await wf.run(checkpoint_id=ckpt_id)
+
+    async def test_import_step_cache_malformed_key(self):
+        ctx = _RunContext("test")
+        with pytest.raises(ValueError, match="Corrupted step cache"):
+            ctx._import_step_cache({"invalid_key_no_separator": 42})  # pyright: ignore[reportPrivateUsage]
+
+    async def test_import_step_cache_non_integer_index(self):
+        ctx = _RunContext("test")
+        with pytest.raises(ValueError, match="Corrupted step cache"):
+            ctx._import_step_cache({"step_name::abc": 42})  # pyright: ignore[reportPrivateUsage]
+
+    async def test_step_cache_round_trips_versioned_and_legacy_keys(self):
+        ctx = _RunContext("test")
+        automatic_key = ctx._get_automatic_step_cache_key(  # pyright: ignore[reportPrivateUsage]
+            "automatic",
+            "a" * 64,
+            "b" * 64,
+        )
+        explicit_key = ctx._get_explicit_step_cache_key(  # pyright: ignore[reportPrivateUsage]
+            "explicit",
+            "c" * 64,
+            "b" * 64,
+        )
+        ctx._step_cache = {automatic_key: "auto", explicit_key: "explicit", "legacy::0": "legacy"}
+        ctx._step_cache_auto_request_info_counts = {automatic_key: 1, explicit_key: 2, "legacy::0": 3}
+
+        restored = _RunContext("test")
+        restored._import_step_cache(ctx._export_step_cache())  # pyright: ignore[reportPrivateUsage]
+        restored._import_step_cache_auto_request_info_counts(  # pyright: ignore[reportPrivateUsage]
+            ctx._export_step_cache_auto_request_info_counts()
+        )
+
+        assert restored._step_cache == ctx._step_cache
+        assert restored._step_cache_auto_request_info_counts == ctx._step_cache_auto_request_info_counts
+
+    async def test_import_step_cache_rejects_malformed_versioned_key(self):
+        ctx = _RunContext("test")
+        with pytest.raises(ValueError, match="Corrupted step cache"):
+            ctx._import_step_cache(  # pyright: ignore[reportPrivateUsage]
+                {'v2::["auto","step","identity",-1]': 42}
+            )
+
+
+# ---------------------------------------------------------------------------
+# executor_bypassed event on replay (review comment #3)
+# ---------------------------------------------------------------------------
+
+
+class TestExecutorBypassed:
+    async def test_cached_step_emits_bypassed_event(self):
+        """When a step replays from cache, it should emit executor_bypassed."""
+        storage = InMemoryCheckpointStorage()
+        call_count = 0
+
+        @step(replay_key=lambda x: str(x))
+        async def tracked(x: int) -> int:
+            nonlocal call_count
+            call_count += 1
+            return x + 1
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(x: int) -> int:
+            return await tracked(x)
+
+        # First run — live execution
+        result1 = await wf.run(5)
+        assert result1.get_outputs() == [6]
+        assert call_count == 1
+
+        event_types1 = [e.type for e in result1]
+        assert "executor_invoked" in event_types1
+        assert "executor_completed" in event_types1
+        assert "executor_bypassed" not in event_types1
+
+        # Restore from checkpoint — cached replay
+        ckpt_id = (await storage.list_checkpoints(workflow_name="wf"))[-1].checkpoint_id
+        result2 = await wf.run(checkpoint_id=ckpt_id)
+        assert result2.get_outputs() == [6]
+        assert call_count == 1  # not called again
+
+        event_types2 = [e.type for e in result2]
+        assert "executor_bypassed" in event_types2
+        # Should NOT have the live-execution pair
+        assert "executor_invoked" not in event_types2
+        assert "executor_completed" not in event_types2
+
+    async def test_bypassed_event_carries_cached_data(self):
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def compute(x: int) -> int:
+            return x * 10
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(x: int) -> int:
+            return await compute(x)
+
+        await wf.run(3)
+        ckpt_id = (await storage.list_checkpoints(workflow_name="wf"))[-1].checkpoint_id
+
+        result = await wf.run(checkpoint_id=ckpt_id)
+        bypassed = [e for e in result if e.type == "executor_bypassed"]
+        assert len(bypassed) == 1
+        assert bypassed[0].executor_id == "compute"
+        assert bypassed[0].data == 30
+
+
+# ---------------------------------------------------------------------------
+# request_info inside @step (review comment #1)
+# ---------------------------------------------------------------------------
+
+
+class TestRequestInfoInStep:
+    async def test_step_with_run_context_injection(self):
+        """A @step function with a RunContext parameter gets it auto-injected."""
+
+        @step
+        async def review_step(doc: str, ctx: RunContext) -> str:
+            feedback = await ctx.request_info({"draft": doc}, response_type=str, request_id="s1")
+            return f"reviewed: {feedback}"
+
+        @built_workflow
+        async def wf(doc: str) -> str:
+            return await review_step(doc)
+
+        # Phase 1: should interrupt
+        result1 = await wf.run("my doc")
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+        assert len(result1.get_request_info_events()) == 1
+        assert result1.get_request_info_events()[0].request_id == "s1"
+
+        # Phase 2: resume
+        result2 = await wf.run(responses={"s1": "LGTM"})
+        assert result2.get_outputs() == ["reviewed: LGTM"]
+
+    async def test_step_works_outside_workflow_with_explicit_ctx(self):
+        """Outside a workflow, the step is transparent — caller provides ctx."""
+
+        @step
+        async def needs_ctx(data: str, ctx: RunContext) -> str:
+            val = ctx.get_state("key", "default")
+            return f"{data}:{val}"
+
+        # Outside a workflow, pass through directly — caller supplies ctx
+        ctx = RunContext("test")
+        ctx.set_state("key", "hello")
+        result = await needs_ctx("data", ctx)
+        assert result == "data:hello"
+
+    async def test_step_injects_ctx_before_user_positional_parameters(self):
+        """RunContext injection should not conflict when ctx is the first step parameter."""
+
+        @step
+        async def needs_ctx_first(ctx: RunContext, data: str) -> str:
+            ctx.set_state("seen", data)
+            return f"{data}:{ctx.get_state('seen')}"
+
+        @built_workflow
+        async def wf(data: str) -> str:
+            return await needs_ctx_first(data)
+
+        result = await wf.run("draft")
+
+        assert result.get_outputs() == ["draft:draft"]
+
+    async def test_get_run_context_inside_workflow(self):
+        """get_run_context() returns the active RunContext inside a workflow."""
+        from agent_framework import get_run_context
+
+        captured_ctx = None
+
+        @step
+        async def capture_ctx(x: int) -> int:
+            nonlocal captured_ctx
+            captured_ctx = get_run_context()  # type: ignore[assignment]
+            return x
+
+        @built_workflow
+        async def wf(x: int) -> int:
+            return await capture_ctx(x)
+
+        await wf.run(1)
+        assert captured_ctx is not None
+        assert isinstance(captured_ctx, RunContext)
+
+    async def test_get_run_context_outside_workflow(self):
+        """get_run_context() returns None outside a workflow."""
+        from agent_framework import get_run_context
+
+        assert get_run_context() is None
+
+
+# ---------------------------------------------------------------------------
+# None response handling (review comment #2)
+# ---------------------------------------------------------------------------
+
+
+class TestNoneResponseHandling:
+    async def test_none_response_logs_warning(self):
+        """Providing None as a response value should log a warning."""
+
+        @built_workflow
+        async def wf(doc: str, ctx: RunContext) -> str:
+            val = await ctx.request_info("need input", response_type=str, request_id="r1")
+            return f"got: {val}"
+
+        # Phase 1
+        await wf.run("start")
+
+        # Phase 2: resume with None response — should warn but still work
+        with caplog_context(logging.getLogger("agent_framework._workflows._functional")) as logs:
+            result = await wf.run(responses={"r1": None})
+
+        assert result.get_outputs() == ["got: None"]
+        assert any("None" in msg and "r1" in msg for msg in logs)
+
+    async def test_none_response_is_returned(self):
+        """None is a valid (if discouraged) response value."""
+
+        @built_workflow
+        async def wf(x: int, ctx: RunContext) -> str:
+            val = await ctx.request_info("need data", response_type=str, request_id="r1")
+            return f"value={val}"
+
+        await wf.run(1)
+        result = await wf.run(responses={"r1": None})
+        assert result.get_outputs() == ["value=None"]
+
+
+# Helper for capturing log messages
+
+
+@contextmanager
+def caplog_context(target_logger: logging.Logger) -> Generator[list[str]]:
+    """Capture log messages from a specific logger."""
+    messages: list[str] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(self.format(record))
+
+    handler = _Handler()
+    handler.setLevel(logging.WARNING)
+    target_logger.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        target_logger.removeHandler(handler)
+
+
+# ---------------------------------------------------------------------------
+# Combined regression tests (cross-cutting review comments #1, #2, #3)
+# ---------------------------------------------------------------------------
+
+
+class TestHITLInStepWithCaching:
+    """Regression tests: request_info inside @step combined with caching and bypass."""
+
+    def test_replay_state_helpers_restore_and_clear_the_full_bundle(self):
+        """Replay helpers keep message, caches, state, and pending IDs together."""
+
+        @built_workflow
+        async def wf(data: str) -> str:
+            return data
+
+        source_ctx = _RunContext("wf")
+        source_ctx._step_cache = {"seed_state::0": "seeded"}
+        source_ctx._step_cache_auto_request_info_counts = {"seed_state::0": 1}
+        source_ctx._state = {"marker": "ok"}
+        source_ctx._pending_requests = {
+            "r1": WorkflowEvent.request_info(
+                request_id="r1",
+                source_executor_id="wf",
+                request_data="question",
+                response_type=str,
+            )
+        }
+
+        wf._capture_replay_state(source_ctx, "input")
+
+        restored_ctx = _RunContext("wf")
+        assert wf._restore_replay_state(restored_ctx) == "input"
+        assert restored_ctx._step_cache == source_ctx._step_cache
+        assert restored_ctx._step_cache_auto_request_info_counts == source_ctx._step_cache_auto_request_info_counts
+        assert restored_ctx._state == source_ctx._state
+        assert wf._last_pending_request_ids == {"r1"}
+
+        wf._clear_replay_state()
+
+        assert wf._last_message is None
+        assert wf._last_step_cache == {}
+        assert wf._last_step_cache_auto_request_info_counts == {}
+        assert wf._last_state == {}
+        assert wf._last_pending_request_ids == set()
+
+    async def test_response_only_resume_restores_state_from_cached_step(self):
+        """Response-only HITL resumes must preserve state written before a cached step."""
+        seed_calls = 0
+
+        @step(replay_key=lambda: "seed")
+        async def seed_state(ctx: RunContext) -> str:
+            nonlocal seed_calls
+            seed_calls += 1
+            ctx.set_state("marker", "ok")
+            return "seeded"
+
+        @built_workflow
+        async def wf(data: str, ctx: RunContext) -> str:
+            value = await seed_state()
+            answer = await ctx.request_info("question", response_type=str, request_id="r1")
+            return f"{ctx.get_state('marker', 'MISSING')}:{value}:{answer}"
+
+        result1 = await wf.run("input")
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+
+        result2 = await wf.run(responses={"r1": "ok"})
+
+        assert seed_calls == 1
+        assert result2.get_outputs() == ["ok:seeded:ok"]
+
+    async def test_preceding_step_bypassed_on_hitl_resume(self):
+        """When a step after a completed step calls request_info and interrupts,
+        resuming should bypass the first step (cached) and re-execute the HITL step."""
+        call_count_a = 0
+
+        @step(replay_key=lambda x: str(x))
+        async def step_a(x: int) -> int:
+            nonlocal call_count_a
+            call_count_a += 1
+            return x + 1
+
+        @step
+        async def step_b(val: int, ctx: RunContext) -> str:
+            feedback = await ctx.request_info({"val": val}, response_type=str, request_id="r1")
+            return f"{val}:{feedback}"
+
+        @built_workflow
+        async def wf(x: int) -> str:
+            a = await step_a(x)
+            return await step_b(a)
+
+        # Phase 1: step_a completes, step_b interrupts
+        result1 = await wf.run(5)
+        assert call_count_a == 1
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+
+        # Phase 2: resume — step_a should be bypassed, step_b re-executes
+        result2 = await wf.run(responses={"r1": "ok"})
+        assert call_count_a == 1  # step_a not called again
+        assert result2.get_outputs() == ["6:ok"]
+
+        event_types = [e.type for e in result2]
+        assert "executor_bypassed" in event_types
+
+    async def test_hitl_step_with_checkpoint_full_lifecycle(self):
+        """Full lifecycle: run -> interrupt -> resume -> checkpoint restore -> all bypassed."""
+        storage = InMemoryCheckpointStorage()
+
+        @step
+        async def compute(x: int) -> int:
+            return x * 10
+
+        @step
+        async def review(val: int, ctx: RunContext) -> str:
+            feedback = await ctx.request_info({"val": val}, response_type=str, request_id="rev")
+            return f"reviewed({val}):{feedback}"
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(x: int) -> str:
+            v = await compute(x)
+            return await review(v)
+
+        # Phase 1: interrupt
+        result1 = await wf.run(3)
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+
+        # Phase 2: resume
+        result2 = await wf.run(responses={"rev": "LGTM"})
+        assert result2.get_outputs() == ["reviewed(30):LGTM"]
+
+        # Phase 3: restore from latest checkpoint -- both steps should be bypassed
+        ckpt_id = (await storage.list_checkpoints(workflow_name="wf"))[-1].checkpoint_id
+        result3 = await wf.run(checkpoint_id=ckpt_id)
+        assert result3.get_outputs() == ["reviewed(30):LGTM"]
+
+        event_types3 = [e.type for e in result3]
+        bypassed = [e for e in result3 if e.type == "executor_bypassed"]
+        assert len(bypassed) == 2
+        assert "executor_invoked" not in event_types3
+
+    async def test_none_response_in_step_request_info(self):
+        """None response inside a @step request_info should warn and return None."""
+
+        @step
+        async def needs_feedback(doc: str, ctx: RunContext) -> str:
+            val = await ctx.request_info({"doc": doc}, response_type=str, request_id="r1")
+            return f"got:{val}"
+
+        @built_workflow
+        async def wf(doc: str) -> str:
+            return await needs_feedback(doc)
+
+        await wf.run("draft")
+
+        with caplog_context(logging.getLogger("agent_framework._workflows._functional")) as logs:
+            result = await wf.run(responses={"r1": None})
+
+        assert result.get_outputs() == ["got:None"]
+        assert any("None" in msg and "r1" in msg for msg in logs)
+
+    async def test_step_hitl_does_not_emit_executor_failed(self):
+        """WorkflowInterrupted from request_info inside a step should NOT emit executor_failed."""
+
+        @step
+        async def hitl_step(x: int, ctx: RunContext) -> str:
+            return await ctx.request_info("need data", response_type=str, request_id="r1")
+
+        @built_workflow
+        async def wf(x: int) -> str:
+            return await hitl_step(x)
+
+        result = await wf.run(1)
+        event_types = [e.type for e in result]
+        assert "executor_failed" not in event_types
+        assert result.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for ultrareview findings
+# ---------------------------------------------------------------------------
+
+
+class TestDeterministicAutoRequestId:
+    """Regression for bug_001: auto-generated request_info ids must be stable across replay."""
+
+    async def test_auto_request_id_roundtrips_on_resume(self):
+        @built_workflow
+        async def wf(x: int, ctx: RunContext) -> str:
+            # No request_id — framework must generate a deterministic one
+            val = await ctx.request_info("need data", response_type=str)
+            return f"got:{val}"
+
+        result1 = await wf.run(1)
+        assert result1.get_final_state() == WorkflowRunState.IDLE_WITH_PENDING_REQUESTS
+        requests = result1.get_request_info_events()
+        assert len(requests) == 1
+        rid = requests[0].request_id
+        assert rid  # non-empty
+
+        # Resume with the id the caller just received.
+        result2 = await wf.run(responses={rid: "hello"})
+        assert result2.get_final_state() == WorkflowRunState.IDLE
+        assert result2.get_outputs() == ["got:hello"]
+
+    async def test_multiple_auto_ids_are_distinct_and_stable(self):
+        @built_workflow
+        async def wf(x: int, ctx: RunContext) -> str:
+            a = await ctx.request_info("first", response_type=str)
+            b = await ctx.request_info("second", response_type=str)
+            return f"{a}/{b}"
+
+        r1 = await wf.run(1)
+        rid1 = r1.get_request_info_events()[0].request_id
+        r2 = await wf.run(responses={rid1: "A"})
+        rid2 = r2.get_request_info_events()[0].request_id
+        assert rid1 != rid2
+        r3 = await wf.run(responses={rid1: "A", rid2: "B"})
+        assert r3.get_outputs() == ["A/B"]
+
+    async def test_cached_step_advances_auto_request_id_counter(self):
+        call_count = 0
+
+        @step(replay_key=lambda value: str(value))
+        async def first_review(value: int, ctx: RunContext) -> str:
+            nonlocal call_count
+            call_count += 1
+            return await ctx.request_info({"step": "first", "value": value}, response_type=str)
+
+        @step
+        async def second_review(value: int, ctx: RunContext) -> str:
+            return await ctx.request_info({"step": "second", "value": value}, response_type=str)
+
+        @built_workflow
+        async def wf(value: int) -> str:
+            first = await first_review(value)
+            second = await second_review(value)
+            return f"{first}/{second}"
+
+        first_run = await wf.run(1)
+        first_request_id = first_run.get_request_info_events()[0].request_id
+        assert first_request_id == "auto::0"
+
+        second_run = await wf.run(responses={first_request_id: "A"})
+        second_request_id = second_run.get_request_info_events()[0].request_id
+        assert second_request_id == "auto::1"
+        completed_call_count = call_count
+
+        final_run = await wf.run(responses={first_request_id: "A", second_request_id: "B"})
+
+        assert call_count == completed_call_count
+        assert final_run.get_outputs() == ["A/B"]
+
+
+class TestPendingRequestsPruned:
+    """Regression for bug_007: resolved requests must be pruned from _pending_requests."""
+
+    async def test_final_checkpoint_no_longer_claims_resolved_requests_pending(self):
+        storage = InMemoryCheckpointStorage()
+
+        @built_workflow(checkpoint_storage=storage)
+        async def wf(x: int, ctx: RunContext) -> str:
+            a = await ctx.request_info("q1", response_type=str, request_id="r1")
+            b = await ctx.request_info("q2", response_type=str, request_id="r2")
+            return f"{a}/{b}"
+
+        await wf.run(1)
+        await wf.run(responses={"r1": "A"})
+        result = await wf.run(responses={"r1": "A", "r2": "B"})
+        assert result.get_final_state() == WorkflowRunState.IDLE
+        # Latest checkpoint must show no pending requests.
+        checkpoints = await storage.list_checkpoints(workflow_name="wf")
+        assert checkpoints, "expected at least one checkpoint to have been saved"
+        final = checkpoints[-1]
+        assert final.pending_request_info_events == {}
+
+
+class TestArityValidation:
+    """Regression for merged_bug_003: validate workflow signature arity."""
+
+    def test_multi_non_ctx_param_rejected_at_decoration(self):
+        with pytest.raises(ValueError, match="multiple non-RunContext parameters"):
+
+            @workflow
+            async def wf(a: str, b: str, ctx: RunContext) -> str:
+                return f"{a}+{b}"
+
+    async def test_ctx_only_workflow_with_message_raises_clear_error(self):
+        @built_workflow
+        async def wf(ctx: RunContext) -> str:
+            return "no message used"
+
+        with pytest.raises(ValueError, match="no non-RunContext parameter"):
+            await wf.run("important input")
+
+    def test_ctx_only_workflow_decoration_succeeds(self):
+        # Decoration must not raise even though the workflow has no
+        # message-receiving parameter.  (Running it without a message still
+        # requires providing responses or a checkpoint_id — that's
+        # _validate_run_params's job, not ours.)
+        @built_workflow
+        async def wf(ctx: RunContext) -> str:
+            return "ok"
+
+        assert wf is not None
+
+
+class TestStaleResponsesRejected:
+    """Regression for bug_014: stale responses after clean completion must be rejected."""
+
+    async def test_responses_after_clean_completion_raise(self):
+        @built_workflow
+        async def wf(x: int) -> int:
+            return x * 2
+
+        await wf.run(5)  # clean completion, no pending requests
+        with pytest.raises(ValueError, match="no pending request_info"):
+            await wf.run(responses={"stale": "x"})
+
+    async def test_responses_mismatched_key_raises(self):
+        @built_workflow
+        async def wf(x: int, ctx: RunContext) -> str:
+            return await ctx.request_info("q", response_type=str, request_id="r1")
+
+        await wf.run(1)  # interrupts with r1 pending
+        with pytest.raises(ValueError, match="do not answer"):
+            await wf.run(responses={"definitely_not_r1": "x"})
+
+
+class TestReservedStateKeys:
+    """Regression for bug_017: set_state must reject underscore-prefixed keys."""
+
+    async def test_underscore_key_rejected(self):
+        @built_workflow
+        async def wf(x: int, ctx: RunContext) -> int:
+            ctx.set_state("_private", "user value")
+            return x
+
+        with pytest.raises(ValueError, match="reserved for framework"):
+            await wf.run(1)
+
+    async def test_normal_key_still_works(self):
+        @built_workflow
+        async def wf(x: int, ctx: RunContext) -> int:
+            ctx.set_state("normal_key", "v")
+            assert ctx.get_state("normal_key") == "v"
+            return x
+
+        r = await wf.run(1)
+        assert r.get_outputs() == [1]
+
+
+class TestDeepcopyOnCacheHit:
+    """Regression for bug_002: cache hits must not deepcopy args."""
+
+    async def test_step_with_non_deepcopyable_arg_replays(self):
+        import threading
+
+        @step
+        async def takes_lock(lock: threading.Lock, n: int) -> int:
+            return n + 1
+
+        @built_workflow
+        async def wf(x: int) -> int:
+            lock = threading.Lock()
+            return await takes_lock(lock, x)
+
+        # First run — must succeed despite threading.Lock not being deepcopyable
+        # (deepcopy now wrapped in try/except, falls back to live reference for
+        # the invocation_data event only).
+        r1 = await wf.run(5)
+        assert r1.get_outputs() == [6]
+
+
+class TestStepDiscoveryAttributeAccess:
+    """Regression for bug_008: checkpoint hash must differ when function body changes."""
+
+    async def test_signature_hash_changes_when_function_body_changes(self):
+        @built_workflow
+        async def wf_a(x: int) -> int:
+            return x + 1
+
+        @built_workflow(name="wf_b")
+        async def wf_b(x: int) -> int:
+            return x * 100
+
+        # Two different function bodies -> different hashes even though the
+        # static step-name scan would produce the same empty list.
+        assert wf_a.graph_signature_hash != wf_b.graph_signature_hash
+
+
+class TestAsAgentSignatureParity:
+    """Regression for bug_015: as_agent signature must accept description/context_providers."""
+
+    async def test_as_agent_accepts_description_override(self):
+        @built_workflow(description="workflow level")
+        async def wf(x: str) -> str:
+            return x.upper()
+
+        agent = wf.as_agent(name="a", description="agent level")
+        assert agent.description == "agent level"
+
+    async def test_as_agent_accepts_context_providers_kwarg(self):
+        @built_workflow
+        async def wf(x: str) -> str:
+            return x
+
+        providers = [object()]  # opaque placeholder; must be stored without error
+        agent = wf.as_agent(context_providers=providers)
+        assert list(agent.context_providers or []) == providers
+
+    async def test_as_agent_description_defaults_to_workflow_description(self):
+        @built_workflow(description="from workflow")
+        async def wf(x: str) -> str:
+            return x
+
+        agent = wf.as_agent()
+        assert agent.description == "from workflow"
+
+
+class TestFunctionalWorkflowAgentHITL:
+    """Regression for bug_013: .as_agent() must surface request_info events."""
+
+    async def test_request_info_surfaces_as_function_approval_request(self):
+        @built_workflow
+        async def wf(x: str, ctx: RunContext) -> str:
+            answer = await ctx.request_info({"need": x}, response_type=str, request_id="rid-1")
+            return f"got:{answer}"
+
+        agent = wf.as_agent()
+        response = await agent.run("topic")
+
+        # Agent must expose the pending request_id.
+        assert "rid-1" in agent.pending_requests
+
+        # Response must contain at least one content item whose type is
+        # function_approval_request (or equivalent).
+        approval_found = False
+        for message in response.messages:
+            for content in message.contents:
+                if getattr(content, "type", None) == "function_approval_request":
+                    approval_found = True
+                    break
+        assert approval_found, "expected FunctionApprovalRequestContent in agent response"
+
+    async def test_request_info_dataclass_arguments_are_serialized_for_agent(self):
+        @dataclass
+        class HandoffRequest:
+            target_agent: str
+            reason: str
+
+        @built_workflow
+        async def wf(x: str, ctx: RunContext) -> str:
+            answer = await ctx.request_info(
+                HandoffRequest(target_agent=x, reason="overflow"),
+                response_type=str,
+                request_id="rid-1",
+            )
+            return f"got:{answer}"
+
+        agent = wf.as_agent()
+        response = await agent.run("helper")
+
+        function_call_arguments = None
+        for message in response.messages:
+            for content in message.contents:
+                if getattr(content, "type", None) == "function_approval_request" and content.function_call is not None:
+                    function_call_arguments = content.function_call.arguments
+                    break
+
+        assert function_call_arguments == {
+            "request_id": "rid-1",
+            "data": {"target_agent": "helper", "reason": "overflow"},
+        }
+        assert json.loads(json.dumps(function_call_arguments)) == function_call_arguments
+
+    async def test_resume_via_agent_responses_kwarg(self):
+        @built_workflow
+        async def wf(x: str, ctx: RunContext) -> str:
+            answer = await ctx.request_info(x, response_type=str, request_id="rid-1")
+            return f"got:{answer}"
+
+        agent = wf.as_agent()
+        # First phase: suspend
+        await agent.run("topic")
+        # Second phase: resume via the agent surface
+        response = await agent.run(responses={"rid-1": "answered"})
+        # Agent's final response should contain the workflow's text output.
+        text_blobs: list[str] = []
+        for message in response.messages:
+            for content in message.contents:
+                text = getattr(content, "text", None)
+                if text:
+                    text_blobs.append(text)
+        assert any("got:answered" in t for t in text_blobs)
+
+
+class TestRunDocstringAllowsResponsesAndCheckpoint:
+    """Regression for bug_010: docstring must permit responses+checkpoint_id combo."""
+
+    def test_docstring_says_at_least_one(self):
+        doc = FunctionalWorkflow.run.__doc__ or ""
+        assert "At least one" in doc or "at least one" in doc
+        assert "Exactly one" not in doc
+
+
+class TestFunctionalWorkflowExperimentalStage:
+    """Tests for the experimental stage annotations applied to functional workflow APIs."""
+
+    def test_public_symbols_are_marked_experimental(self) -> None:
+        symbols = [
+            get_run_context,
+            RunContext,
+            StepWrapper,
+            step,
+            FunctionalWorkflow,
+            FunctionalWorkflowDefinition,
+            workflow,
+            FunctionalWorkflowAgent,
+        ]
+
+        for symbol in symbols:
+            assert symbol.__feature_stage__ == "experimental"  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+            assert symbol.__feature_id__ == ExperimentalFeature.FUNCTIONAL_WORKFLOWS.value  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+            assert symbol.__doc__ is not None
+            assert ".. warning:: Experimental" in symbol.__doc__

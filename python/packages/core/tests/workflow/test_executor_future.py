@@ -1,0 +1,202 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+from __future__ import annotations
+
+import inspect
+from typing import TYPE_CHECKING, Any, TypeVar
+
+import pytest
+from pydantic import BaseModel
+
+from agent_framework import Executor, WorkflowContext, handler, response_handler
+
+
+class MyTypeA(BaseModel):
+    pass
+
+
+class MyTypeB(BaseModel):
+    pass
+
+
+class MyTypeC(BaseModel):
+    pass
+
+
+if TYPE_CHECKING:
+
+    class NonExistentType:
+        pass
+
+    class MissingType:
+        pass
+
+
+_T = TypeVar("_T")
+
+
+class TestExecutorFutureAnnotations:
+    """Test suite for Executor with from __future__ import annotations."""
+
+    def test_handler_decorator_future_annotations(self):
+        """Test @handler decorator works with stringified annotations (issue #3898)."""
+
+        class MyExecutor(Executor):
+            @handler
+            async def example(self, input: str, ctx: WorkflowContext[MyTypeA, MyTypeB]) -> None:
+                pass
+
+        exec_instance = MyExecutor(id="test")
+        assert str in exec_instance._handlers  # pyright: ignore[reportPrivateUsage]
+        spec = exec_instance._handler_specs[0]  # pyright: ignore[reportPrivateUsage]
+        assert spec["message_type"] is str
+        assert spec["output_types"] == [MyTypeA]
+        assert spec["workflow_output_types"] == [MyTypeB]
+
+    def test_handler_decorator_future_annotations_single_type_arg(self):
+        """Test @handler with single type argument and future annotations."""
+
+        class MyExecutor(Executor):
+            @handler
+            async def example(self, input: int, ctx: WorkflowContext[MyTypeA]) -> None:
+                pass
+
+        exec_instance = MyExecutor(id="test")
+        assert int in exec_instance._handlers  # pyright: ignore[reportPrivateUsage]
+        spec = exec_instance._handler_specs[0]  # pyright: ignore[reportPrivateUsage]
+        assert spec["message_type"] is int
+        assert spec["output_types"] == [MyTypeA]
+
+    def test_handler_decorator_future_annotations_complex(self):
+        """Test @handler with complex type annotations and future annotations."""
+
+        class MyExecutor(Executor):
+            @handler
+            async def example(self, data: dict[str, Any], ctx: WorkflowContext[list[str]]) -> None:
+                pass
+
+        exec_instance = MyExecutor(id="test")
+        spec = exec_instance._handler_specs[0]  # pyright: ignore[reportPrivateUsage]
+        assert spec["message_type"] == dict[str, Any]
+        assert spec["output_types"] == [list[str]]
+
+    def test_handler_decorator_future_annotations_bare_context(self):
+        """Test @handler with bare WorkflowContext and future annotations."""
+
+        class MyExecutor(Executor):
+            @handler
+            async def example(self, input: str, ctx: WorkflowContext) -> None:
+                pass
+
+        exec_instance = MyExecutor(id="test")
+        assert str in exec_instance._handlers  # pyright: ignore[reportPrivateUsage]
+        spec = exec_instance._handler_specs[0]  # pyright: ignore[reportPrivateUsage]
+        assert spec["output_types"] == []
+        assert spec["workflow_output_types"] == []
+
+    def test_handler_decorator_future_annotations_explicit_types(self):
+        """Test @handler with explicit type parameters under future annotations."""
+
+        class MyExecutor(Executor):
+            @handler(input=str, output=MyTypeA)
+            async def example(self, input, ctx) -> None:  # type: ignore[no-untyped-def]
+                pass
+
+        exec_instance = MyExecutor(id="test")
+        assert str in exec_instance._handlers  # pyright: ignore[reportPrivateUsage]
+        spec = exec_instance._handler_specs[0]  # pyright: ignore[reportPrivateUsage]
+        assert spec["message_type"] is str
+        assert spec["output_types"] == [MyTypeA]
+
+    def test_handler_decorator_future_annotations_union_context(self):
+        """Test @handler with union type context annotations and future annotations."""
+
+        class MyExecutor(Executor):
+            @handler
+            async def example(self, input: str, ctx: WorkflowContext[MyTypeA | MyTypeB, MyTypeC]) -> None:
+                pass
+
+        exec_instance = MyExecutor(id="test")
+        assert str in exec_instance._handlers  # pyright: ignore[reportPrivateUsage]
+        spec = exec_instance._handler_specs[0]  # pyright: ignore[reportPrivateUsage]
+        assert spec["output_types"] == [MyTypeA, MyTypeB]
+        assert spec["workflow_output_types"] == [MyTypeC]
+
+    def test_response_handler_decorator_future_annotations(self):
+        """Test @response_handler with stringified annotations and future annotations."""
+
+        class MyExecutor(Executor):
+            @handler
+            async def example(self, input: str, ctx: WorkflowContext) -> None:
+                pass
+
+            @response_handler
+            async def handle_response(
+                self, original_request: str, response: int, ctx: WorkflowContext[str, bool]
+            ) -> None:
+                pass
+
+        exec_instance = MyExecutor(id="test")
+        assert (str, int) in exec_instance._response_handlers  # pyright: ignore[reportPrivateUsage]
+        spec = exec_instance._response_handler_specs[0]  # pyright: ignore[reportPrivateUsage]
+        assert spec["request_type"] is str
+        assert spec["response_type"] is int
+        assert spec["output_types"] == [str]
+        assert spec["workflow_output_types"] == [bool]
+
+    def test_response_handler_unresolvable_annotation_raises(self):
+        """Test that an unresolvable response-handler annotation raises ValueError."""
+        with pytest.raises(ValueError, match="Response handler parameter 'ctx' must be annotated as"):
+
+            class BadResponseHandler(Executor):  # pyright: ignore[reportUnusedClass]
+                @response_handler  # pyright: ignore[reportUnknownArgumentType]
+                async def handle_response(
+                    self,
+                    original_request: NonExistentType,
+                    response: int,
+                    ctx: WorkflowContext[MyTypeA, MyTypeB],
+                ) -> None:
+                    pass
+
+    def test_response_handler_rejects_unresolved_typevar_in_request_annotation(self):
+        """Test that response handlers reject an unresolved request TypeVar during registration."""
+        with pytest.raises(ValueError, match="unresolved TypeVar"):
+
+            class GenericRequestResponseExecutor(Executor):  # pyright: ignore[reportUnusedClass]
+                @response_handler  # pyright: ignore[reportUnknownArgumentType]
+                async def handle_response(self, original_request: _T, response: int, ctx: WorkflowContext) -> None:
+                    pass
+
+    def test_response_handler_rejects_unresolved_typevar_in_response_annotation(self):
+        """Test that response handlers reject an unresolved response TypeVar during registration."""
+        with pytest.raises(ValueError, match="unresolved TypeVar"):
+
+            class GenericResponseExecutor(Executor):  # pyright: ignore[reportUnusedClass]
+                @response_handler  # pyright: ignore[reportUnknownArgumentType]
+                async def handle_response(self, original_request: str, response: _T, ctx: WorkflowContext) -> None:
+                    pass
+
+    def test_annotation_resolver_falls_back_to_raw_annotations(self):
+        """Test that annotation resolution preserves raw annotations when a hint is unresolved."""
+        from agent_framework._workflows._typing_utils import _resolve_function_annotations
+
+        def sample(value: MissingType) -> None:
+            pass
+
+        params = list(inspect.signature(sample).parameters.values())
+
+        assert _resolve_function_annotations(sample, params)["value"] == "MissingType"
+
+    def test_handler_unresolvable_annotation_raises(self):
+        """Test that an unresolvable forward-reference annotation raises ValueError.
+
+        When get_type_hints fails (e.g. NameError for NonExistentType), the code falls back
+        to raw string annotations. The ctx parameter's raw string annotation is then not
+        recognised as a valid WorkflowContext type, so a ValueError is still raised.
+        """
+        with pytest.raises(ValueError):
+
+            class Bad(Executor):  # pyright: ignore[reportUnusedClass]
+                @handler  # pyright: ignore[reportUnknownArgumentType]
+                async def example(self, input: NonExistentType, ctx: WorkflowContext[MyTypeA, MyTypeB]) -> None:
+                    pass

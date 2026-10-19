@@ -1,0 +1,153 @@
+[project]
+name = "agent-framework-core"
+description = "Microsoft Agent Framework for building AI Agents with Python. This is the core package that has all the core abstractions and implementations."
+authors = [{ name = "Microsoft", email = "af-support@microsoft.com"}]
+readme = "README.md"
+requires-python = ">=3.10"
+version = "1.21.0"
+license-files = ["LICENSE"]
+urls.homepage = "https://aka.ms/agent-framework"
+urls.source = "https://github.com/microsoft/agent-framework/tree/main/python"
+urls.release_notes = "https://github.com/microsoft/agent-framework/releases?q=tag%3Apython-1&expanded=true"
+urls.issues = "https://github.com/microsoft/agent-framework/issues"
+classifiers = [
+  "License :: OSI Approved :: MIT License",
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+dependencies = [
+    "msgspec>=0.20.0,<0.23",
+    "typing-extensions>=4.15.0,<5",
+    "pydantic>=2,<3",
+    "python-dotenv>=1,<2",
+    "opentelemetry-api>=1.39.0,<2",
+    "pyyaml>=6.0,<7.0",
+    "regex>=2024.11.6",
+]
+
+[project.optional-dependencies]
+all = [
+    "mcp>=1.24.0,<2",
+    "agent-framework-a2a>=1.0.0b261002,<2",
+    "agent-framework-ag-ui>=1.5.1,<2",
+    "agent-framework-anthropic>=1.0.0b261008,<2",
+    "agent-framework-azure-ai-search>=1.0.0b261002,<2",
+    "agent-framework-azure-contentunderstanding>=1.0.0b261008,<2",
+    "agent-framework-azure-cosmos>=1.0.0b261002,<2",
+    "agent-framework-azurefunctions>=1.0.0b260922,<2",
+    "agent-framework-bedrock>=1.0.0b261008,<2",
+    "agent-framework-chatkit>=1.0.0b261002,<2",
+    "agent-framework-claude>=1.0.0b261002,<2",
+    "agent-framework-copilotstudio>=1.0.0b261002,<2",
+    "agent-framework-declarative>=1.2.1,<2",
+    "agent-framework-devui>=1.0.0b261008,<2",
+    "agent-framework-durabletask>=1.0.0b260922,<2",
+    "agent-framework-foundry>=1.14.1,<2",
+    "agent-framework-foundry-hosting>=1.0.0b261008,<2",
+    "agent-framework-foundry-local>=1.0.0b260730,<2",
+    "agent-framework-gemini>=1.0.0b261008,<2",
+    "agent-framework-github-copilot>=2.0.2,<3; python_version >= '3.11'",
+    "agent-framework-hyperlight>=1.0.0b261008,<2; python_version < '3.15' and ((sys_platform == 'linux' and platform_machine == 'x86_64') or (sys_platform == 'win32' and platform_machine == 'AMD64'))",
+    "agent-framework-mem0>=1.0.0b261002,<2",
+    "agent-framework-mistral>=1.0.0b260918,<2",
+    "agent-framework-monty>=1.0.0b261008,<2",
+    "agent-framework-ollama>=1.0.0b261008,<2",
+    "agent-framework-openai>=1.16.0,<2",
+    "agent-framework-orchestrations>=1.3.1,<2",
+    "agent-framework-purview>=1.0.0b261008,<2",
+    "agent-framework-redis>=1.0.0b261002,<2; python_version < '3.15'",
+    "agent-framework-tools>=1.0.0b261008,<2",
+]
+
+[dependency-groups]
+# These optional integrations depend on agent-framework-core, so core cannot list them as
+# runtime dependencies. They are declared here so isolated source checks can resolve their APIs.
+dev = [
+    "azure-ai-agentserver-core>=2.0.0b7,<3",
+    "graphviz>=0.20,<1",
+    "opentelemetry-exporter-otlp>=1.39.0,<2",
+    "types-pyyaml>=6.0,<7.0",
+]
+
+[tool.uv]
+prerelease = "if-necessary"
+environments = [
+    "sys_platform == 'darwin'",
+    "sys_platform == 'linux'",
+    "sys_platform == 'win32'"
+]
+
+[tool.uv-dynamic-versioning]
+fallback-version = "0.0.0"
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+addopts = "-ra -q -r fEX"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = []
+timeout = 120
+markers = [
+    "integration: marks tests as integration tests that require external services",
+]
+
+[tool.coverage.run]
+omit = [
+    "**/__init__.py"
+]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.pyright]
+extends = "../../pyproject.toml"
+include = ["agent_framework"]
+
+[tool.mypy]
+plugins = ['pydantic.mypy']
+strict = true
+incremental = false
+python_version = "3.10"
+ignore_missing_imports = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+warn_return_any = true
+show_error_codes = true
+warn_unused_ignores = false
+disallow_incomplete_defs = true
+disallow_untyped_decorators = true
+
+[tool.bandit]
+targets = ["agent_framework"]
+exclude_dirs = ["tests"]
+
+[tool.poe]
+executor.type = "uv"
+include = "../../shared_tasks.toml"
+
+[tool.poe.tasks.dependency-pyright]
+help = "Run Pyright over core implementation files for isolated dependency validation."
+cmd = "pyright --project pyrightconfig.dependency.json"
+
+[tool.poe.tasks.mypy]
+help = "Run MyPy for this package."
+cmd = "mypy --config-file $POE_ROOT/pyproject.toml agent_framework"
+
+[tool.poe.tasks.test]
+help = "Run the default unit test suite for this package."
+cmd = 'pytest -m "not integration" --cov=agent_framework --cov-report=term-missing:skip-covered -n auto --dist worksteal tests'
+
+[tool.flit.module]
+name = "agent_framework"
+
+[build-system]
+requires = ["flit-core >= 3.11,<4.0"]
+build-backend = "flit_core.buildapi"

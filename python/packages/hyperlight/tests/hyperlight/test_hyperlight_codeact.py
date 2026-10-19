@@ -1,0 +1,3497 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import dataclasses
+import gc
+import importlib
+import importlib.metadata
+import importlib.util
+import inspect
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import weakref
+from collections.abc import Awaitable, Callable, Coroutine, Generator, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import MappingProxyType
+from typing import Any, Literal, cast
+from unittest.mock import patch
+
+import pytest
+from agent_framework import (
+    Agent,
+    BaseChatClient,
+    ChatResponse,
+    ChatResponseUpdate,
+    Content,
+    FunctionInvocationLayer,
+    FunctionTool,
+    Message,
+    ResponseStream,
+    tool,
+)
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from pytest import fixture
+
+from agent_framework_hyperlight import AllowedDomain, FileMount, HyperlightCodeActProvider, HyperlightExecuteCodeTool
+from agent_framework_hyperlight import _execute_code_tool as execute_code_module
+from agent_framework_hyperlight import _instructions as instructions_module
+
+
+def _hyperlight_integration_static_skip_reason() -> str | None:
+    if sys.platform not in {"linux", "win32"}:
+        return "Hyperlight integration tests require Linux or Windows runners."
+
+    if importlib.util.find_spec("hyperlight_sandbox") is None:
+        return "hyperlight-sandbox is not installed."
+
+    if importlib.util.find_spec("python_guest") is None:
+        return "hyperlight-sandbox-python-guest is not installed."
+
+    try:
+        importlib.metadata.version("hyperlight-sandbox-backend-wasm")
+    except importlib.metadata.PackageNotFoundError:
+        return "hyperlight-sandbox-backend-wasm is not installed."
+
+    return None
+
+
+def _hyperlight_integration_runtime_skip_reason() -> str | None:
+    if (reason := _hyperlight_integration_static_skip_reason()) is not None:
+        return reason
+
+    sandbox: Any | None = None
+    try:
+        sandbox_cls = execute_code_module._load_sandbox_class()
+        sandbox_instance = sandbox_cls(
+            backend=execute_code_module.DEFAULT_HYPERLIGHT_BACKEND,
+            module=execute_code_module.DEFAULT_HYPERLIGHT_MODULE,
+        )
+        sandbox = sandbox_instance
+        sandbox_instance.run("None")
+    except RuntimeError as exc:
+        message = str(exc)
+        if "no hypervisor was found for sandbox" in message.lower():
+            return "Hyperlight integration tests require a runner with a working Hyperlight hypervisor."
+    finally:
+        if sandbox is not None:
+            _close_sandbox(sandbox)
+
+    return None
+
+
+def _skip_if_hyperlight_integration_runtime_disabled() -> None:
+    if (reason := _hyperlight_integration_runtime_skip_reason()) is not None:
+        pytest.skip(reason)
+
+
+skip_if_hyperlight_integration_tests_disabled = pytest.mark.skipif(
+    (reason := _hyperlight_integration_static_skip_reason()) is not None,
+    reason=reason or "Hyperlight integration tests are disabled.",
+)
+
+
+@fixture
+def span_exporter(monkeypatch) -> Generator[InMemorySpanExporter]:
+    env_vars = [
+        "ENABLE_INSTRUMENTATION",
+        "ENABLE_SENSITIVE_DATA",
+        "ENABLE_CONSOLE_EXPORTERS",
+        "OTEL_EXPORTER_OTLP_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+        "OTEL_EXPORTER_OTLP_PROTOCOL",
+        "OTEL_EXPORTER_OTLP_HEADERS",
+        "OTEL_EXPORTER_OTLP_TRACES_HEADERS",
+        "OTEL_EXPORTER_OTLP_METRICS_HEADERS",
+        "OTEL_EXPORTER_OTLP_LOGS_HEADERS",
+        "OTEL_SERVICE_NAME",
+        "OTEL_SERVICE_VERSION",
+        "OTEL_RESOURCE_ATTRIBUTES",
+    ]
+
+    for key in env_vars:
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("ENABLE_INSTRUMENTATION", "True")
+    monkeypatch.setenv("ENABLE_SENSITIVE_DATA", "True")
+
+    import agent_framework.observability as observability
+    from opentelemetry import trace
+
+    importlib.reload(observability)
+    observability_settings = observability.ObservabilitySettings()
+    tracer_provider = TracerProvider(resource=observability.create_resource())
+    trace.set_tracer_provider(tracer_provider)
+    monkeypatch.setattr(observability, "OBSERVABILITY_SETTINGS", observability_settings, raising=False)
+
+    with (
+        patch("agent_framework.observability.OBSERVABILITY_SETTINGS", observability_settings),
+        patch("agent_framework.observability.configure_otel_providers"),
+    ):
+        exporter = InMemorySpanExporter()
+        current_tracer_provider = trace.get_tracer_provider()
+        if not hasattr(current_tracer_provider, "add_span_processor"):
+            raise RuntimeError("Tracer provider does not support adding span processors.")
+
+        cast(Any, current_tracer_provider).add_span_processor(SimpleSpanProcessor(exporter))
+        yield exporter
+        exporter.clear()
+
+
+def _close_sandbox(sandbox: Any) -> None:
+    close_hook = getattr(sandbox, "close", None) or getattr(sandbox, "shutdown", None)
+    if callable(close_hook):
+        with contextlib.suppress(Exception):
+            close_hook()
+
+
+def _close_execute_code_registry(execute_code: HyperlightExecuteCodeTool) -> None:
+    close_hook = getattr(execute_code._registry, "close", None)
+    if callable(close_hook):
+        close_hook()
+
+
+def _close_provider_registry(provider: HyperlightCodeActProvider) -> None:
+    _close_execute_code_registry(provider._execute_code_tool)
+
+
+@pytest.fixture(scope="module")
+def shared_sandbox():
+    """Long-lived sandbox with snapshot/restore for read-mostly tests.
+
+    Multiple tests run sequentially against this fixture. Each test restores the
+    sandbox to a clean state via the ``restored_sandbox`` fixture.
+    """
+    if (reason := _hyperlight_integration_runtime_skip_reason()) is not None:
+        pytest.skip(reason)
+
+    sandbox_cls = execute_code_module._load_sandbox_class()
+    sandbox = sandbox_cls(
+        backend=execute_code_module.DEFAULT_HYPERLIGHT_BACKEND,
+        module=execute_code_module.DEFAULT_HYPERLIGHT_MODULE,
+    )
+    sandbox.run("None")
+    snapshot = sandbox.snapshot()
+    try:
+        yield sandbox, snapshot
+    finally:
+        _close_sandbox(sandbox)
+
+
+@pytest.fixture
+def restored_sandbox(shared_sandbox):
+    """Restore shared sandbox to clean state before each test."""
+    sandbox, snapshot = shared_sandbox
+    sandbox.restore(snapshot)
+    return sandbox
+
+
+@pytest.fixture
+def fresh_sandbox():
+    """Short-lived sandbox for tests that alter config meaningfully.
+
+    Not pre-warmed: call ``sandbox.run("None")`` after registering tools
+    and domains, then snapshot/restore before executing test code.
+    """
+    if (reason := _hyperlight_integration_runtime_skip_reason()) is not None:
+        pytest.skip(reason)
+
+    sandbox_cls = execute_code_module._load_sandbox_class()
+    sandbox = sandbox_cls(
+        backend=execute_code_module.DEFAULT_HYPERLIGHT_BACKEND,
+        module=execute_code_module.DEFAULT_HYPERLIGHT_MODULE,
+        temp_output=True,
+    )
+    try:
+        yield sandbox
+    finally:
+        _close_sandbox(sandbox)
+
+
+@tool(approval_mode="never_require")
+def compute(a: int, b: int) -> int:
+    return a + b
+
+
+@tool(approval_mode="always_require")
+def dangerous_compute(a: int, b: int) -> int:
+    return a * b
+
+
+@tool(name="compute", approval_mode="always_require")
+def replacement_compute(a: int, b: int) -> int:
+    return a - b
+
+
+@dataclass(slots=True)
+class _FakeResult:
+    success: bool
+    stdout: str = ""
+    stderr: str = ""
+
+
+def _run_in_thread(callback: Callable[[], Any]) -> Any:
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def _runner() -> None:
+        try:
+            result["value"] = callback()
+        except BaseException as exc:
+            error["value"] = exc
+
+    thread = threading.Thread(target=_runner)
+    thread.start()
+    thread.join()
+
+    if "value" in error:
+        raise error["value"]
+
+    return result.get("value")
+
+
+class _FakeSandbox:
+    instances: list[_FakeSandbox] = []
+
+    def __init__(
+        self,
+        *,
+        input_dir: str | None = None,
+        output_dir: str | None = None,
+        temp_output: bool = False,
+        backend: str = "wasm",
+        module: str | None = None,
+        module_path: str | None = None,
+        heap_size: str | None = None,
+        stack_size: str | None = None,
+        max_file_size: str | None = None,
+        max_total_size: str | None = None,
+        max_file_count: int | None = None,
+    ) -> None:
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.max_file_size = max_file_size
+        self.max_total_size = max_total_size
+        self.max_file_count = max_file_count
+        self.registered_tools: dict[str, Any] = {}
+        self.allowed_domains: list[tuple[str, list[str] | None]] = []
+        self.restore_calls: list[Any] = []
+        self.output_files: list[str] = []
+        _FakeSandbox.instances.append(self)
+
+    def register_tool(self, name_or_tool: Any, callback: Any | None = None) -> None:
+        if callback is None:
+            raise AssertionError("Expected callback registration for sandbox tools.")
+        self.registered_tools[str(name_or_tool)] = callback
+
+    def allow_domain(self, target: str, methods: list[str] | None = None) -> None:
+        self.allowed_domains.append((target, methods))
+
+    def _invoke_tool(self, name: str, **kwargs: Any) -> Any:
+        callback = self.registered_tools[name]
+        if inspect.iscoroutinefunction(callback):
+            return _run_in_thread(lambda: asyncio.run(callback(**kwargs)))
+
+        result = callback(**kwargs)
+        if inspect.isawaitable(result):
+            return _run_in_thread(lambda: asyncio.run(cast(Coroutine[Any, Any, Any], result)))
+        return result
+
+    def run(self, code: str) -> _FakeResult:
+        if code == "None":
+            return _FakeResult(success=True)
+        if code == "create-output":
+            if self.output_dir is None:
+                raise AssertionError("Expected output directory for create-output test.")
+            Path(self.output_dir, "report.txt").write_text("artifact", encoding="utf-8")
+            self.output_files = ["report.txt"]
+            return _FakeResult(success=True, stdout="done\n")
+        if 'call_tool("compute", a=20, b=22)' in code:
+            total = self._invoke_tool("compute", a=20, b=22)
+            return _FakeResult(success=True, stdout=f"{total}\n")
+        return _FakeResult(success=False, stderr="sandbox boom")
+
+    def snapshot(self) -> str:
+        return "snapshot"
+
+    def restore(self, snapshot: Any) -> None:
+        self.restore_calls.append(snapshot)
+
+    def get_output_files(self) -> list[str]:
+        return list(self.output_files)
+
+
+class _FakeRuntime:
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, str]] = []
+
+    def execute(self, *, config: Any, code: str) -> list[Content]:
+        self.calls.append((config, code))
+        return [Content.from_text("ok")]
+
+
+class _FakeSandboxWithoutOutputListing(_FakeSandbox):
+    def get_output_files(self) -> list[str]:
+        return []
+
+
+class _FakeSandboxWithDelayedUnlistedOutput(_FakeSandboxWithoutOutputListing):
+    writer_threads: list[threading.Thread] = []
+
+    def run(self, code: str) -> _FakeResult:
+        if (
+            'Path("/output/report.txt").write_text("artifact", encoding="utf-8")' in code
+            or code == "create-dynamic-delayed-output"
+        ):
+            if self.output_dir is None:
+                raise AssertionError("Expected output directory for delayed output test.")
+            output_dir = self.output_dir
+
+            def _write_file() -> None:
+                time.sleep(0.15)
+                Path(output_dir, "report.txt").write_text("artifact", encoding="utf-8")
+
+            writer_thread = threading.Thread(target=_write_file)
+            writer_thread.start()
+            self.writer_threads.append(writer_thread)
+            return _FakeResult(success=True)
+
+        return super().run(code)
+
+
+class _FakeSandboxWithBoundedOutputs(_FakeSandbox):
+    def run(self, code: str) -> _FakeResult:
+        if code == "None":
+            return _FakeResult(success=True)
+        if self.output_dir is None:
+            raise AssertionError("Expected output directory for bounded output test.")
+
+        output_root = Path(self.output_dir)
+        if code == "create-sparse-output":
+            sparse_file = output_root / "sparse.bin"
+            with sparse_file.open("wb") as handle:
+                handle.seek((2 << 30) - 1)
+                handle.write(b"X")
+            self.output_files = ["sparse.bin"]
+        elif code == "create-count-output":
+            for index in range(3):
+                (output_root / f"report-{index}.txt").write_bytes(b"x")
+            self.output_files = [f"report-{index}.txt" for index in range(3)]
+        elif code == "create-cumulative-output":
+            (output_root / "first.bin").write_bytes(b"abc")
+            (output_root / "second.bin").write_bytes(b"def")
+            self.output_files = ["first.bin", "second.bin"]
+        elif code == "create-exact-output":
+            (output_root / "first.bin").write_bytes(b"abc")
+            (output_root / "second.bin").write_bytes(b"de")
+            self.output_files = ["first.bin", "second.bin"]
+        elif code == "create-growing-output":
+            (output_root / "growing.bin").write_bytes(b"data")
+            self.output_files = ["growing.bin"]
+        elif code == "create-memory-output":
+            (output_root / "memory.bin").write_bytes(b"data")
+            self.output_files = ["memory.bin"]
+        elif code == "create-nested-output":
+            (output_root / "nested").mkdir()
+            (output_root / "nested" / "report.bin").write_bytes(b"data")
+            self.output_files = ["nested/report.bin"]
+        elif code == "create-wide-output":
+            for index in range(101):
+                (output_root / f"directory-{index}").mkdir()
+        elif code == "create-deep-output":
+            current = output_root
+            for index in range(execute_code_module.OUTPUT_TRAVERSAL_MAX_DEPTH + 1):
+                current /= f"level-{index}"
+                current.mkdir()
+        else:
+            return super().run(code)
+
+        return _FakeResult(success=True, stdout="guest-finished\n")
+
+
+class _FakeSandboxWithBoundedOutputsWithoutListing(_FakeSandboxWithBoundedOutputs):
+    def get_output_files(self) -> list[str]:
+        return []
+
+
+class _FakeSandboxWithEagerOutputListing(_FakeSandboxWithBoundedOutputs):
+    listing_calls = 0
+
+    def get_output_files(self) -> list[str]:
+        type(self).listing_calls += 1
+        return [f"report-{index}.txt" for index in range(10_000)]
+
+
+class _FakeSessionContext:
+    def __init__(self, *, tools: list[Any] | None = None) -> None:
+        self.options: dict[str, Any] = {}
+        if tools is not None:
+            self.options["tools"] = tools
+        self.instructions: list[tuple[str, str]] = []
+        self.tools: list[tuple[str, list[Any]]] = []
+
+    def extend_instructions(self, source_id: str, instructions: str) -> None:
+        self.instructions.append((source_id, instructions))
+
+    def extend_tools(self, source_id: str, tools: list[Any]) -> None:
+        self.tools.append((source_id, tools))
+
+
+def _extract_text_output(function_result: Content) -> str:
+    assert function_result.type == "function_result"
+    assert function_result.exception is None, (
+        f"execute_code raised {function_result.exception!r} with items={function_result.items!r}"
+    )
+    text_output = next(
+        (item for item in function_result.items or [] if item.type == "text" and item.text is not None),
+        None,
+    )
+    if text_output is not None and text_output.text is not None:
+        return text_output.text
+    if function_result.result:
+        return function_result.result
+    raise AssertionError(f"Expected text output from execute_code, got {function_result.items!r}")
+
+
+class _FakeCodeActChatClient(FunctionInvocationLayer[Any], BaseChatClient[Any]):
+    def __init__(self) -> None:
+        FunctionInvocationLayer.__init__(self)
+        BaseChatClient.__init__(self)
+        self.call_count = 0
+
+    def _inner_get_response(
+        self,
+        *,
+        messages: Sequence[Message],
+        stream: bool,
+        options: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Awaitable[ChatResponse] | ResponseStream[ChatResponseUpdate, ChatResponse]:
+        if stream:
+            raise AssertionError("Streaming is not used in this integration test.")
+
+        async def _get_response() -> ChatResponse:
+            self.call_count += 1
+
+            if self.call_count == 1:
+                return ChatResponse(
+                    messages=Message(
+                        role="assistant",
+                        contents=[
+                            Content.from_function_call(
+                                call_id="execute_code_call",
+                                name="execute_code",
+                                arguments={
+                                    "code": 'total = call_tool("compute", a=20, b=22)\nprint(total)',
+                                },
+                            )
+                        ],
+                    )
+                )
+
+            function_results = [
+                content for message in messages for content in message.contents if content.type == "function_result"
+            ]
+            assert len(function_results) == 1
+
+            result_content = function_results[0]
+            assert result_content.call_id == "execute_code_call"
+            assert _extract_text_output(result_content) == "42\n"
+
+            return ChatResponse(messages=Message(role="assistant", contents=["The sandbox returned 42."]))
+
+        return _get_response()
+
+
+def test_execute_code_tool_updates_approval_with_managed_tools() -> None:
+    execute_code = HyperlightExecuteCodeTool(tools=[compute], _registry=_FakeRuntime())
+    assert execute_code.approval_mode == "never_require"
+
+    execute_code.add_tools([dangerous_compute])
+    assert execute_code.approval_mode == "always_require"
+
+
+@pytest.mark.parametrize("entry_point", [HyperlightExecuteCodeTool, HyperlightCodeActProvider])
+@pytest.mark.parametrize("register_later", [False, True])
+@pytest.mark.parametrize(
+    "properties",
+    [
+        {"source_integrity": "untrusted"},
+        {"confidentiality": "private"},
+        {"max_allowed_confidentiality": "public"},
+        {"max_allowed_confidentiality": None},
+        {"accepts_untrusted": False},
+        {"standing_guidance": []},
+        {"agent_framework.security.principals": []},
+        {"_agent_framework_internal_security_tool": object()},
+        {"_mcp_trust_server_ifc": False},
+    ],
+)
+def test_codeact_warns_for_fides_tool_metadata(
+    entry_point: type[HyperlightExecuteCodeTool] | type[HyperlightCodeActProvider],
+    register_later: bool,
+    properties: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    @tool(additional_properties=properties)
+    def annotated_tool(value: int) -> int:
+        return value
+
+    with caplog.at_level("WARNING", logger="agent_framework"):
+        codeact = entry_point(tools=None if register_later else annotated_tool, _registry=_FakeRuntime())
+        if register_later:
+            codeact.add_tools(annotated_tool)
+
+    records = [
+        record for record in caplog.records if "FIDES is not supported with CodeAct providers." in record.message
+    ]
+    assert len(records) == 1
+    assert records[0].levelname == "WARNING"
+    assert records[0].args == ("annotated_tool",)
+    assert codeact.get_tools()[0] is annotated_tool
+    assert annotated_tool.additional_properties == properties
+    assert annotated_tool.invocation_count == annotated_tool.invocation_exception_count == 0
+
+
+@pytest.mark.parametrize("entry_point", [HyperlightExecuteCodeTool, HyperlightCodeActProvider])
+@pytest.mark.parametrize("properties", [None, {}, {"custom_property": False}])
+def test_codeact_does_not_warn_for_unannotated_tools(
+    entry_point: type[HyperlightExecuteCodeTool] | type[HyperlightCodeActProvider],
+    properties: dict[str, Any] | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    @tool(additional_properties=properties)
+    def plain_tool(value: int) -> int:
+        return value
+
+    with caplog.at_level("WARNING", logger="agent_framework"):
+        codeact = entry_point(tools=plain_tool, _registry=_FakeRuntime())
+
+    assert "FIDES" not in caplog.text
+    assert codeact.get_tools()[0] is plain_tool
+
+
+def test_run_snapshot_warns_for_fides_metadata_added_after_registration(caplog: pytest.LogCaptureFixture) -> None:
+    @tool
+    def annotated_tool(value: int) -> int:
+        return value
+
+    codeact = HyperlightExecuteCodeTool(tools=annotated_tool, _registry=_FakeRuntime())
+    assert annotated_tool.additional_properties is not None
+    annotated_tool.additional_properties["accepts_untrusted"] = False
+
+    with caplog.at_level("WARNING", logger="agent_framework"):
+        run_tool = codeact.create_run_tool()
+
+    assert "FIDES is not supported with CodeAct providers." in caplog.text
+    assert run_tool.get_tools()[0] is annotated_tool
+    assert annotated_tool.invocation_count == annotated_tool.invocation_exception_count == 0
+
+
+@pytest.mark.parametrize("entry_point", [HyperlightExecuteCodeTool, HyperlightCodeActProvider])
+def test_codeact_does_not_repeat_fides_warning_for_unrelated_registration(
+    entry_point: type[HyperlightExecuteCodeTool] | type[HyperlightCodeActProvider],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    @tool(additional_properties={"source_integrity": "untrusted"})
+    def annotated_tool(value: int) -> int:
+        return value
+
+    @tool
+    def plain_tool(value: int) -> int:
+        return value
+
+    with caplog.at_level("WARNING", logger="agent_framework"):
+        codeact = entry_point(tools=annotated_tool, _registry=_FakeRuntime())
+        caplog.clear()
+        codeact.add_tools(plain_tool)
+
+    assert "FIDES" not in caplog.text
+    assert codeact.get_tools() == [annotated_tool, plain_tool]
+
+
+@pytest.mark.parametrize("entry_point", [HyperlightExecuteCodeTool, HyperlightCodeActProvider])
+def test_codeact_warns_once_for_annotated_tool_replacement(
+    entry_point: type[HyperlightExecuteCodeTool] | type[HyperlightCodeActProvider],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    @tool(name="shared")
+    def original_tool(value: int) -> int:
+        return value
+
+    @tool(name="shared", additional_properties={"accepts_untrusted": False})
+    def replacement_tool(value: int) -> int:
+        return value
+
+    codeact = entry_point(tools=original_tool, _registry=_FakeRuntime())
+    with caplog.at_level("WARNING", logger="agent_framework"):
+        codeact.add_tools(replacement_tool)
+
+    records = [
+        record for record in caplog.records if "FIDES is not supported with CodeAct providers." in record.message
+    ]
+    assert len(records) == 1
+    assert records[0].args == ("shared",)
+    assert codeact.get_tools() == [replacement_tool]
+
+
+def test_execute_code_tool_replaces_tools_with_the_same_name() -> None:
+    execute_code = HyperlightExecuteCodeTool(tools=[compute], _registry=_FakeRuntime())
+
+    execute_code.add_tools(replacement_compute)
+
+    tools = execute_code.get_tools()
+    assert len(tools) == 1
+    assert tools[0] is replacement_compute
+    assert execute_code.approval_mode == "always_require"
+
+
+async def test_execute_code_tool_parent_span_for_host_tools(
+    span_exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+
+    execute_code = HyperlightExecuteCodeTool(tools=[compute])
+
+    span_exporter.clear()
+    await execute_code.invoke(
+        arguments={"code": 'total = call_tool("compute", a=20, b=22)\nprint(total)'},
+        skip_parsing=True,
+    )
+
+    spans = span_exporter.get_finished_spans()
+    execute_code_spans = [span for span in spans if span.name == "execute_tool execute_code"]
+    compute_spans = [span for span in spans if span.name == "execute_tool compute"]
+
+    assert len(execute_code_spans) == 1
+    assert len(compute_spans) == 1
+
+    execute_code_span = execute_code_spans[0]
+    compute_span = compute_spans[0]
+
+    assert compute_span.context is not None
+    assert execute_code_span.context is not None
+    assert compute_span.context.trace_id == execute_code_span.context.trace_id
+    assert compute_span.parent is not None
+    assert compute_span.parent.span_id == execute_code_span.context.span_id
+
+
+def test_execute_code_tool_accepts_string_and_tuple_file_mounts_without_mode_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shorthand_file = tmp_path / "notes.txt"
+    shorthand_file.write_text("hello", encoding="utf-8")
+    explicit_file = tmp_path / "data.json"
+    explicit_file.write_text('{"hello": "world"}', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    execute_code = HyperlightExecuteCodeTool(_registry=_FakeRuntime())
+    execute_code.add_file_mounts("notes.txt")
+    execute_code.add_file_mounts((explicit_file, "data/data.json"))
+
+    assert execute_code.get_file_mounts() == [
+        FileMount(shorthand_file.resolve(), "/input/notes.txt"),
+        FileMount(explicit_file.resolve(), "/input/data/data.json"),
+    ]
+
+
+async def test_execute_code_tool_populates_input_dir_with_workspace_and_file_mounts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    (workspace_root / "notes.txt").write_text("workspace note", encoding="utf-8")
+
+    mounted_file = tmp_path / "mounted.txt"
+    mounted_file.write_text("hello from mount", encoding="utf-8")
+
+    execute_code = HyperlightExecuteCodeTool(
+        workspace_root=workspace_root,
+        file_mounts=[FileMount(mounted_file, "data/input.txt")],
+    )
+    try:
+        result = await execute_code.invoke(arguments={"code": "create-output"})
+
+        assert result[0].type == "text"
+        assert _FakeSandbox.instances[0].input_dir is not None
+
+        input_root = Path(_FakeSandbox.instances[0].input_dir)
+        assert (input_root / "notes.txt").read_text(encoding="utf-8") == "workspace note"
+        assert (input_root / "data" / "input.txt").read_text(encoding="utf-8") == "hello from mount"
+    finally:
+        _close_execute_code_registry(execute_code)
+
+
+def _build_run_config(
+    *,
+    workspace_root: Path | None = None,
+    file_mounts: tuple = (),
+) -> Any:
+    """Build a minimal _RunConfig for tests that exercise _populate_input_dir directly."""
+    return execute_code_module._RunConfig(
+        backend="wasm",
+        module="python_guest.path",
+        module_path=None,
+        approval_mode="never_require",
+        tools=(),
+        workspace_root=workspace_root,
+        workspace_signature=(),
+        file_mounts=file_mounts,
+        allowed_domains=(),
+    )
+
+
+def _symlinks_supported(tmp: Path) -> bool:
+    """Return True if the current platform/environment supports symlinks.
+
+    Mirrors python/packages/core/tests/core/test_skills.py so the symlink
+    regression tests are skipped on restricted Windows CI runners instead of
+    failing on ``OSError`` / ``NotImplementedError`` during creation.
+    """
+    test_target = tmp / "_symlink_test_target"
+    test_link = tmp / "_symlink_test_link"
+    try:
+        test_target.write_text("test", encoding="utf-8")
+        test_link.symlink_to(test_target)
+        return True
+    except (OSError, NotImplementedError):
+        return False
+    finally:
+        test_link.unlink(missing_ok=True)
+        test_target.unlink(missing_ok=True)
+
+
+def _create_junction_or_skip(*, link: Path, target: Path) -> None:
+    if sys.platform != "win32":
+        pytest.skip("Windows directory junctions are only available on Windows")
+
+    result = subprocess.run(
+        [os.environ.get("COMSPEC", "cmd"), "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"Could not create Windows directory junction: {result.stderr or result.stdout}")
+
+    if not execute_code_module._is_link_or_reparse_point(link):
+        link.rmdir()
+        pytest.skip("Created junction was not reported as a reparse point")
+
+
+def test_resolve_contained_path_reports_runtime_resolve_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    candidate = workspace / "candidate.txt"
+    candidate.write_text("content", encoding="utf-8")
+    original_resolve = type(candidate).resolve
+
+    def fail_candidate_resolve(self: Path, strict: bool = False) -> Path:
+        if self == candidate:
+            raise RuntimeError("symlink loop from candidate")
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(type(candidate), "resolve", fail_candidate_resolve)
+
+    with pytest.raises(ValueError) as exc_info:
+        execute_code_module._resolve_contained_path(path=candidate, root=workspace)
+
+    message = str(exc_info.value)
+    assert "Could not resolve Hyperlight sandbox input path" in message
+    assert "validating it stays under the configured source root" in message
+    assert str(candidate) in message
+    assert str(workspace) in message
+    assert "symlink loop from candidate" in message
+
+
+def test_populate_input_dir_rejects_symlink_to_file_outside_workspace(tmp_path: Path) -> None:
+    if not _symlinks_supported(tmp_path):
+        pytest.skip("Symlinks not supported on this platform/environment")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside-content", encoding="utf-8")
+    (workspace / "real.txt").write_text("real-content", encoding="utf-8")
+    (workspace / "link.txt").symlink_to(outside)
+
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+
+    with pytest.raises(ValueError, match="Refusing to stage linked or reparse-point path"):
+        execute_code_module._populate_input_dir(
+            config=_build_run_config(workspace_root=workspace),
+            input_root=input_root,
+        )
+
+    assert not (input_root / "link.txt").exists()
+    assert not (input_root / "link.txt").is_symlink()
+    leaked = [
+        path
+        for path in input_root.rglob("*")
+        if path.is_file() and path.read_text(encoding="utf-8") == "outside-content"
+    ]
+    assert leaked == []
+
+
+def test_populate_input_dir_rejects_symlinked_directory_outside_workspace(tmp_path: Path) -> None:
+    if not _symlinks_supported(tmp_path):
+        pytest.skip("Symlinks not supported on this platform/environment")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "deep.txt").write_text("deep-content", encoding="utf-8")
+    (workspace / "linked_dir").symlink_to(outside_dir, target_is_directory=True)
+
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+
+    with pytest.raises(ValueError, match="Refusing to stage linked or reparse-point path"):
+        execute_code_module._populate_input_dir(
+            config=_build_run_config(workspace_root=workspace),
+            input_root=input_root,
+        )
+
+    assert not (input_root / "linked_dir").exists()
+    leaked = [
+        path for path in input_root.rglob("*") if path.is_file() and path.read_text(encoding="utf-8") == "deep-content"
+    ]
+    assert leaked == []
+
+
+def test_populate_input_dir_rejects_nested_symlinks(tmp_path: Path) -> None:
+    """A symlink several levels deep inside a real subdir must also be rejected."""
+    if not _symlinks_supported(tmp_path):
+        pytest.skip("Symlinks not supported on this platform/environment")
+    workspace = tmp_path / "workspace"
+    (workspace / "real_sub").mkdir(parents=True)
+    (workspace / "real_sub" / "ok.txt").write_text("ok", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside-content", encoding="utf-8")
+    (workspace / "real_sub" / "link.txt").symlink_to(outside)
+
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+
+    with pytest.raises(ValueError, match="Refusing to stage linked or reparse-point path"):
+        execute_code_module._populate_input_dir(
+            config=_build_run_config(workspace_root=workspace),
+            input_root=input_root,
+        )
+
+    assert not any(
+        path.is_file() and path.read_text(encoding="utf-8") == "outside-content" for path in input_root.rglob("*")
+    )
+    assert not (input_root / "real_sub" / "link.txt").exists()
+
+
+def test_populate_input_dir_rejects_workspace_junction_outside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "deep.txt").write_text("deep-content", encoding="utf-8")
+    _create_junction_or_skip(link=workspace / "linked_dir", target=outside_dir)
+
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+
+    with pytest.raises(ValueError, match="Refusing to stage linked or reparse-point path"):
+        execute_code_module._populate_input_dir(
+            config=_build_run_config(workspace_root=workspace),
+            input_root=input_root,
+        )
+
+    assert not (input_root / "linked_dir").exists()
+    assert not any(
+        path.is_file() and path.read_text(encoding="utf-8") == "deep-content" for path in input_root.rglob("*")
+    )
+
+
+def test_populate_input_dir_rejects_nested_workspace_junction(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    (workspace / "real_sub").mkdir(parents=True)
+    (workspace / "real_sub" / "ok.txt").write_text("ok", encoding="utf-8")
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "deep.txt").write_text("deep-content", encoding="utf-8")
+    _create_junction_or_skip(link=workspace / "real_sub" / "linked_dir", target=outside_dir)
+
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+
+    with pytest.raises(ValueError, match="Refusing to stage linked or reparse-point path"):
+        execute_code_module._populate_input_dir(
+            config=_build_run_config(workspace_root=workspace),
+            input_root=input_root,
+        )
+
+    assert not any(
+        path.is_file() and path.read_text(encoding="utf-8") == "deep-content" for path in input_root.rglob("*")
+    )
+    assert not (input_root / "real_sub" / "linked_dir").exists()
+
+
+def test_populate_input_dir_rejects_file_mount_junction(tmp_path: Path) -> None:
+    mount_root = tmp_path / "mount"
+    mount_root.mkdir()
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "deep.txt").write_text("deep-content", encoding="utf-8")
+    _create_junction_or_skip(link=mount_root / "linked_dir", target=outside_dir)
+
+    input_root = tmp_path / "input"
+    input_root.mkdir()
+    mount = execute_code_module._NormalizedFileMount(
+        host_path=mount_root,
+        mount_path="mounted",
+        path_signature=(),
+    )
+
+    with pytest.raises(ValueError, match="Refusing to stage linked or reparse-point path"):
+        execute_code_module._populate_input_dir(
+            config=_build_run_config(file_mounts=(mount,)),
+            input_root=input_root,
+        )
+
+    assert not (input_root / "mounted" / "linked_dir").exists()
+    assert not any(
+        path.is_file() and path.read_text(encoding="utf-8") == "deep-content" for path in input_root.rglob("*")
+    )
+
+
+def test_path_tree_signature_rejects_symlinks(tmp_path: Path) -> None:
+    """The cache-key signature must mirror staging and reject linked entries."""
+    if not _symlinks_supported(tmp_path):
+        pytest.skip("Symlinks not supported on this platform/environment")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    real = workspace / "real.txt"
+    real.write_text("real-content", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside-content", encoding="utf-8")
+    (workspace / "link.txt").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="Refusing to stage linked or reparse-point path"):
+        execute_code_module._path_tree_signature(workspace)
+
+
+def test_path_tree_signature_walks_through_symlinked_root(tmp_path: Path) -> None:
+    """A symlinked workspace root must produce a real signature, not an empty one.
+
+    Defends against the cache never invalidating when a caller passes a
+    symlinked workspace and the underlying real directory's contents change.
+    """
+    if not _symlinks_supported(tmp_path):
+        pytest.skip("Symlinks not supported on this platform/environment")
+
+    real_workspace = tmp_path / "real_workspace"
+    real_workspace.mkdir()
+    target = real_workspace / "data.txt"
+    target.write_text("v1", encoding="utf-8")
+
+    linked_workspace = tmp_path / "linked_workspace"
+    linked_workspace.symlink_to(real_workspace, target_is_directory=True)
+
+    signature_v1 = execute_code_module._path_tree_signature(linked_workspace)
+    names = [entry[0] for entry in signature_v1]
+    assert "data.txt" in names, f"signature should include the target's contents, got {signature_v1!r}"
+
+    # Mutate the real contents; the symlinked-root signature must reflect the change
+    # so the cache key invalidates.
+    import time
+
+    time.sleep(0.01)  # ensure mtime_ns moves on filesystems with coarse granularity
+    target.write_text("v2-content-larger", encoding="utf-8")
+    signature_v2 = execute_code_module._path_tree_signature(linked_workspace)
+    assert signature_v1 != signature_v2, "signature should change when symlinked target contents change"
+
+
+class _OutputDirShim:
+    """Minimal stand-in for ``TemporaryDirectory`` exposing only ``.name``."""
+
+    def __init__(self, path: Path) -> None:
+        self.name = str(path)
+
+
+def _decode_content_bytes(item: Content) -> bytes:
+    import base64
+
+    assert item.uri is not None
+    _, _, encoded = item.uri.partition("base64,")
+    return base64.b64decode(encoded)
+
+
+def _assert_bounded_output_error(contents: list[Content], match: str) -> None:
+    assert any(item.type == "text" and item.text == "guest-finished\n" for item in contents)
+    assert not any(item.type == "data" for item in contents)
+    errors = [item for item in contents if item.type == "error"]
+    assert len(errors) == 1
+    assert errors[0].message == "Execution error"
+    assert errors[0].error_details is not None
+    assert match in errors[0].error_details
+
+
+def test_collect_output_relative_paths_skips_symlinked_file(tmp_path: Path) -> None:
+    """A final-component symlink planted in /output must not be surfaced."""
+    if not _symlinks_supported(tmp_path):
+        pytest.skip("Symlinks not supported on this platform/environment")
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    (output_root / "report.txt").write_text("real-report", encoding="utf-8")
+    secret = tmp_path / "host_secret.txt"
+    secret.write_text("HOST_SECRET", encoding="utf-8")
+    (output_root / "leak.txt").symlink_to(secret)
+
+    relative_paths = execute_code_module._collect_output_relative_paths(root=output_root)
+
+    assert "report.txt" in relative_paths
+    assert "leak.txt" not in relative_paths
+
+
+def test_collect_output_relative_paths_skips_symlinked_directory(tmp_path: Path) -> None:
+    """A symlinked directory in /output must not be descended into."""
+    if not _symlinks_supported(tmp_path):
+        pytest.skip("Symlinks not supported on this platform/environment")
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "deep.txt").write_text("deep-secret", encoding="utf-8")
+    (output_root / "linked_dir").symlink_to(outside_dir, target_is_directory=True)
+
+    relative_paths = execute_code_module._collect_output_relative_paths(root=output_root)
+
+    assert relative_paths == set()
+
+
+def test_collect_output_relative_paths_skips_junctioned_directory(tmp_path: Path) -> None:
+    """A junctioned directory in /output must not be descended into."""
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "deep.txt").write_text("deep-secret", encoding="utf-8")
+    _create_junction_or_skip(link=output_root / "linked_dir", target=outside_dir)
+
+    relative_paths = execute_code_module._collect_output_relative_paths(root=output_root)
+
+    assert relative_paths == set()
+
+
+def test_collect_output_relative_paths_bounds_directory_only_breadth(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    for index in range(101):
+        (output_root / f"directory-{index}").mkdir()
+
+    with pytest.raises(execute_code_module._OutputMaterializationError, match="traversal entry limit of 100"):
+        execute_code_module._collect_output_relative_paths(root=output_root, max_output_files=1)
+
+
+def test_collect_output_relative_paths_bounds_nesting_depth(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    current = output_root
+    for index in range(execute_code_module.OUTPUT_TRAVERSAL_MAX_DEPTH + 1):
+        current /= f"level-{index}"
+        current.mkdir()
+
+    with pytest.raises(execute_code_module._OutputMaterializationError, match="nesting depth limit"):
+        execute_code_module._collect_output_relative_paths(root=output_root)
+
+
+def test_collect_output_relative_paths_surfaces_scandir_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    original_scandir = os.scandir
+
+    def fail_output_scan(path: str | os.PathLike[str]) -> Any:
+        if Path(path) == output_root:
+            raise PermissionError("simulated output scan failure")
+        return original_scandir(path)
+
+    monkeypatch.setattr(execute_code_module.os, "scandir", fail_output_scan)
+
+    with pytest.raises(execute_code_module._OutputMaterializationError, match="Could not enumerate output directory"):
+        execute_code_module._collect_output_relative_paths(root=output_root)
+
+
+def test_parse_output_files_collects_legitimate_nested_file(tmp_path: Path) -> None:
+    if not execute_code_module._supports_secure_output_dir_fd():
+        pytest.skip("Nested output attachments require secure dir_fd support")
+    output_root = tmp_path / "output"
+    nested_dir = output_root / "nested"
+    nested_dir.mkdir(parents=True)
+    (nested_dir / "report.txt").write_bytes(b"nested-report")
+
+    contents = execute_code_module._parse_output_files(
+        output_dir=cast("TemporaryDirectory[str]", _OutputDirShim(output_root)),
+        expect_output_files=True,
+    )
+
+    data_items = [item for item in contents if item.type == "data"]
+    assert len(data_items) == 1
+    assert data_items[0].additional_properties["path"] == "/output/nested/report.txt"
+    assert _decode_content_bytes(data_items[0]) == b"nested-report"
+
+
+def test_parse_output_files_skips_symlink_to_host_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """End-to-end: a /output symlink to a host file is never returned as Content."""
+    if not _symlinks_supported(tmp_path):
+        pytest.skip("Symlinks not supported on this platform/environment")
+    monkeypatch.setattr(execute_code_module, "OUTPUT_FILE_RETRY_ATTEMPTS", 1)
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    (output_root / "report.txt").write_text("real-report", encoding="utf-8")
+    secret = tmp_path / "host_secret.txt"
+    secret.write_text("HOST_SECRET", encoding="utf-8")
+    (output_root / "leak.txt").symlink_to(secret)
+
+    contents = execute_code_module._parse_output_files(
+        output_dir=cast("TemporaryDirectory[str]", _OutputDirShim(output_root)),
+        expect_output_files=False,
+    )
+
+    paths = {item.additional_properties["path"] for item in contents if item.type == "data"}
+    assert "/output/report.txt" in paths
+    assert "/output/leak.txt" not in paths
+    assert all(b"HOST_SECRET" not in _decode_content_bytes(item) for item in contents if item.type == "data")
+
+
+def test_parse_output_files_rejects_intermediate_dir_symlink(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A path traversing an intermediate dir symlink must be rejected."""
+    if not _symlinks_supported(tmp_path):
+        pytest.skip("Symlinks not supported on this platform/environment")
+    monkeypatch.setattr(execute_code_module, "OUTPUT_FILE_RETRY_ATTEMPTS", 1)
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "leak.txt").write_text("HOST_SECRET", encoding="utf-8")
+    (output_root / "sub").symlink_to(outside_dir, target_is_directory=True)
+
+    contents = execute_code_module._parse_output_files(
+        output_dir=cast("TemporaryDirectory[str]", _OutputDirShim(output_root)),
+        expect_output_files=False,
+    )
+
+    assert all(b"HOST_SECRET" not in _decode_content_bytes(item) for item in contents if item.type == "data")
+    assert all(item.additional_properties.get("path") != "/output/sub/leak.txt" for item in contents)
+
+
+def test_parse_output_files_rejects_intermediate_dir_junction(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A path traversing an intermediate dir junction must be rejected."""
+    monkeypatch.setattr(execute_code_module, "OUTPUT_FILE_RETRY_ATTEMPTS", 1)
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "leak.txt").write_text("HOST_SECRET", encoding="utf-8")
+    _create_junction_or_skip(link=output_root / "sub", target=outside_dir)
+
+    contents = execute_code_module._parse_output_files(
+        output_dir=cast("TemporaryDirectory[str]", _OutputDirShim(output_root)),
+        expect_output_files=False,
+    )
+
+    assert all(b"HOST_SECRET" not in _decode_content_bytes(item) for item in contents if item.type == "data")
+    assert all(item.additional_properties.get("path") != "/output/sub/leak.txt" for item in contents)
+
+
+def test_parse_output_files_rejects_intermediate_dir_swap_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if not _symlinks_supported(tmp_path):
+        pytest.skip("Symlinks not supported on this platform/environment")
+    if not execute_code_module._supports_secure_output_dir_fd():
+        pytest.skip("Atomic intermediate-directory swap test requires secure dir_fd support")
+    monkeypatch.setattr(execute_code_module, "OUTPUT_FILE_RETRY_ATTEMPTS", 1)
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    output_subdir = output_root / "sub"
+    output_subdir.mkdir()
+    output_file = output_subdir / "report.txt"
+    output_file.write_text("safe-report", encoding="utf-8")
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    (outside_dir / "report.txt").write_text("HOST_SECRET", encoding="utf-8")
+    original_is_safe_output_file = execute_code_module._is_safe_output_file
+    swapped = False
+
+    def swap_parent_after_validation(*, root: Path, host_path: Path) -> bool:
+        nonlocal swapped
+        is_safe = original_is_safe_output_file(root=root, host_path=host_path)
+        if is_safe and host_path == output_file and not swapped:
+            swapped = True
+            output_subdir.rename(output_root / "original-sub")
+            output_subdir.symlink_to(outside_dir, target_is_directory=True)
+        return is_safe
+
+    monkeypatch.setattr(execute_code_module, "_is_safe_output_file", swap_parent_after_validation)
+
+    contents = execute_code_module._parse_output_files(
+        output_dir=cast("TemporaryDirectory[str]", _OutputDirShim(output_root)),
+        expect_output_files=False,
+    )
+
+    assert swapped
+    assert not any(item.type == "data" for item in contents)
+    assert all(b"HOST_SECRET" not in _decode_content_bytes(item) for item in contents if item.type == "data")
+
+
+async def test_execute_code_tool_fails_closed_for_nested_output_without_secure_dir_fd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+    monkeypatch.setattr(
+        execute_code_module,
+        "_supports_secure_output_dir_fd",
+        lambda: False,
+        raising=False,
+    )
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path)
+
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-nested-output"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    _assert_bounded_output_error(contents, "Nested output attachments cannot be opened safely")
+
+
+def test_clear_directory_removes_junction_without_deleting_target(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "keep.txt"
+    outside_file.write_text("do-not-delete", encoding="utf-8")
+    _create_junction_or_skip(link=output_root / "linked_dir", target=outside_dir)
+
+    execute_code_module._clear_directory(cast("TemporaryDirectory[str]", _OutputDirShim(output_root)))
+
+    assert outside_file.read_text(encoding="utf-8") == "do-not-delete"
+    assert not (output_root / "linked_dir").exists()
+
+
+def test_clear_directory_bounds_directory_only_breadth(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    for index in range(101):
+        (output_root / f"directory-{index}").mkdir()
+
+    with pytest.raises(execute_code_module._OutputCleanupError, match="cleanup entry limit of 100"):
+        execute_code_module._clear_directory(
+            cast("TemporaryDirectory[str]", _OutputDirShim(output_root)),
+            max_entries=100,
+            max_depth=execute_code_module.OUTPUT_TRAVERSAL_MAX_DEPTH,
+        )
+
+    assert sum(1 for _ in output_root.iterdir()) == 1
+
+
+def test_clear_directory_bounds_nesting_depth(tmp_path: Path) -> None:
+    output_root = tmp_path / "output"
+    current = output_root
+    for index in range(3):
+        current /= f"level-{index}"
+        current.mkdir(parents=True)
+
+    with pytest.raises(execute_code_module._OutputCleanupError, match="cleanup nesting depth limit of 2"):
+        execute_code_module._clear_directory(
+            cast("TemporaryDirectory[str]", _OutputDirShim(output_root)), max_entries=100, max_depth=2
+        )
+
+
+def test_is_safe_output_file_rejects_parent_traversal(tmp_path: Path) -> None:
+    """A lexical ``..`` component must be rejected even without any symlink."""
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("HOST_SECRET", encoding="utf-8")
+
+    assert (
+        execute_code_module._is_safe_output_file(root=output_root, host_path=output_root / ".." / "secret.txt") is False
+    )
+    assert execute_code_module._is_safe_output_file(root=output_root, host_path=secret) is False
+
+
+def test_is_safe_output_file_rejects_runtime_resolve_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    report = output_root / "report.txt"
+    report.write_text("artifact", encoding="utf-8")
+    original_resolve = type(report).resolve
+
+    def fail_report_resolve(self: Path, strict: bool = False) -> Path:
+        if self == report:
+            raise RuntimeError("symlink loop from output")
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(type(report), "resolve", fail_report_resolve)
+
+    assert execute_code_module._is_safe_output_file(root=output_root, host_path=report) is False
+
+
+def test_parse_output_files_collects_real_output_file(tmp_path: Path) -> None:
+    """Regression: a genuine /output file is still collected and returned."""
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    (output_root / "report.txt").write_text("artifact", encoding="utf-8")
+
+    contents = execute_code_module._parse_output_files(
+        output_dir=cast("TemporaryDirectory[str]", _OutputDirShim(output_root)),
+        expect_output_files=True,
+    )
+
+    data_items = [item for item in contents if item.type == "data"]
+    assert len(data_items) == 1
+    assert data_items[0].additional_properties["path"] == "/output/report.txt"
+    assert _decode_content_bytes(data_items[0]) == b"artifact"
+
+
+async def test_execute_code_tool_rejects_sparse_output_without_unbounded_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+    original_fdopen = os.fdopen
+
+    class _BoundedReadGuard:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> _BoundedReadGuard:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            self._handle.close()
+
+        def read(self, size: int = -1) -> bytes:
+            assert size >= 0, "output reads must always be bounded"
+            assert size <= 5 * 1024 * 1024 + 1
+            return cast(bytes, self._handle.read(size))
+
+    def guarded_fdopen(fd: int, *args: Any, **kwargs: Any) -> _BoundedReadGuard:
+        return _BoundedReadGuard(original_fdopen(fd, *args, **kwargs))
+
+    monkeypatch.setattr(execute_code_module.os, "fdopen", guarded_fdopen)
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path)
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-sparse-output"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    _assert_bounded_output_error(contents, "per-file output limit")
+
+
+async def test_execute_code_tool_clears_output_after_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+    execute_code = HyperlightExecuteCodeTool(
+        workspace_root=tmp_path,
+        max_output_file_bytes=3,
+    )
+    config = execute_code._build_run_config()
+    registry = cast(Any, execute_code._registry)
+    output_root = Path(registry._get_or_create_entry(config).output_dir.name)
+
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-memory-output"})
+
+        _assert_bounded_output_error(contents, "per-file output limit")
+        # Rejection retires the entry and removes its directory on the single cleanup worker.
+        # Wait behind that cleanup before checking the directory, which may already be gone.
+        await asyncio.wrap_future(registry._cleanup_executor.submit(lambda: None))
+        assert not await asyncio.to_thread(output_root.exists)
+    finally:
+        _close_execute_code_registry(execute_code)
+
+
+async def test_execute_code_tool_preserves_result_when_post_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path)
+    config = execute_code._build_run_config()
+    registry = cast(Any, execute_code._registry)
+    output_root = Path(registry._get_or_create_entry(config).output_dir.name)
+    original_scandir = os.scandir
+    output_scan_calls = 0
+
+    def fail_post_cleanup(path: str | os.PathLike[str]) -> Any:
+        nonlocal output_scan_calls
+        if Path(path) == output_root:
+            output_scan_calls += 1
+            if output_scan_calls == 3:
+                raise PermissionError("simulated cleanup failure")
+        return original_scandir(path)
+
+    monkeypatch.setattr(execute_code_module.os, "scandir", fail_post_cleanup)
+
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-output"})
+
+        assert any(item.type == "text" and item.text == "done\n" for item in contents)
+        assert any(item.type == "data" for item in contents)
+        cleanup_errors = [item for item in contents if item.type == "error"]
+        assert len(cleanup_errors) == 1
+        assert cleanup_errors[0].error_details == "Could not clear sandbox output safely."
+        assert str(output_root) not in cleanup_errors[0].error_details
+        assert registry._entries == {}
+
+        recovered = await execute_code.invoke(arguments={"code": "fail"})
+        assert not any(item.type == "data" for item in recovered)
+        assert any(item.type == "error" and item.error_details == "sandbox boom" for item in recovered)
+        assert len(_FakeSandbox.instances) == 2
+        assert registry._entries == {}
+    finally:
+        _close_execute_code_registry(execute_code)
+
+
+async def test_cleanup_failed_entry_disposes_directories_without_blocking_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+    registry = execute_code_module._SandboxRegistry()
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path, _registry=registry)
+    config = execute_code._build_run_config()
+    entry = registry._get_or_create_entry(config)
+    assert entry.output_dir is not None
+    output_root = Path(entry.output_dir.name)
+    original_scandir = os.scandir
+    output_scan_calls = 0
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    original_cleanup_temp_dirs = execute_code_module._SandboxEntry.cleanup_temp_dirs
+
+    def fail_post_cleanup(path: str | os.PathLike[str]) -> Any:
+        nonlocal output_scan_calls
+        if Path(path) == output_root:
+            output_scan_calls += 1
+            if output_scan_calls == 3:
+                raise PermissionError("simulated cleanup failure")
+        return original_scandir(path)
+
+    def blocking_cleanup_temp_dirs(entry_to_clean: Any) -> None:
+        cleanup_started.set()
+        if not release_cleanup.wait(timeout=5):
+            raise TimeoutError("timed out waiting to release cleanup")
+        original_cleanup_temp_dirs(entry_to_clean)
+
+    monkeypatch.setattr(execute_code_module.os, "scandir", fail_post_cleanup)
+    monkeypatch.setattr(execute_code_module._SandboxEntry, "cleanup_temp_dirs", blocking_cleanup_temp_dirs)
+
+    try:
+        contents = await asyncio.wait_for(
+            execute_code.invoke(arguments={"code": "create-output"}),
+            timeout=2,
+        )
+
+        assert any(item.type == "data" for item in contents)
+        assert any(item.type == "error" for item in contents)
+        assert await asyncio.to_thread(cleanup_started.wait, 1)
+        assert await asyncio.to_thread(output_root.exists)
+
+        release_cleanup.set()
+        for _ in range(100):
+            if not await asyncio.to_thread(output_root.exists):
+                break
+            await asyncio.sleep(0.01)
+        assert not await asyncio.to_thread(output_root.exists)
+    finally:
+        release_cleanup.set()
+        _close_execute_code_registry(execute_code)
+
+
+async def test_execute_code_tool_preserves_exception_when_post_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path)
+    config = execute_code._build_run_config()
+    registry = cast(Any, execute_code._registry)
+    output_root = Path(registry._get_or_create_entry(config).output_dir.name)
+    original_scandir = os.scandir
+    output_scan_calls = 0
+
+    def fail_post_cleanup(path: str | os.PathLike[str]) -> Any:
+        nonlocal output_scan_calls
+        if Path(path) == output_root:
+            output_scan_calls += 1
+            if output_scan_calls == 2:
+                raise PermissionError("simulated cleanup failure")
+        return original_scandir(path)
+
+    def fail_build_contents(**kwargs: Any) -> list[Content]:
+        del kwargs
+        raise RuntimeError("primary build failure")
+
+    monkeypatch.setattr(execute_code_module.os, "scandir", fail_post_cleanup)
+    monkeypatch.setattr(execute_code_module, "_build_execution_contents", fail_build_contents)
+
+    try:
+        with pytest.raises(RuntimeError, match="primary build failure"):
+            await execute_code.invoke(arguments={"code": "create-output"})
+        assert registry._entries == {}
+    finally:
+        _close_execute_code_registry(execute_code)
+
+
+async def test_execute_code_tool_checks_output_count_before_reading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+
+    def fail_if_read(*args: Any, **kwargs: Any) -> bytes:
+        del args, kwargs
+        pytest.fail("output files were read before enforcing the count limit")
+
+    monkeypatch.setattr(execute_code_module, "_read_output_file_bytes", fail_if_read)
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path, max_output_files=2)
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-count-output"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    _assert_bounded_output_error(contents, "output file count limit")
+
+
+async def test_execute_code_tool_does_not_call_eager_backend_output_listing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandboxWithEagerOutputListing.listing_calls = 0
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithEagerOutputListing)
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path, max_output_files=2)
+
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-count-output"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    assert _FakeSandboxWithEagerOutputListing.listing_calls == 0
+    _assert_bounded_output_error(contents, "output file count limit")
+
+
+async def test_execute_code_tool_streams_directory_enumeration_to_count_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        execute_code_module,
+        "_load_sandbox_class",
+        lambda: _FakeSandboxWithBoundedOutputsWithoutListing,
+    )
+    original_scandir = os.scandir
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path, max_output_files=2)
+    config = execute_code._build_run_config()
+    output_root = Path(cast(Any, execute_code._registry)._get_or_create_entry(config).output_dir.name)
+    scanned_entries: list[int] = []
+
+    class _BoundedScandir:
+        def __init__(self, path: str | os.PathLike[str]) -> None:
+            self._entries = original_scandir(path)
+            self._scan_index: int | None = None
+            if Path(path) == output_root:
+                self._scan_index = len(scanned_entries)
+                scanned_entries.append(0)
+
+        def __enter__(self) -> _BoundedScandir:
+            self._entries.__enter__()
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            self._entries.__exit__(*args)
+
+        def close(self) -> None:
+            self._entries.close()
+
+        def __iter__(self) -> _BoundedScandir:
+            return self
+
+        def __next__(self) -> os.DirEntry[str]:
+            entry = next(self._entries)
+            if self._scan_index is not None:
+                scanned_entries[self._scan_index] += 1
+                if scanned_entries[self._scan_index] > 3:
+                    pytest.fail("an output directory scan continued past max_output_files + 1")
+            return entry
+
+    monkeypatch.setattr(execute_code_module.os, "scandir", _BoundedScandir)
+
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-count-output"})
+    finally:
+        _close_execute_code_registry(execute_code)
+        monkeypatch.setattr(execute_code_module.os, "scandir", original_scandir)
+
+    assert scanned_entries == [0, 3, 3, 0]
+    _assert_bounded_output_error(contents, "output file count limit")
+
+
+@pytest.mark.parametrize(
+    ("code", "error_match"),
+    [
+        ("create-wide-output", "traversal entry limit of 100"),
+        ("create-deep-output", "nesting depth limit of 32"),
+    ],
+)
+async def test_execute_code_tool_invalidates_entry_when_cleanup_exceeds_bounds(
+    code: str,
+    error_match: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path, max_output_files=1)
+    config = execute_code._build_run_config()
+    registry = cast(Any, execute_code._registry)
+    original_entry = registry._get_or_create_entry(config)
+    assert original_entry.output_dir is not None
+    original_output_root = Path(original_entry.output_dir.name)
+
+    try:
+        rejected = await execute_code.invoke(arguments={"code": code})
+        assert registry._entries == {}
+        for _ in range(100):
+            if not await asyncio.to_thread(original_output_root.exists):
+                break
+            await asyncio.sleep(0.01)
+        assert not await asyncio.to_thread(original_output_root.exists)
+
+        recovered = await execute_code.invoke(arguments={"code": "create-memory-output"})
+        replacement_output_root = Path(registry._get_or_create_entry(config).output_dir.name)
+        remaining_after_recovery = await asyncio.to_thread(lambda: list(replacement_output_root.iterdir()))
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    _assert_bounded_output_error(rejected, error_match)
+    assert len(_FakeSandbox.instances) == 2
+    assert [_decode_content_bytes(item) for item in recovered if item.type == "data"] == [b"data"]
+    assert remaining_after_recovery == []
+
+
+async def test_execute_code_tool_reads_only_observed_file_size_with_large_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+    original_fdopen = os.fdopen
+    read_sizes: list[int] = []
+
+    class _ReadSizeGuard:
+        def __init__(self, handle: Any) -> None:
+            self._handle = handle
+
+        def __enter__(self) -> _ReadSizeGuard:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            self._handle.close()
+
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            if size > 5:
+                pytest.fail("small output requested a quota-sized read")
+            return cast(bytes, self._handle.read(size))
+
+    monkeypatch.setattr(
+        execute_code_module.os,
+        "fdopen",
+        lambda fd, *args, **kwargs: _ReadSizeGuard(original_fdopen(fd, *args, **kwargs)),
+    )
+    execute_code = HyperlightExecuteCodeTool(
+        workspace_root=tmp_path,
+        max_output_file_bytes=sys.maxsize,
+        max_output_total_bytes=sys.maxsize,
+    )
+
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-memory-output"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    assert read_sizes == [5]
+    assert [_decode_content_bytes(item) for item in contents if item.type == "data"] == [b"data"]
+
+
+async def test_execute_code_tool_rejects_cumulative_output_overflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+    execute_code = HyperlightExecuteCodeTool(
+        workspace_root=tmp_path,
+        max_output_file_bytes=3,
+        max_output_total_bytes=5,
+    )
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-cumulative-output"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    _assert_bounded_output_error(contents, "cumulative output limit")
+
+
+async def test_execute_code_tool_accepts_output_at_exact_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+    execute_code = HyperlightExecuteCodeTool(
+        workspace_root=tmp_path,
+        max_output_files=2,
+        max_output_file_bytes=3,
+        max_output_total_bytes=5,
+    )
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-exact-output"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    data_items = [item for item in contents if item.type == "data"]
+    assert [_decode_content_bytes(item) for item in data_items] == [b"abc", b"de"]
+    assert not any(item.type == "error" for item in contents)
+
+
+async def test_execute_code_tool_bounds_file_growth_after_fstat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+    original_fdopen = os.fdopen
+    read_sizes: list[int] = []
+
+    class _GrowingHandle:
+        def __init__(self, handle: Any, file_path: Path) -> None:
+            self._handle = handle
+            self._file_path = file_path
+
+        def __enter__(self) -> _GrowingHandle:
+            return self
+
+        def __exit__(self, *args: Any) -> None:
+            self._handle.close()
+
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            with self._file_path.open("ab") as growing_file:
+                growing_file.write(b"X")
+            return cast(bytes, self._handle.read(size))
+
+    execute_code = HyperlightExecuteCodeTool(
+        workspace_root=tmp_path,
+        max_output_file_bytes=8,
+        max_output_total_bytes=8,
+    )
+    try:
+        config = execute_code._build_run_config()
+        output_root = Path(cast(Any, execute_code._registry)._get_or_create_entry(config).output_dir.name)
+        monkeypatch.setattr(
+            execute_code_module.os,
+            "fdopen",
+            lambda fd, *args, **kwargs: _GrowingHandle(
+                original_fdopen(fd, *args, **kwargs), output_root / "growing.bin"
+            ),
+        )
+        contents = await execute_code.invoke(arguments={"code": "create-growing-output"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    assert read_sizes == [5]
+    _assert_bounded_output_error(contents, "grew while it was being read")
+
+
+@pytest.mark.parametrize("stage", ["read_memory", "read_overflow", "content_memory"])
+async def test_execute_code_tool_converts_output_allocation_error_to_content_error(
+    stage: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+
+    if stage != "content_memory":
+        original_fdopen = os.fdopen
+
+        class _MemoryErrorHandle:
+            def __init__(self, handle: Any) -> None:
+                self._handle = handle
+
+            def __enter__(self) -> _MemoryErrorHandle:
+                return self
+
+            def __exit__(self, *args: Any) -> None:
+                self._handle.close()
+
+            def read(self, size: int = -1) -> bytes:
+                del size
+                if stage == "read_memory":
+                    raise MemoryError("simulated allocation failure")
+                raise OverflowError("simulated read size overflow")
+
+        monkeypatch.setattr(
+            execute_code_module.os,
+            "fdopen",
+            lambda fd, *args, **kwargs: _MemoryErrorHandle(original_fdopen(fd, *args, **kwargs)),
+        )
+    else:
+
+        def raise_memory_error(*args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            raise MemoryError("simulated allocation failure")
+
+        monkeypatch.setattr(execute_code_module.Content, "from_data", raise_memory_error)
+
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path)
+    try:
+        contents = await execute_code.invoke(arguments={"code": "create-memory-output"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    _assert_bounded_output_error(
+        contents,
+        "configured byte limits" if stage != "content_memory" else "enough memory",
+    )
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "error_type"),
+    [
+        ("max_output_files", 0, ValueError),
+        ("max_output_file_bytes", -1, ValueError),
+        ("max_output_total_bytes", True, TypeError),
+        ("max_output_files", 1.5, TypeError),
+        ("max_output_file_bytes", "1024", TypeError),
+    ],
+)
+def test_hyperlight_output_limit_options_require_positive_integers(
+    option: str,
+    value: Any,
+    error_type: type[Exception],
+) -> None:
+    kwargs = {option: value}
+    with pytest.raises(error_type, match=option):
+        HyperlightExecuteCodeTool(**kwargs)
+    with pytest.raises(error_type, match=option):
+        HyperlightCodeActProvider(**kwargs)
+
+
+def test_execute_code_tool_allowed_domains_use_structured_entries_and_replace_by_target() -> None:
+    execute_code = HyperlightExecuteCodeTool(_registry=_FakeRuntime())
+
+    execute_code.add_allowed_domains(["https://api.example.com/v1", ("github.com", "get")])
+    execute_code.add_allowed_domains([
+        AllowedDomain("api.example.com", ("post", "get")),
+        ("github.com", ["head", "get"]),
+    ])
+
+    assert execute_code.get_allowed_domains() == [
+        AllowedDomain("api.example.com", ("GET", "POST")),
+        AllowedDomain("github.com", ("GET", "HEAD")),
+    ]
+
+
+def test_execute_code_tool_normalizers_reject_invalid_inputs() -> None:
+    with pytest.raises(ValueError, match="must not be empty"):
+        execute_code_module._normalize_domain(" ")
+    with pytest.raises(ValueError, match="Could not normalize allowed domain entry"):
+        execute_code_module._normalize_domain("https://")
+    with pytest.raises(ValueError, match="must not be empty"):
+        execute_code_module._normalize_http_method(" ")
+    assert execute_code_module._normalize_http_methods(None) is None
+    with pytest.raises(ValueError, match="must not be empty when provided"):
+        execute_code_module._normalize_http_methods([])
+    with pytest.raises(ValueError, match="must not be empty"):
+        execute_code_module._normalize_mount_path(" ")
+    with pytest.raises(ValueError, match="must stay within /input"):
+        execute_code_module._normalize_mount_path("/input/../escape")
+    with pytest.raises(ValueError, match="must point to a concrete path under /input"):
+        execute_code_module._normalize_mount_path("/input")
+
+
+def test_execute_code_tool_shape_guards_validate_pairs() -> None:
+    assert execute_code_module._is_file_mount_pair(("source.txt", "mount.txt")) is True
+    assert execute_code_module._is_file_mount_pair(("source.txt", "mount.txt", "extra")) is False
+    assert execute_code_module._is_file_mount_pair(("source.txt", 1)) is False
+
+    assert execute_code_module._is_allowed_domain_pair(("example.com", "get")) is True
+    assert execute_code_module._is_allowed_domain_pair(("example.com", ["get", "post"])) is True
+    assert execute_code_module._is_allowed_domain_pair((123, ["get"])) is False
+    assert execute_code_module._is_allowed_domain_pair(("example.com", 123)) is False
+
+
+def test_instruction_builders_cover_mounted_paths_and_workspace_free_filesystem_state() -> None:
+    description = instructions_module.build_execute_code_description(
+        tools=[compute],
+        filesystem_enabled=True,
+        workspace_enabled=False,
+        mounted_paths=["/input/data/report.txt"],
+        allowed_domains=[],
+    )
+    instructions = instructions_module.build_codeact_instructions(
+        tools=[compute],
+        tools_visible_to_model=True,
+        filesystem_enabled=True,
+    )
+    filesystem_text = instructions_module._format_filesystem_capabilities(
+        filesystem_enabled=True,
+        workspace_enabled=False,
+        mounted_paths=[],
+    )
+
+    assert "Additional mounted paths:" in description
+    assert "/input/data/report.txt" in description
+    assert "Some tools may also appear directly" in instructions
+    assert "For larger artifacts, write them to `/output/<filename>` instead" in instructions
+    assert "No workspace root or explicit file mounts are currently configured." in filesystem_text
+
+
+def test_execute_code_tool_description_contains_call_tool_guidance(tmp_path: Path) -> None:
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    (workspace_root / "notes.txt").write_text("hello", encoding="utf-8")
+    mount_file = tmp_path / "data.json"
+    mount_file.write_text('{"hello": "world"}', encoding="utf-8")
+
+    execute_code = HyperlightExecuteCodeTool(
+        tools=[compute],
+        workspace_root=workspace_root,
+        file_mounts=[FileMount(str(mount_file), "data/data.json")],
+        allowed_domains=[AllowedDomain("https://api.example.com/v1", ("get", "post")), "github.com"],
+        _registry=_FakeRuntime(),
+    )
+
+    description = execute_code.description
+
+    assert "call_tool(name, **kwargs)" in description
+    assert "compute" in description
+    assert "/input/data/data.json" in description
+    assert "/output" in description
+    assert "api.example.com" in description
+    assert "GET, POST" in description
+    assert "github.com" in description
+
+
+@pytest.fixture
+def documented_tool() -> FunctionTool:
+    return FunctionTool(
+        name="lookup",
+        description="Look up an item.",
+        func=lambda **kwargs: kwargs,
+        input_model={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search text"},
+                "limit": {"type": "integer", "description": "Maximum results", "default": 10},
+                "order": {"type": "string", "enum": ["ascending", "descending"], "default": "ascending"},
+            },
+            "required": ["query"],
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["compact", {}, {"lookup": "compact"}, {"LOOKUP": "json"}, MappingProxyType({"inactive": "json"})],
+)
+def test_description_format_compact_preserves_parameter_metadata(documented_tool: FunctionTool, mode: Any) -> None:
+    execute_code = HyperlightExecuteCodeTool(
+        tools=[documented_tool], tool_description_format=mode, _registry=_FakeRuntime()
+    )
+    description = execute_code.description
+
+    assert "- `lookup`: Look up an item." in description
+    assert "- `query` (string, required): Search text" in description
+    assert "- `limit` (integer, optional): Maximum results Default: 10." in description
+    expected_order = '- `order` (string, optional) Allowed values: ["ascending", "descending"]. Default: "ascending".'
+    assert expected_order in description
+    assert "Parameters (JSON Schema)" not in description
+    assert execute_code.to_dict()["description"] == description
+    assert execute_code.parameters() == execute_code_module.EXECUTE_CODE_INPUT_SCHEMA
+
+
+@pytest.mark.parametrize("mode", ["json", {"lookup": "json"}])
+@pytest.mark.parametrize("rich_schema", [False, True])
+def test_description_format_json_preserves_full_schema(
+    documented_tool: FunctionTool, mode: Any, rich_schema: bool
+) -> None:
+    schema = deepcopy(documented_tool.parameters())
+    if rich_schema:
+        schema["additionalProperties"] = False
+        schema["properties"]["filters"] = {"type": "array", "items": {"type": "integer", "minimum": 1}}
+    registered_tool = FunctionTool(name="lookup", description="", func=lambda **kwargs: kwargs, input_model=schema)
+    original_schema = deepcopy(registered_tool.parameters())
+    execute_code = HyperlightExecuteCodeTool(
+        tools=[registered_tool], tool_description_format=mode, _registry=_FakeRuntime()
+    )
+
+    description = execute_code.description
+    rendered_schema = json.loads(description.split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert rendered_schema == original_schema
+    assert "Parameters (JSON Schema)" in description
+    assert "cannot be represented faithfully" not in description
+    assert registered_tool.parameters() == original_schema
+    assert execute_code.to_dict()["description"] == description
+
+
+def test_description_format_rich_schema_falls_back_without_mutation() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "record": {
+                "type": "object",
+                "properties": {"ids": {"type": "array", "items": {"type": "integer"}}},
+                "required": ["ids"],
+            }
+        },
+        "required": ["record"],
+        "additionalProperties": False,
+    }
+    original_schema = deepcopy(schema)
+    registered_tool = FunctionTool(name="nested", description="", func=lambda **kwargs: kwargs, input_model=schema)
+    execute_code = HyperlightExecuteCodeTool(tools=[registered_tool], _registry=_FakeRuntime())
+
+    description = execute_code.description
+    assert (
+        "Using JSON Schema because the parameter schema cannot be represented faithfully in compact form."
+        in description
+    )
+    rendered_schema = json.loads(description.split("```json\n", 1)[1].split("\n```", 1)[0])
+    assert rendered_schema == registered_tool.parameters() == original_schema
+    assert schema == original_schema
+    assert execute_code.to_dict()["description"] == description
+    assert execute_code.build_serializable_state()["tool_description_format"] == "compact"
+
+
+def test_description_format_mixed_mapping_and_dynamic_registration(documented_tool: FunctionTool) -> None:
+    modes: dict[str, Literal["compact", "json"]] = {"lookup": "json", "compute": "compact", "future": "json"}
+    execute_code = HyperlightExecuteCodeTool(tools=[compute], tool_description_format=modes, _registry=_FakeRuntime())
+    run_tool = execute_code.create_run_tool()
+    assert execute_code._tool_description_format is not modes
+    assert run_tool._tool_description_format is not execute_code._tool_description_format
+    modes["lookup"] = "compact"
+    execute_code.add_tools([documented_tool, dangerous_compute])
+
+    description = execute_code.description
+    assert description.count("Parameters (JSON Schema)") == 1
+    assert "- `a` (integer, required)" in description
+    assert "- `dangerous_compute`: No description provided." in description
+    assert "lookup" not in run_tool.description
+    run_tool.add_tools(documented_tool)
+    assert "Parameters (JSON Schema)" in run_tool.description
+    execute_code.remove_tool("lookup")
+    execute_code.add_tools(documented_tool)
+    assert "Parameters (JSON Schema)" in execute_code.description
+    state = execute_code.build_serializable_state()
+    assert state["tool_description_format"] == {"lookup": "json", "compute": "compact", "future": "json"}
+    state["tool_description_format"]["lookup"] = "compact"
+    assert "Parameters (JSON Schema)" in execute_code.description
+    assert json.loads(json.dumps(run_tool.build_serializable_state()))["tool_description_format"]["future"] == "json"
+
+
+@pytest.mark.parametrize("mode", ["compact", "json", {"compute": "json", "future": "compact"}])
+async def test_description_format_provider_run_state_and_snapshot(mode: Any) -> None:
+    provider = HyperlightCodeActProvider(tools=[compute], tool_description_format=mode, _registry=_FakeRuntime())
+    expected_mode = deepcopy(mode)
+    if isinstance(mode, dict):
+        mode["compute"] = "compact"
+    context = _FakeSessionContext()
+    state: dict[str, Any] = {}
+
+    await provider.before_run(agent=object(), session=None, context=cast(Any, context), state=state)
+    run_tool = context.tools[0][1][0]
+    assert isinstance(run_tool, HyperlightExecuteCodeTool)
+    assert state[provider.source_id]["tool_description_format"] == expected_mode
+    assert run_tool.build_serializable_state() == state[provider.source_id]
+    assert run_tool.to_dict()["description"] == run_tool.description
+    assert ("Parameters (JSON Schema)" in run_tool.description) == (expected_mode != "compact")
+    assert "Parameters (JSON Schema)" not in context.instructions[0][1]
+    assert "compute" not in context.instructions[0][1]
+    assert run_tool._tool_description_format == provider._execute_code_tool._tool_description_format
+    if isinstance(expected_mode, dict):
+        assert run_tool._tool_description_format is not provider._execute_code_tool._tool_description_format
+    provider.clear_tools()
+    assert "- `compute`:" in run_tool.description
+    assert "No tools are currently registered" in provider._execute_code_tool.description
+    json.dumps(state)
+
+
+@pytest.mark.parametrize(
+    ("mode", "error_type"),
+    [
+        ("verbose", ValueError),
+        ("JSON", ValueError),
+        (" compact", ValueError),
+        ({"inactive": "verbose"}, ValueError),
+        (None, TypeError),
+        (1, TypeError),
+        (["compact"], TypeError),
+        ({1: "json"}, TypeError),
+        ({"compute": None}, TypeError),
+        ({"inactive": 1}, TypeError),
+    ],
+)
+@pytest.mark.parametrize("entry_point", [HyperlightExecuteCodeTool, HyperlightCodeActProvider])
+def test_description_format_rejects_invalid_inputs(mode: Any, error_type: type[Exception], entry_point: Any) -> None:
+    with pytest.raises(error_type, match="tool_description_format"):
+        entry_point(tool_description_format=mode, _registry=_FakeRuntime())
+
+
+def test_description_format_defaults_no_tools_and_zero_parameters() -> None:
+    execute_code = HyperlightExecuteCodeTool(_registry=_FakeRuntime())
+    assert "- No tools are currently registered inside the sandbox." in execute_code.description
+    assert execute_code.build_serializable_state()["tool_description_format"] == "compact"
+
+    execute_code.add_tools(
+        FunctionTool(name="noop", description="", func=lambda: None, input_model={"type": "object", "properties": {}})
+    )
+    assert "- `noop`: No description provided.\n  Parameters: none." in execute_code.description
+    assert "call_tool(name, **kwargs)" in execute_code.description
+    assert "arguments only. Do not pass a dict or any other positional arguments" in execute_code.description
+    assert "Filesystem access is unavailable" in execute_code.description
+    assert "Outbound network access is unavailable" in execute_code.description
+
+
+async def test_description_format_does_not_change_runtime_config_or_input_schema() -> None:
+    runtime = _FakeRuntime()
+    compact_tool = HyperlightExecuteCodeTool(tools=[compute], _registry=runtime)
+    json_tool = HyperlightExecuteCodeTool(tools=[compute], tool_description_format="json", _registry=runtime)
+    for execute_code in (compact_tool, json_tool):
+        result = await execute_code.invoke(arguments={"code": "print(42)"})
+        assert result[0].text == "ok"
+        assert execute_code.parameters() == execute_code_module.EXECUTE_CODE_INPUT_SCHEMA
+    compact_config, compact_code = runtime.calls[0]
+    json_config, json_code = runtime.calls[1]
+    assert compact_config == json_config
+    assert compact_config.cache_key() == json_config.cache_key()
+    assert not hasattr(compact_config, "tool_description_format")
+    assert compact_code == json_code == "print(42)"
+    assert compact_tool.build_instructions(tools_visible_to_model=False) == json_tool.build_instructions(
+        tools_visible_to_model=False
+    )
+
+
+async def test_description_format_reuses_sandbox_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+    registry = execute_code_module._SandboxRegistry()
+    compact_tool = HyperlightExecuteCodeTool(tools=[compute], _registry=registry)
+    json_tool = HyperlightExecuteCodeTool(tools=[compute], tool_description_format="json", _registry=registry)
+
+    try:
+        for execute_code in (compact_tool, json_tool):
+            await execute_code.invoke(arguments={"code": "None"})
+        assert len(_FakeSandbox.instances) == 1
+        assert set(_FakeSandbox.instances[0].registered_tools) == {"compute"}
+        assert _FakeSandbox.instances[0].restore_calls == ["snapshot", "snapshot"]
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("mutation", ["remove", "clear", "replace"])
+@pytest.mark.parametrize("cleanup", ["close", "discard"])
+async def test_sandbox_cache_retains_tool_identity_until_entry_removed(
+    monkeypatch: pytest.MonkeyPatch, mutation: str, cleanup: str
+) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+    registry = execute_code_module._SandboxRegistry()
+
+    @tool(name="compute")
+    def original(a: int, b: int) -> int:
+        return a + b
+
+    original_ref = weakref.ref(original)
+    execute_code = HyperlightExecuteCodeTool(tools=[original], _registry=registry)
+    del original
+
+    try:
+        await execute_code.invoke(arguments={"code": "None"})
+        if mutation == "remove":
+            execute_code.remove_tool("compute")
+        elif mutation == "clear":
+            execute_code.clear_tools()
+        else:
+            execute_code.add_tools(compute)
+
+        gc.collect()
+        assert original_ref() is not None
+        assert len(registry._entries) == 1
+
+        if cleanup == "close":
+            registry.close()
+        else:
+            registry._discard_entry(
+                cache_key=next(iter(registry._entries)), entry=next(iter(registry._entries.values()))
+            )
+            registry._cleanup_executor.submit(lambda: None).result(timeout=5)
+
+        gc.collect()
+        assert registry._entries == {}
+        assert original_ref() is None
+    finally:
+        registry.close()
+
+
+async def test_sandbox_cache_replacement_preserves_run_snapshots_and_identity_semantics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ValueEqualTool(FunctionTool):
+        def __eq__(self, other: object) -> bool:
+            return isinstance(other, FunctionTool) and self.name == other.name
+
+    calls: list[str] = []
+
+    def original_callback(a: int, b: int) -> int:
+        calls.append("original")
+        return a + b
+
+    def replacement_callback(a: int, b: int) -> int:
+        calls.append("replacement")
+        return a - b
+
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+    registry = execute_code_module._SandboxRegistry()
+    original = ValueEqualTool(name="compute", func=original_callback)
+    replacement = ValueEqualTool(name="compute", func=replacement_callback)
+    assert original == replacement
+    with pytest.raises(TypeError):
+        hash(original)
+    execute_code = HyperlightExecuteCodeTool(tools=[original], _registry=registry)
+    previous_run = execute_code.create_run_tool()
+    code = 'print(call_tool("compute", a=20, b=22))'
+
+    try:
+        await previous_run.invoke(arguments={"code": "None"})
+        execute_code.remove_tool("compute")
+        execute_code.add_tools(replacement)
+        current_run = execute_code.create_run_tool()
+
+        result = await current_run.invoke(arguments={"code": code})
+        repeated_result = await current_run.invoke(arguments={"code": code})
+        assert result[0].text == repeated_result[0].text == "-2\n"
+        assert calls == ["replacement", "replacement"]
+        assert len(_FakeSandbox.instances) == 2
+
+        previous_result = await previous_run.invoke(arguments={"code": code})
+        assert previous_result[0].text == "42\n"
+        assert calls == ["replacement", "replacement", "original"]
+        assert len(_FakeSandbox.instances) == 2
+    finally:
+        registry.close()
+
+
+async def test_execute_code_tool_executes_with_structured_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+
+    execute_code = HyperlightExecuteCodeTool(
+        tools=[compute],
+        file_mounts=[FileMount(Path(__file__), "fixtures/source.py")],
+        allowed_domains=[("api.example.com", "get")],
+    )
+
+    result = await execute_code.invoke(arguments={"code": "create-output"})
+
+    assert result[0].type == "text"
+    assert result[0].text == "done\n"
+    assert any(item.type == "data" for item in result)
+    assert _FakeSandbox.instances[0].allowed_domains == [("api.example.com", ["GET"])]
+    assert "compute" in _FakeSandbox.instances[0].registered_tools
+
+
+async def test_execute_code_tool_collects_output_files_without_backend_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithoutOutputListing)
+
+    execute_code = HyperlightExecuteCodeTool(
+        file_mounts=[FileMount(Path(__file__), "fixtures/source.py")],
+    )
+    result = await execute_code.invoke(arguments={"code": "create-output"})
+
+    assert result[0].type == "text"
+    assert any(item.type == "data" and item.additional_properties["path"] == "/output/report.txt" for item in result)
+
+
+async def test_execute_code_tool_waits_for_unlisted_output_files_to_appear(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandboxWithDelayedUnlistedOutput.writer_threads.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithDelayedUnlistedOutput)
+
+    execute_code = HyperlightExecuteCodeTool(
+        file_mounts=[FileMount(Path(__file__), "fixtures/source.py")],
+    )
+    result = await execute_code.invoke(
+        arguments={"code": 'Path("/output/report.txt").write_text("artifact", encoding="utf-8")'}
+    )
+
+    for writer_thread in _FakeSandboxWithDelayedUnlistedOutput.writer_threads:
+        writer_thread.join()
+
+    assert any(item.type == "data" and item.additional_properties["path"] == "/output/report.txt" for item in result)
+
+
+async def test_execute_code_tool_waits_for_dynamically_addressed_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandboxWithDelayedUnlistedOutput.writer_threads.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithDelayedUnlistedOutput)
+    execute_code = HyperlightExecuteCodeTool(
+        file_mounts=[FileMount(Path(__file__), "fixtures/source.py")],
+    )
+
+    try:
+        result = await execute_code.invoke(arguments={"code": "create-dynamic-delayed-output"})
+
+        for writer_thread in _FakeSandboxWithDelayedUnlistedOutput.writer_threads:
+            writer_thread.join()
+
+        assert any(
+            item.type == "data" and item.additional_properties["path"] == "/output/report.txt" for item in result
+        )
+        next_result = await execute_code.invoke(arguments={"code": "fail"})
+        assert not any(item.type == "data" for item in next_result)
+    finally:
+        _close_execute_code_registry(execute_code)
+
+
+async def test_execute_code_tool_replaces_output_generation_after_empty_retry_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+    registry = execute_code_module._SandboxRegistry()
+    execute_code = HyperlightExecuteCodeTool(
+        file_mounts=[FileMount(Path(__file__), "fixtures/source.py")],
+        _registry=registry,
+    )
+    config = execute_code._build_run_config()
+    first_entry = registry._get_or_create_entry(config)
+    assert first_entry.output_dir is not None
+    first_output_root = Path(first_entry.output_dir.name)
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+    original_cleanup_temp_dirs = execute_code_module._SandboxEntry.cleanup_temp_dirs
+
+    def blocking_cleanup_temp_dirs(entry_to_clean: Any) -> None:
+        cleanup_started.set()
+        if not release_cleanup.wait(timeout=5):
+            raise TimeoutError("timed out waiting to release cleanup")
+        original_cleanup_temp_dirs(entry_to_clean)
+
+    monkeypatch.setattr(execute_code_module._SandboxEntry, "cleanup_temp_dirs", blocking_cleanup_temp_dirs)
+
+    try:
+        first_result = await execute_code.invoke(arguments={"code": "None"})
+        assert not any(item.type == "data" for item in first_result)
+        assert await asyncio.to_thread(cleanup_started.wait, 1)
+
+        await asyncio.to_thread(
+            (first_output_root / "late.txt").write_text,
+            "late-output",
+            encoding="utf-8",
+        )
+        second_result = await execute_code.invoke(arguments={"code": "fail"})
+
+        assert not any(item.type == "data" for item in second_result)
+        assert any(item.type == "error" and item.error_details == "sandbox boom" for item in second_result)
+        assert len(_FakeSandbox.instances) == 2
+    finally:
+        release_cleanup.set()
+        _close_execute_code_registry(execute_code)
+
+
+async def test_execute_code_tool_failure_returns_error_content(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+
+    execute_code = HyperlightExecuteCodeTool()
+    result = await execute_code.invoke(arguments={"code": "fail"})
+
+    assert result[0].type == "error"
+    assert result[0].error_details == "sandbox boom"
+
+
+async def test_execute_code_tool_retries_allowed_domains_with_urls_when_backend_rejects_host_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeStrictNetworkSandbox:
+        instances: list[_FakeStrictNetworkSandbox] = []
+
+        def __init__(
+            self,
+            *,
+            input_dir: str | None = None,
+            output_dir: str | None = None,
+            backend: str = "wasm",
+            module: str | None = None,
+            module_path: str | None = None,
+            max_file_size: str | None = None,
+            max_total_size: str | None = None,
+            max_file_count: int | None = None,
+        ) -> None:
+            del input_dir, output_dir, backend, module, module_path
+            del max_file_size, max_total_size, max_file_count
+            self.allowed_domains: list[tuple[str, list[str] | None]] = []
+            _FakeStrictNetworkSandbox.instances.append(self)
+
+        def register_tool(self, name_or_tool: Any, callback: Any | None = None) -> None:
+            del name_or_tool, callback
+
+        def allow_domain(self, target: str, methods: list[str] | None = None) -> None:
+            self.allowed_domains.append((target, methods))
+
+        def run(self, code: str) -> _FakeResult:
+            if code == "None" and any("://" not in target for target, _ in self.allowed_domains):
+                raise RuntimeError("invalid URL for network permission: ")
+            return _FakeResult(success=True)
+
+        def snapshot(self) -> str:
+            return "snapshot"
+
+        def restore(self, snapshot: Any) -> None:
+            del snapshot
+
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeStrictNetworkSandbox)
+
+    execute_code = HyperlightExecuteCodeTool(allowed_domains=[("127.0.0.1:8080", "get")])
+    result = await execute_code.invoke(arguments={"code": "None"})
+
+    assert result[0].type == "text"
+    assert len(_FakeStrictNetworkSandbox.instances) == 2
+    assert _FakeStrictNetworkSandbox.instances[0].allowed_domains == [("127.0.0.1:8080", ["GET"])]
+    assert _FakeStrictNetworkSandbox.instances[1].allowed_domains == [
+        ("http://127.0.0.1:8080", ["GET"]),
+        ("https://127.0.0.1:8080", ["GET"]),
+    ]
+
+
+def test_hyperlight_integration_runtime_skip_reason_reports_missing_hypervisor(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeNoHypervisorSandbox:
+        def __init__(
+            self,
+            *,
+            input_dir: str | None = None,
+            output_dir: str | None = None,
+            backend: str = "wasm",
+            module: str | None = None,
+            module_path: str | None = None,
+        ) -> None:
+            del input_dir, output_dir, backend, module, module_path
+
+        def run(self, code: str) -> _FakeResult:
+            del code
+            raise RuntimeError("failed to build ProtoWasmSandbox: No Hypervisor was found for Sandbox")
+
+    original_find_spec = importlib.util.find_spec
+
+    def _fake_find_spec(name: str) -> object | None:
+        if name in {"hyperlight_sandbox", "python_guest"}:
+            return object()
+        return original_find_spec(name)
+
+    monkeypatch.setattr(sys, "version_info", (3, 14, 0))
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
+    monkeypatch.setattr(importlib.metadata, "version", lambda _: "0.0.0")
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeNoHypervisorSandbox)
+
+    assert _hyperlight_integration_runtime_skip_reason() == (
+        "Hyperlight integration tests require a runner with a working Hyperlight hypervisor."
+    )
+
+
+async def test_provider_injects_run_scoped_execute_code_tool() -> None:
+    runtime = _FakeRuntime()
+    provider = HyperlightCodeActProvider(tools=[compute], _registry=runtime)
+    context = _FakeSessionContext(tools=[dangerous_compute])
+    state: dict[str, Any] = {}
+
+    await provider.before_run(agent=object(), session=None, context=cast(Any, context), state=state)
+
+    assert context.options["tools"] == [dangerous_compute]
+    assert len(context.instructions) == 1
+    assert len(context.tools) == 1
+
+    run_tool = context.tools[0][1][0]
+    assert isinstance(run_tool, HyperlightExecuteCodeTool)
+    assert run_tool.approval_mode == "never_require"
+    assert [tool_obj.name for tool_obj in run_tool.get_tools()] == ["compute"]
+    assert "dangerous_compute" not in context.instructions[0][1]
+    assert "compute" not in context.instructions[0][1]
+    assert "Filesystem capabilities:" not in context.instructions[0][1]
+    assert state[provider.source_id]["tool_names"] == ["compute"]
+    assert state[provider.source_id]["approval_mode"] == "never_require"
+    json.dumps(state)
+
+    provider.remove_tool("compute")
+    assert [tool_obj.name for tool_obj in run_tool.get_tools()] == ["compute"]
+
+
+async def test_provider_forwards_output_limits_to_run_tool_and_serializable_state() -> None:
+    runtime = _FakeRuntime()
+    provider = HyperlightCodeActProvider(
+        max_output_files=7,
+        max_output_file_bytes=11,
+        max_output_total_bytes=13,
+        _registry=runtime,
+    )
+    context = _FakeSessionContext()
+    state: dict[str, Any] = {}
+
+    await provider.before_run(agent=object(), session=None, context=cast(Any, context), state=state)
+    run_tool = context.tools[0][1][0]
+    assert isinstance(run_tool, HyperlightExecuteCodeTool)
+
+    result = await run_tool.invoke(arguments={"code": "None"})
+
+    assert result[0].text == "ok"
+    config = runtime.calls[0][0]
+    assert config.max_output_files == 7
+    assert config.max_output_file_bytes == 11
+    assert config.max_output_total_bytes == 13
+    assert state[provider.source_id]["max_output_files"] == 7
+    assert state[provider.source_id]["max_output_file_bytes"] == 11
+    assert state[provider.source_id]["max_output_total_bytes"] == 13
+    json.dumps(state)
+
+
+async def test_output_limits_are_isolated_when_registry_is_shared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandboxWithBoundedOutputs)
+    registry = execute_code_module._SandboxRegistry()
+    restrictive_tool = HyperlightExecuteCodeTool(
+        workspace_root=tmp_path,
+        max_output_file_bytes=3,
+        max_output_total_bytes=10,
+        _registry=registry,
+    )
+    permissive_tool = HyperlightExecuteCodeTool(
+        workspace_root=tmp_path,
+        max_output_file_bytes=4,
+        max_output_total_bytes=10,
+        _registry=registry,
+    )
+
+    try:
+        accepted = await permissive_tool.invoke(arguments={"code": "create-growing-output"})
+        rejected = await restrictive_tool.invoke(arguments={"code": "create-growing-output"})
+    finally:
+        registry.close()
+
+    _assert_bounded_output_error(rejected, "per-file output limit")
+    assert [_decode_content_bytes(item) for item in accepted if item.type == "data"] == [b"data"]
+    assert len(_FakeSandbox.instances) == 2
+    assert [
+        (sandbox.max_file_size, sandbox.max_total_size, sandbox.max_file_count) for sandbox in _FakeSandbox.instances
+    ] == [("4B", "10B", 20), ("3B", "10B", 20)]
+
+
+async def test_default_output_limits_are_forwarded_to_hyperlight_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+    execute_code = HyperlightExecuteCodeTool()
+
+    try:
+        await execute_code.invoke(arguments={"code": "None"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    sandbox = _FakeSandbox.instances[0]
+    assert (sandbox.max_file_size, sandbox.max_total_size, sandbox.max_file_count) == (
+        "5242880B",
+        "20971520B",
+        20,
+    )
+
+
+async def test_custom_output_limits_are_forwarded_to_hyperlight_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+    execute_code = HyperlightExecuteCodeTool(
+        max_output_file_bytes=7,
+        max_output_total_bytes=11,
+        max_output_files=3,
+    )
+
+    try:
+        await execute_code.invoke(arguments={"code": "None"})
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    sandbox = _FakeSandbox.instances[0]
+    assert (sandbox.max_file_size, sandbox.max_total_size, sandbox.max_file_count) == ("7B", "11B", 3)
+
+
+def test_execute_code_tool_uses_finite_default_output_limits() -> None:
+    execute_code = HyperlightExecuteCodeTool(_registry=_FakeRuntime())
+
+    state = execute_code.build_serializable_state()
+
+    assert state["max_output_files"] == 20
+    assert state["max_output_file_bytes"] == 5 * 1024 * 1024
+    assert state["max_output_total_bytes"] == 20 * 1024 * 1024
+
+
+def test_provider_delegates_file_mounts_and_allowed_domains_to_internal_tool(tmp_path: Path) -> None:
+    provider = HyperlightCodeActProvider()
+
+    provider.add_file_mounts((tmp_path, "reports/output.txt"))
+    assert provider.get_file_mounts() == [FileMount(tmp_path.resolve(), "/input/reports/output.txt")]
+
+    provider.remove_file_mount("/input/reports/output.txt")
+    assert provider.get_file_mounts() == []
+
+    provider.add_file_mounts((tmp_path, "reports/output.txt"))
+    provider.clear_file_mounts()
+    assert provider.get_file_mounts() == []
+
+    provider.add_allowed_domains([("api.example.com", "get"), "github.com"])
+    assert provider.get_allowed_domains() == [
+        AllowedDomain("api.example.com", ("GET",)),
+        AllowedDomain("github.com", None),
+    ]
+
+    provider.remove_allowed_domain("github.com")
+    assert provider.get_allowed_domains() == [AllowedDomain("api.example.com", ("GET",))]
+
+    provider.clear_allowed_domains()
+    assert provider.get_allowed_domains() == []
+
+
+async def test_agent_runs_hyperlight_codeact_end_to_end_with_fake_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+
+    client = _FakeCodeActChatClient()
+    provider = HyperlightCodeActProvider(tools=[compute])
+    agent = Agent(client=client, context_providers=[provider])
+
+    try:
+        response = await agent.run("Use the sandbox to add 20 and 22.")
+
+        assert response.text == "The sandbox returned 42."
+        assert client.call_count == 2
+    finally:
+        _close_provider_registry(provider)
+    assert len(_FakeSandbox.instances) == 1
+    assert "compute" in _FakeSandbox.instances[0].registered_tools
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+async def test_agent_runs_hyperlight_codeact_end_to_end_with_real_sandbox() -> None:
+    _skip_if_hyperlight_integration_runtime_disabled()
+
+    client = _FakeCodeActChatClient()
+    provider = HyperlightCodeActProvider(tools=[compute])
+    agent = Agent(client=client, context_providers=[provider])
+
+    try:
+        response = await agent.run("Use the sandbox to add 20 and 22.")
+
+        assert response.text == "The sandbox returned 42."
+        assert client.call_count == 2
+    finally:
+        _close_provider_registry(provider)
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+async def test_provider_run_tool_writes_files_with_real_sandbox(tmp_path: Path) -> None:
+    _skip_if_hyperlight_integration_runtime_disabled()
+
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    provider = HyperlightCodeActProvider(workspace_root=workspace_root)
+
+    context = _FakeSessionContext()
+    state: dict[str, Any] = {}
+    await provider.before_run(agent=object(), session=None, context=cast(Any, context), state=state)
+
+    run_tool = context.tools[0][1][0]
+    assert isinstance(run_tool, HyperlightExecuteCodeTool)
+
+    try:
+        result = await run_tool.invoke(
+            arguments={
+                "code": (
+                    'payload = "hello from sandbox"\n'
+                    "output_path = None\n"
+                    'for candidate in ("/output/result.txt",):\n'
+                    "    try:\n"
+                    '        with open(candidate, "w", encoding="utf-8") as f:\n'
+                    "            f.write(payload)\n"
+                    "    except OSError:\n"
+                    "        continue\n"
+                    "    output_path = candidate\n"
+                    "    break\n"
+                    'assert output_path is not None, "output path unavailable"\n'
+                    'print("validated")\n'
+                )
+            }
+        )
+
+        outputs = result
+        error_outputs = [
+            f"{item.message}: {item.error_details}"
+            for item in outputs
+            if item.type == "error" and item.error_details is not None
+        ]
+        assert not error_outputs, error_outputs
+
+        text_output = next((item for item in outputs if item.type == "text" and item.text is not None), None)
+        if text_output is not None:
+            assert text_output.text == "validated\n"
+
+        file_output = next((item for item in outputs if item.type == "data"), None)
+        if file_output is not None:
+            assert file_output.uri is not None and file_output.uri.startswith("data:")
+            assert file_output.additional_properties["path"] in {"/output/result.txt", "/output/output/result.txt"}
+    finally:
+        _close_execute_code_registry(run_tool)
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+async def test_execute_code_tool_rejects_sparse_file_with_real_sandbox(tmp_path: Path) -> None:
+    _skip_if_hyperlight_integration_runtime_disabled()
+    execute_code = HyperlightExecuteCodeTool(workspace_root=tmp_path)
+
+    try:
+        contents = await execute_code.invoke(
+            arguments={
+                "code": (
+                    'with open("/output/sparse.bin", "wb") as output:\n'
+                    "    output.seek((2 << 30) - 1)\n"
+                    '    output.write(b"X")\n'
+                    'print("guest-finished")\n'
+                )
+            }
+        )
+    finally:
+        _close_execute_code_registry(execute_code)
+
+    _assert_bounded_output_error(contents, "per-file output limit")
+
+
+@pytest.mark.flaky
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+@pytest.mark.skipif(sys.platform == "win32", reason="Hyperlight WASM sandbox lacks encodings.idna on Windows")
+async def test_provider_run_tool_pings_bing_with_real_sandbox() -> None:
+    _skip_if_hyperlight_integration_runtime_disabled()
+
+    provider = HyperlightCodeActProvider()
+    provider.add_allowed_domains("bing.com")
+
+    context = _FakeSessionContext()
+    state: dict[str, Any] = {}
+    await provider.before_run(agent=object(), session=None, context=cast(Any, context), state=state)
+
+    run_tool = context.tools[0][1][0]
+    assert isinstance(run_tool, HyperlightExecuteCodeTool)
+
+    try:
+        result = await run_tool.invoke(
+            arguments={
+                "code": (
+                    "import _socket\n\n"
+                    'addresses = _socket.getaddrinfo("bing.com", 80, _socket.AF_INET, _socket.SOCK_STREAM)\n'
+                    'assert addresses, "bing.com did not resolve"\n'
+                    "last_error = None\n"
+                    "for family, socktype, proto, _, sockaddr in addresses:\n"
+                    "    connection = None\n"
+                    "    try:\n"
+                    "        connection = _socket.socket(family, socktype, proto)\n"
+                    "        connection.settimeout(10)\n"
+                    "        connection.connect(sockaddr)\n"
+                    '        print("pinged bing.com")\n'
+                    "        break\n"
+                    "    except OSError as exc:\n"
+                    "        last_error = exc\n"
+                    "    finally:\n"
+                    "        if connection is not None:\n"
+                    "            try:\n"
+                    "                connection.close()\n"
+                    "            except OSError:\n"
+                    "                pass\n"
+                    "else:\n"
+                    '    raise last_error or RuntimeError("unable to reach bing.com")\n'
+                )
+            }
+        )
+
+        outputs = result
+        error_outputs = [
+            f"{item.message}: {item.error_details}"
+            for item in outputs
+            if item.type == "error" and item.error_details is not None
+        ]
+        assert not error_outputs, error_outputs
+
+        text_output = next((item for item in outputs if item.type == "text" and item.text is not None), None)
+        if text_output is not None:
+            assert text_output.text == "pinged bing.com\n"
+    finally:
+        _close_execute_code_registry(run_tool)
+
+
+# ---------------------------------------------------------------------------
+# Real-sandbox tests using shared (long-lived) fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+async def test_sandbox_runs_simple_code(restored_sandbox) -> None:
+    result = restored_sandbox.run('print("hello")')
+    assert result.success
+    assert "hello" in result.stdout
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+async def test_sandbox_stdout_and_stderr_captured(restored_sandbox) -> None:
+    result = restored_sandbox.run('import sys\nprint("out")\nprint("err", file=sys.stderr)')
+    assert result.success
+    assert "out" in result.stdout
+    assert "err" in result.stderr
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+async def test_sandbox_code_failure_returns_nonzero_exit(restored_sandbox) -> None:
+    result = restored_sandbox.run("raise ValueError('boom')")
+    assert not result.success
+    assert "boom" in result.stderr
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+@pytest.mark.skipif(
+    sys.platform == "win32" and sys.version_info < (3, 11),
+    reason="Hyperlight sandbox snapshot/restore crashes on Windows Python 3.10.",
+)
+async def test_sandbox_snapshot_restore_keeps_sandbox_functional(restored_sandbox) -> None:
+    """Verify snapshot/restore cycle leaves the sandbox in a working state."""
+    # Mutate the sandbox
+    result1 = restored_sandbox.run('print("before snapshot")')
+    assert result1.success
+
+    # Take a snapshot and restore
+    snapshot = restored_sandbox.snapshot()
+    restored_sandbox.restore(snapshot)
+
+    # Sandbox still works after restore
+    result2 = restored_sandbox.run('print("after restore")')
+    assert result2.success
+    assert "after restore" in result2.stdout
+
+
+# ---------------------------------------------------------------------------
+# Real-sandbox tests using fresh (short-lived) fixture
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+async def test_sandbox_with_tool_registration_and_execution(fresh_sandbox) -> None:
+    """Verify that a sync host tool round-trips via call_tool in the real sandbox."""
+
+    def multiply(a: int, b: int) -> int:
+        return a * b
+
+    fresh_sandbox.register_tool("multiply", multiply)
+    fresh_sandbox.run("None")
+    snapshot = fresh_sandbox.snapshot()
+    fresh_sandbox.restore(snapshot)
+    result = fresh_sandbox.run('result = call_tool("multiply", a=6, b=7)\nprint(result)')
+    assert result.success
+    assert "42" in result.stdout
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+async def test_sandbox_async_callback_round_trips_with_real_sandbox(fresh_sandbox) -> None:
+    """Confirm that _make_sandbox_callback (sync wrapper) works with real FFI."""
+    sandbox_tool = FunctionTool(
+        func=compute,
+        name="compute",
+        description="Add two numbers",
+    )
+    callback = execute_code_module._make_sandbox_callback(sandbox_tool)
+
+    fresh_sandbox.register_tool("compute", callback)
+    fresh_sandbox.run("None")
+    snapshot = fresh_sandbox.snapshot()
+    fresh_sandbox.restore(snapshot)
+    result = fresh_sandbox.run('total = call_tool("compute", a=20, b=22)\nprint(total)')
+    assert result.success
+    assert "42" in result.stdout
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+async def test_output_dir_cleared_between_invocations() -> None:
+    """Verify stale output files don't leak across invocations (comment 23)."""
+    _skip_if_hyperlight_integration_runtime_disabled()
+
+    provider = HyperlightCodeActProvider(workspace_root=Path(__file__).parent)
+    context = _FakeSessionContext()
+    state: dict[str, Any] = {}
+    await provider.before_run(agent=object(), session=None, context=cast(Any, context), state=state)
+
+    run_tool = context.tools[0][1][0]
+    assert isinstance(run_tool, HyperlightExecuteCodeTool)
+
+    try:
+        # First invocation: write a file
+        result1 = await run_tool.invoke(
+            arguments={"code": ('with open("/output/stale.txt", "w") as f:\n    f.write("first")\nprint("wrote")\n')}
+        )
+        assert result1[0].type == "text" or result1[0].type == "data"
+        outputs1 = result1
+        assert any(
+            item.type == "data" and "stale.txt" in (item.additional_properties or {}).get("path", "")
+            for item in outputs1
+        ), "First invocation should produce stale.txt"
+
+        # Second invocation: no file writes
+        result2 = await run_tool.invoke(arguments={"code": 'print("clean")\n'})
+        outputs2 = result2
+        stale_files = [
+            item
+            for item in outputs2
+            if item.type == "data" and "stale.txt" in (item.additional_properties or {}).get("path", "")
+        ]
+        assert not stale_files, "Stale output file leaked into second invocation"
+    finally:
+        _close_execute_code_registry(run_tool)
+
+
+@pytest.mark.integration
+@skip_if_hyperlight_integration_tests_disabled
+async def test_run_code_does_not_block_event_loop() -> None:
+    """Verify _run_code uses asyncio.to_thread so the event loop stays responsive (comment 26)."""
+    _skip_if_hyperlight_integration_runtime_disabled()
+
+    provider = HyperlightCodeActProvider()
+    context = _FakeSessionContext()
+    state: dict[str, Any] = {}
+    await provider.before_run(agent=object(), session=None, context=cast(Any, context), state=state)
+
+    run_tool = context.tools[0][1][0]
+    assert isinstance(run_tool, HyperlightExecuteCodeTool)
+
+    # Monkeypatch the registry.execute to block on an event, proving the event loop
+    # stays responsive while the worker thread is blocked.
+    release = threading.Event()
+    async_started = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    original_execute = run_tool._registry.execute
+
+    def _blocking_execute(*, config, code):
+        loop.call_soon_threadsafe(async_started.set)
+        release.wait(timeout=10)
+        return original_execute(config=config, code=code)
+
+    run_tool._registry.execute = _blocking_execute  # type: ignore[assignment]
+
+    concurrent_ran = False
+
+    async def _concurrent_task():
+        nonlocal concurrent_ran
+        await async_started.wait()
+        concurrent_ran = True
+        release.set()
+
+    try:
+        code_task = asyncio.create_task(run_tool.invoke(arguments={"code": 'print("done")\n'}))
+        await _concurrent_task()
+        result = await code_task
+
+        assert concurrent_ran, "Event loop was blocked during sandbox execution"
+        assert result[0].type == "text"
+    finally:
+        release.set()
+        _close_execute_code_registry(run_tool)
+
+
+class _ThreadAffinityFakeSandbox(_FakeSandbox):
+    """Fake sandbox that records the OS thread of every method invocation.
+
+    Mirrors the PyO3 ``unsendable`` invariant of ``hyperlight_sandbox.WasmSandbox``:
+    if ``__init__``, ``register_tool``, ``allow_domain``, ``run``, ``snapshot`` or ``restore``
+    are ever called from more than one thread for a given instance, the test fails.
+    """
+
+    affinity_failures: list[str] = []
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._owner_thread = threading.get_ident()
+        self.thread_ids: set[int] = {self._owner_thread}
+
+    def _record(self, method: str) -> None:
+        ident = threading.get_ident()
+        self.thread_ids.add(ident)
+        if ident != self._owner_thread:
+            _ThreadAffinityFakeSandbox.affinity_failures.append(
+                f"{method} called from thread {ident}, expected {self._owner_thread}"
+            )
+
+    def register_tool(self, name_or_tool: Any, callback: Any | None = None) -> None:
+        self._record("register_tool")
+        super().register_tool(name_or_tool, callback)
+
+    def allow_domain(self, target: str, methods: list[str] | None = None) -> None:
+        self._record("allow_domain")
+        super().allow_domain(target, methods)
+
+    def run(self, code: str) -> _FakeResult:
+        self._record("run")
+        return super().run(code)
+
+    def snapshot(self) -> str:
+        self._record("snapshot")
+        return super().snapshot()
+
+    def restore(self, snapshot: Any) -> None:
+        self._record("restore")
+        super().restore(snapshot)
+
+
+async def test_sandbox_calls_are_pinned_to_owning_worker_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: WasmSandbox is unsendable; every sandbox call must run on its owner thread."""
+    _ThreadAffinityFakeSandbox.instances.clear()
+    _ThreadAffinityFakeSandbox.affinity_failures.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _ThreadAffinityFakeSandbox)
+
+    execute_code = HyperlightExecuteCodeTool()
+
+    # Invoke many times concurrently; asyncio.to_thread will spread these across the default
+    # executor's worker threads, which previously caused PyO3 to panic when a different thread
+    # touched the cached sandbox.
+    results = await asyncio.gather(*[execute_code.invoke(arguments={"code": "None"}) for _ in range(8)])
+    for result in results:
+        assert result[0].type == "text"
+
+    assert _ThreadAffinityFakeSandbox.affinity_failures == []
+    assert len(_ThreadAffinityFakeSandbox.instances) == 1
+    sandbox = _ThreadAffinityFakeSandbox.instances[0]
+    # All sandbox-touching calls must have stayed on a single owning thread, distinct from the
+    # caller thread that asyncio.to_thread used for dispatch.
+    sandbox_with_thread_data = cast(Any, sandbox)
+    assert sandbox_with_thread_data.thread_ids == {sandbox_with_thread_data._owner_thread}
+    assert sandbox_with_thread_data._owner_thread != threading.get_ident()
+
+
+async def test_sandbox_owner_thread_persists_across_dispatch_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sequential calls landing on different dispatch threads still share one sandbox thread."""
+    _ThreadAffinityFakeSandbox.instances.clear()
+    _ThreadAffinityFakeSandbox.affinity_failures.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _ThreadAffinityFakeSandbox)
+
+    execute_code = HyperlightExecuteCodeTool()
+
+    for _ in range(5):
+        result = await execute_code.invoke(arguments={"code": "None"})
+        assert result[0].type == "text"
+
+    assert _ThreadAffinityFakeSandbox.affinity_failures == []
+    assert len(_ThreadAffinityFakeSandbox.instances) == 1
+
+
+def test_sandbox_registry_close_shuts_down_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _FakeSandbox)
+
+    registry = execute_code_module._SandboxRegistry()
+    execute_code = HyperlightExecuteCodeTool(_registry=registry)
+    asyncio.run(execute_code.invoke(arguments={"code": "None"}))
+
+    entries = list(registry._entries.values())
+    assert len(entries) == 1
+    worker = entries[0].worker
+
+    registry.close()
+
+    assert registry._entries == {}
+    # After shutdown, the worker must report itself as no longer accepting work.
+    assert worker.is_alive() is False
+
+
+def test_sandbox_registry_close_releases_per_entry_resources(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """close() must invoke any sandbox close hook and release temp directories."""
+
+    close_calls: list[int] = []
+
+    class _ClosableFakeSandbox(_FakeSandbox):
+        def close(self) -> None:
+            close_calls.append(1)
+
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _ClosableFakeSandbox)
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = execute_code_module._SandboxRegistry()
+    execute_code = HyperlightExecuteCodeTool(workspace_root=workspace, _registry=registry)
+    asyncio.run(execute_code.invoke(arguments={"code": "create-output"}))
+
+    entries = list(registry._entries.values())
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry.input_dir is not None and entry.output_dir is not None
+    input_path = Path(entry.input_dir.name)
+    output_path = Path(entry.output_dir.name)
+    assert input_path.exists() and output_path.exists()
+
+    registry.close()
+
+    assert close_calls == [1]
+    assert not input_path.exists()
+    assert not output_path.exists()
+
+
+async def test_make_sandbox_callback_returns_native_dict() -> None:
+    """Host tool returning a dict must be forwarded as a native dict (no repr round-trip)."""
+
+    @tool
+    def get_weather(city: str) -> dict[str, Any]:
+        """Get weather."""
+        return {"city": city, "temp_c": 21.5}
+
+    callback = execute_code_module._make_sandbox_callback(get_weather)
+    result = callback(city="Seattle")
+
+    assert isinstance(result, dict)
+    assert result == {"city": "Seattle", "temp_c": 21.5}
+
+
+async def test_make_sandbox_callback_bypasses_user_result_parser() -> None:
+    """Documented behavior change: result_parser is bypassed in the sandbox path."""
+
+    parser_calls: list[Any] = []
+
+    def parser(value: Any) -> str:
+        parser_calls.append(value)
+        return "PARSED"
+
+    @tool(result_parser=parser)
+    def make_payload() -> dict[str, int]:
+        """Returns a dict."""
+        return {"a": 1, "b": 2}
+
+    callback = execute_code_module._make_sandbox_callback(make_payload)
+    result = callback()
+
+    assert result == {"a": 1, "b": 2}
+    assert parser_calls == [], "result_parser must not run on the sandbox path"
+
+
+async def test_make_sandbox_callback_propagates_exceptions() -> None:
+    @tool
+    def boom(x: int) -> int:
+        """Always fails."""
+        raise RuntimeError("nope")
+
+    callback = execute_code_module._make_sandbox_callback(boom)
+    with pytest.raises(RuntimeError, match="nope"):
+        callback(x=1)
+
+
+class _OwnerThreadTrackedResult:
+    """Fake sandbox.run() return value that mirrors a PyO3 ``unsendable`` object's Drop.
+
+    Records (rather than panics, since CPython swallows __del__ exceptions) the OS thread
+    that finalized the object, so tests can assert it was dropped on the sandbox's owner
+    thread and not on whatever thread happened to GC it.
+    """
+
+    drop_thread_violations: list[str] = []
+
+    def __init__(self, *, owner_thread: int, success: bool = True, stdout: str = "", stderr: str = "") -> None:
+        self._owner_thread = owner_thread
+        self.success = success
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def __del__(self) -> None:
+        ident = threading.get_ident()
+        if ident != self._owner_thread:
+            type(self).drop_thread_violations.append(
+                f"_OwnerThreadTrackedResult dropped on thread {ident}, owner was {self._owner_thread}"
+            )
+
+
+class _ResultDropTrackingFakeSandbox(_FakeSandbox):
+    """Fake sandbox whose ``run()`` returns an owner-thread-tracking result."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._owner_thread = threading.get_ident()
+
+    def run(self, code: str) -> Any:
+        del code
+        # Real Hyperlight runs almost always have non-empty stdout (the executed Python
+        # ``print`` output); that is the path where _build_execution_contents attaches
+        # raw_representation=result and the unsendable object escapes the worker thread.
+        return _OwnerThreadTrackedResult(owner_thread=self._owner_thread, success=True, stdout="hello\n")
+
+
+def test_sandbox_run_result_is_finalized_on_owner_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: the object returned by ``sandbox.run`` must not escape its owner thread.
+
+    The Hyperlight ``WasmSandbox`` is unsendable; the value its ``run()`` returns can carry
+    a back-reference to the sandbox and is itself unsendable. Attaching it to
+    ``Content.raw_representation`` lets it ride out of the worker thread and be garbage
+    collected on whichever thread the asyncio loop / agent state ends up on, which trips
+    the PyO3 ``Drop`` panic. Drop must happen on the worker thread that ran ``run()``.
+    """
+    _OwnerThreadTrackedResult.drop_thread_violations.clear()
+    _FakeSandbox.instances.clear()
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _ResultDropTrackingFakeSandbox)
+
+    execute_code = HyperlightExecuteCodeTool()
+
+    def _drive() -> None:
+        # Run the whole invocation inside a helper frame so every local
+        # reference (contents, awaitable, asyncio frames) dies when the
+        # function returns. Anything still pinning the result is the bug.
+        contents = asyncio.run(execute_code.invoke(arguments={"code": "None"}))
+        assert contents and contents[0].type == "text"
+
+    _drive()
+    for _ in range(3):
+        gc.collect()
+
+    assert _OwnerThreadTrackedResult.drop_thread_violations == []
+
+
+def test_sandbox_is_finalized_on_owner_thread_after_registry_close(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression: dropping the sandbox object itself must occur on its owner thread.
+
+    ``_SandboxRegistry.close()`` previously held entries in a local list whose lifetime
+    extended onto the caller's thread. When that list went out of scope the unsendable
+    sandbox was finalized on the caller's thread, panicking PyO3 with
+    "WasmSandbox is unsendable, but is being dropped by another thread".
+    """
+    drop_violations: list[str] = []
+
+    class _OwnerDropFakeSandbox(_FakeSandbox):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._owner_thread = threading.get_ident()
+            # Do not pin ourselves on the class-level instances list; we want the
+            # registry/entry to hold the only strong reference so that dispose-time
+            # drop is what determines the finalizer thread.
+            _FakeSandbox.instances.remove(self)
+
+        def __del__(self) -> None:
+            ident = threading.get_ident()
+            if ident != self._owner_thread:
+                drop_violations.append(f"sandbox dropped on thread {ident}, owner was {self._owner_thread}")
+
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _OwnerDropFakeSandbox)
+
+    registry = execute_code_module._SandboxRegistry()
+    execute_code = HyperlightExecuteCodeTool(_registry=registry)
+    asyncio.run(execute_code.invoke(arguments={"code": "None"}))
+
+    registry.close()
+
+    # Release the registry/tool references and force a GC. With the fix in place the
+    # sandbox is already disposed on the worker thread inside close(); dropping these
+    # local references must not trigger a wrong-thread __del__ now.
+    del registry
+    del execute_code
+    for _ in range(3):
+        gc.collect()
+
+    assert drop_violations == [], f"sandbox was dropped off-thread despite registry close: {drop_violations}"
+
+
+def test_worker_failure_does_not_leak_unsendable_via_exception_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: an exception raised inside a worker closure must not leak unsendable refs.
+
+    Production failure mode: ``_build_sandbox`` (or ``sandbox.run``) raises on the
+    worker thread. ``concurrent.futures`` propagates the exception via
+    ``Future.result()`` to the caller's thread. Python's exception object retains
+    ``__traceback__`` whose frames reference local variables -- including the
+    partially-built PyO3 unsendable sandbox. When the caller's thread eventually
+    GCs the exception, those locals are dec_ref'd on the wrong thread and PyO3
+    panics with
+    ``_native_wasm::WasmSandbox is unsendable, but is being dropped on another thread``.
+
+    The fix routes every worker closure through ``_run_on_worker``, which catches
+    the exception on the worker thread, drops its traceback there, and re-raises
+    a fresh exception on the caller side carrying only the message.
+    """
+    drop_violations: list[str] = []
+
+    class _RaisingFakeSandbox(_FakeSandbox):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._owner_thread = threading.get_ident()
+            _FakeSandbox.instances.remove(self)
+            # Simulate production bug: build raises while ``self`` is alive in
+            # the calling frame's locals -- the exception traceback will retain
+            # a reference to this object.
+            raise RuntimeError("simulated build failure with unsendable in frame locals")
+
+        def __del__(self) -> None:
+            ident = threading.get_ident()
+            if ident != self._owner_thread:
+                drop_violations.append(f"sandbox dropped on thread {ident}, owner was {self._owner_thread}")
+
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _RaisingFakeSandbox)
+
+    registry = execute_code_module._SandboxRegistry()
+    execute_code = HyperlightExecuteCodeTool(_registry=registry)
+
+    async def _drive(tool: HyperlightExecuteCodeTool) -> None:
+        for _ in range(4):
+            with contextlib.suppress(Exception):
+                await tool.invoke(arguments={"code": "None"})
+
+    asyncio.run(_drive(execute_code))
+    registry.close()
+
+    del registry
+    del execute_code
+    for _ in range(5):
+        gc.collect()
+
+    assert drop_violations == [], (
+        f"sandbox dropped off-thread despite worker raising on the owner thread: {drop_violations}"
+    )
+
+
+def test_sandbox_entry_does_not_expose_unsendable_attributes() -> None:
+    """Architectural regression: the entry must not hold sandbox/snapshot as attributes.
+
+    The unsendable PyO3 sandbox/snapshot must live ONLY inside the per-entry worker
+    thread, accessible only via worker-submitted closures. Any direct ``entry.sandbox``
+    or ``entry.snapshot`` attribute would let callers obtain a strong reference that
+    can be released on a non-owner thread, triggering PyO3's unsendable Drop panic
+    (the production bug we are fixing).
+    """
+    fields = {f.name for f in dataclasses.fields(execute_code_module._SandboxEntry)}
+    assert "sandbox" not in fields, "_SandboxEntry must not expose `sandbox` directly"
+    assert "snapshot" not in fields, "_SandboxEntry must not expose `snapshot` directly"
+    # Whatever attributes remain must be sendable / safe to GC on any thread.
+    assert fields <= {"worker", "input_dir", "output_dir", "tools"}
+
+
+def test_sandbox_survives_external_thread_holding_stale_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: stale refs held by external executors must not cause wrong-thread Drop.
+
+    Production traceback was ``concurrent.futures.thread._worker:95 del work_item`` on
+    ``asyncio_0`` -- an external ``ThreadPoolExecutor`` whose ``_WorkItem`` transitively
+    held a strong reference to the sandbox via ``self._registry.execute``. When that
+    work_item was deleted on the external worker thread, the sandbox's refcount could
+    reach zero there, panicking PyO3.
+
+    With the actor-model refactor, ``HyperlightExecuteCodeTool._run_code`` runs the
+    sandbox call via ``asyncio.to_thread(self._registry.execute, ...)`` which creates
+    an external work_item containing ``self._registry.execute`` -- but that reference
+    transitively holds only the registry, not the sandbox. The sandbox lives entirely
+    inside the per-entry ``_SandboxWorker`` and never escapes; so when the external
+    work_item is deleted on a non-owner thread, the sandbox's refcount cannot reach
+    zero there.
+    """
+    drop_violations: list[str] = []
+
+    class _OwnerDropFakeSandbox(_FakeSandbox):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._owner_thread = threading.get_ident()
+            _FakeSandbox.instances.remove(self)
+
+        def __del__(self) -> None:
+            ident = threading.get_ident()
+            if ident != self._owner_thread:
+                drop_violations.append(f"sandbox dropped on thread {ident}, owner was {self._owner_thread}")
+
+    monkeypatch.setattr(execute_code_module, "_load_sandbox_class", lambda: _OwnerDropFakeSandbox)
+
+    registry = execute_code_module._SandboxRegistry()
+    execute_code = HyperlightExecuteCodeTool(_registry=registry)
+
+    async def _drive_many(tool: HyperlightExecuteCodeTool) -> None:
+        # Many concurrent invocations push work_items into asyncio's default executor;
+        # each work_item's args transitively reference the registry. If the registry
+        # were the sandbox holder, the work_items' deletion on asyncio_0/asyncio_1 etc.
+        # could trigger a wrong-thread Drop -- which is exactly the production bug.
+        await asyncio.gather(*[tool.invoke(arguments={"code": "None"}) for _ in range(8)])
+
+    asyncio.run(_drive_many(execute_code))
+    registry.close()
+
+    del registry
+    del execute_code
+    for _ in range(5):
+        gc.collect()
+
+    assert drop_violations == []

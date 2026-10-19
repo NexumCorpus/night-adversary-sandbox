@@ -1,0 +1,100 @@
+name: Feature Request
+description: Propose a new capability for Microsoft Agent Framework
+title: "[Feature]: "
+type: feature
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem before proposing implementation. Filing an issue does
+        not reserve the work or approve a pull request.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete problem or limitation are you experiencing?
+      placeholder: Describe the current limitation and who it affects.
+    validations:
+      required: true
+
+  - type: textarea
+    id: use-case
+    attributes:
+      label: Use Case and Evidence
+      description: Provide a real scenario, example, or other evidence that demonstrates the need.
+      placeholder: Explain what you are trying to accomplish and why the current APIs or guidance are insufficient.
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired-outcome
+    attributes:
+      label: Desired Outcome
+      description: Describe the behavior or capability you need without prescribing implementation details.
+      placeholder: What should a successful outcome allow users to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What existing features, workarounds, or alternative approaches have you considered?
+      placeholder: Describe what you tried and why it did not meet the need.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposed-direction
+    attributes:
+      label: Proposed Direction
+      description: If you have a proposed API or design direction, describe it here.
+      placeholder: Optional implementation or API ideas.
+    validations:
+      required: false
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope and Non-Goals
+      description: Identify important boundaries or related work that should not be included.
+      placeholder: Optional scope constraints and non-goals.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: language
+    attributes:
+      label: Language
+      description: Which implementation does this request apply to?
+      options:
+        - Both
+        - .NET
+        - Python
+        - Other / Not Applicable
+      default: 0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: contribution-intent
+    attributes:
+      label: Contribution Intent
+      description: Would you be interested in implementing this after maintainer agreement?
+      options:
+        - I am willing to implement this
+        - I can help with implementation or testing
+        - I am only requesting the feature
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I will wait for explicit maintainer agreement before starting implementation of a non-trivial change.
+          required: true

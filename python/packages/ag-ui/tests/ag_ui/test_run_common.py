@@ -1,0 +1,1110 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Tests for _run_common.py edge cases."""
+
+import json
+import logging
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from ag_ui.core import EventType, StateSnapshotEvent
+from ag_ui.core.events import (
+    ReasoningMessageContentEvent,
+    ReasoningMessageStartEvent,
+    ReasoningStartEvent,
+)
+from agent_framework import Content, Message
+
+from agent_framework_ag_ui import state_update
+from agent_framework_ag_ui._agent_run import (
+    _build_messages_snapshot,
+    _make_approval_tool_result_events,
+    _merge_resolved_approval_results_into_snapshot,
+    _resolved_tool_result_snapshot_messages,
+)
+from agent_framework_ag_ui._predictive_state import PredictiveStateHandler
+from agent_framework_ag_ui._run_common import (
+    FlowState,
+    _build_run_finished_event,
+    _close_reasoning_block,
+    _emit_mcp_tool_result,
+    _emit_text_reasoning,
+    _emit_tool_result,
+    _extract_resume_payload,
+    _extract_tool_result_state,
+    _is_snapshot_hydration_request,
+    _normalize_resume_interrupts,
+    _reconstruct_messages_from_thread_snapshot,
+    _strict_resume_entries,
+)
+from agent_framework_ag_ui._state import TOOL_RESULT_DISPLAY_KEY, TOOL_RESULT_STATE_KEY
+from agent_framework_ag_ui._utils import (
+    _AGUI_HOST_PAYLOAD_OMITTED_KEY,
+    _AGUI_MCP_TOOL_RESULT_KEY,
+    _AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY,
+    _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY,
+    _MCP_TOOL_RESULT_HOST_PAYLOAD_KEY,
+    _host_payload_history_size,
+    _mcp_tool_result_host_payload_key,
+    _persistable_host_payload_history,
+)
+
+
+def _open_tool_call(flow: FlowState, call_id: str, name: str = "tool") -> None:
+    """Register a tool call as started in this run so TOOL_CALL_END is eligible."""
+    entry = {
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": "{}"},
+    }
+    flow.pending_tool_calls.append(entry)
+    flow.tool_calls_by_id[call_id] = entry
+
+
+class TestNormalizeResumeInterrupts:
+    """Tests for _normalize_resume_interrupts edge cases."""
+
+    def test_plain_list_of_dicts(self):
+        """Resume payload as a plain list of interrupt dicts."""
+        result = _normalize_resume_interrupts([{"id": "x", "value": "y"}])
+        assert result == [{"id": "x", "value": "y"}]
+
+    def test_dict_with_singular_interrupt_key(self):
+        """Resume dict using 'interrupt' (singular) instead of 'interrupts'."""
+        result = _normalize_resume_interrupts({"interrupt": [{"id": "x", "value": "y"}]})
+        assert result == [{"id": "x", "value": "y"}]
+
+    def test_dict_without_interrupts_key_wraps_as_candidate(self):
+        """Resume dict without interrupts/interrupt key wraps the dict itself."""
+        result = _normalize_resume_interrupts({"id": "x", "value": "y"})
+        assert result == [{"id": "x", "value": "y"}]
+
+    def test_non_dict_items_in_list_are_skipped(self):
+        """Non-dict items in candidate list are silently skipped."""
+        result = _normalize_resume_interrupts([None, "string", {"id": "x", "value": "y"}])
+        assert result == [{"id": "x", "value": "y"}]
+
+    def test_items_missing_id_are_skipped(self):
+        """Dict items without any id field are skipped."""
+        result = _normalize_resume_interrupts([{"name": "test"}])
+        assert result == []
+
+    def test_response_key_used_as_value(self):
+        """'response' key is used as value when 'value' is absent."""
+        result = _normalize_resume_interrupts([{"id": "x", "response": "approved"}])
+        assert result == [{"id": "x", "value": "approved"}]
+
+    def test_neither_value_nor_response_uses_remaining_fields(self):
+        """When neither 'value' nor 'response' key exists, remaining fields become value."""
+        result = _normalize_resume_interrupts([{"id": "x", "extra": "data", "more": 42}])
+        assert result == [{"id": "x", "value": {"extra": "data", "more": 42}}]
+
+    def test_none_payload_returns_empty(self):
+        """None resume payload returns empty list."""
+        assert _normalize_resume_interrupts(None) == []
+
+    def test_non_dict_non_list_returns_empty(self):
+        """Non-dict, non-list payload returns empty list."""
+        assert _normalize_resume_interrupts(42) == []
+
+    def test_interrupt_id_key_used_as_id(self):
+        """interruptId key is accepted as identifier."""
+        result = _normalize_resume_interrupts([{"interruptId": "abc", "value": "yes"}])
+        assert result == [{"id": "abc", "value": "yes"}]
+
+    def test_tool_call_id_key_used_as_id(self):
+        """toolCallId key is accepted as identifier."""
+        result = _normalize_resume_interrupts([{"toolCallId": "tc1", "value": "done"}])
+        assert result == [{"id": "tc1", "value": "done"}]
+
+    def test_canonical_resume_entry_uses_interrupt_id_and_payload(self):
+        """Canonical ResumeEntry dictionaries preserve status and map payload to legacy runner values."""
+        result = _normalize_resume_interrupts(
+            [{"interrupt_id": "req_1", "status": "resolved", "payload": {"approved": True}}]
+        )
+        assert result == [{"id": "req_1", "value": {"approved": True}, "status": "resolved"}]
+
+
+@pytest.mark.parametrize(
+    ("input_data", "snapshot_enabled", "supports_checkpoint_resume", "expected"),
+    [
+        ({"messages": []}, True, False, True),
+        ({"messages": []}, True, True, True),
+        ({"messages": [{"role": "user", "content": "continue"}]}, True, False, False),
+        ({"messages": [], "resume": [{"interruptId": "i1"}]}, True, False, False),
+        ({"messages": [], "forwardedProps": {"resume": [{"interruptId": "i1"}]}}, True, False, False),
+        (
+            {"messages": [], "forwardedProps": {"command": {"resume": [{"interruptId": "i1"}]}}},
+            True,
+            False,
+            False,
+        ),
+        ({"messages": [], "forwardedProps": {"checkpoint_id": "cp1"}}, True, False, True),
+        ({"messages": [], "forwardedProps": {"checkpoint_id": "cp1"}}, True, True, False),
+        ({"messages": []}, False, False, False),
+    ],
+)
+def test_snapshot_hydration_classification_is_shared(
+    input_data: dict[str, Any],
+    snapshot_enabled: bool,
+    supports_checkpoint_resume: bool,
+    expected: bool,
+) -> None:
+    """Hydration admission matches runner resume capabilities."""
+    assert (
+        _is_snapshot_hydration_request(
+            input_data,
+            snapshot_enabled=snapshot_enabled,
+            supports_checkpoint_resume=supports_checkpoint_resume,
+        )
+        is expected
+    )
+
+
+class TestStrictResumeEntries:
+    """Tests for strict canonical resume-entry parsing."""
+
+    def test_tool_call_id_key_used_as_interrupt_id(self) -> None:
+        """toolCallId is accepted as a legacy identifier alias and excluded from payload."""
+        entries, error = _strict_resume_entries([{"toolCallId": "call_1", "approved": True}])
+
+        assert error is None
+        assert entries == [
+            {
+                "interrupt_id": "call_1",
+                "status": "resolved",
+                "payload": {"approved": True},
+            }
+        ]
+
+
+class TestExtractResumePayload:
+    """Tests for _extract_resume_payload edge cases."""
+
+    def test_forwarded_props_resume_not_nested_in_command(self):
+        """forwarded_props.resume (not nested in command) is extracted."""
+        result = _extract_resume_payload({"forwarded_props": {"resume": "data"}})
+        assert result == "data"
+
+    def test_forwarded_props_not_dict_returns_none(self):
+        """Non-dict forwarded_props returns None."""
+        result = _extract_resume_payload({"forwarded_props": "string"})
+        assert result is None
+
+    def test_resume_key_has_priority(self):
+        """Direct resume key takes priority over forwarded_props."""
+        result = _extract_resume_payload({"resume": "direct", "forwarded_props": {"resume": "fp"}})
+        assert result == "direct"
+
+    def test_no_resume_at_all(self):
+        """No resume key anywhere returns None."""
+        result = _extract_resume_payload({"messages": []})
+        assert result is None
+
+    def test_forwarded_props_camelcase(self):
+        """camelCase forwardedProps is also supported."""
+        result = _extract_resume_payload({"forwardedProps": {"resume": "camel"}})
+        assert result == "camel"
+
+
+class TestRunFinishedEvent:
+    """Tests for externally visible RUN_FINISHED event shape."""
+
+    def test_build_run_finished_event_with_interrupt_outcome(self) -> None:
+        """Interrupted RUN_FINISHED uses canonical outcome.interrupts without a top-level interrupt field."""
+        event = _build_run_finished_event("run-1", "thread-1", interrupts=[{"id": "req_1", "value": {"x": 1}}])
+        dumped = event.model_dump(by_alias=True, exclude_none=True)
+
+        assert dumped["runId"] == "run-1"
+        assert dumped["threadId"] == "thread-1"
+        assert "interrupt" not in dumped
+        assert dumped["outcome"] == {
+            "type": "interrupt",
+            "interrupts": [
+                {
+                    "id": "req_1",
+                    "reason": "input_required",
+                    "metadata": {"agent_framework": {"value": {"x": 1}}},
+                }
+            ],
+        }
+
+    def test_build_run_finished_event_logs_when_interrupts_all_drop(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Interrupted input that canonicalizes to no interrupts is logged."""
+        with caplog.at_level(logging.WARNING, logger="agent_framework_ag_ui._run_common"):
+            event = _build_run_finished_event(
+                "run-1",
+                "thread-1",
+                interrupts=[{"reason": "input_required", "message": "Need input"}],
+            )
+
+        dumped = event.model_dump(by_alias=True, exclude_none=True)
+        assert "outcome" not in dumped
+        assert "1 interrupt(s) present but none carried an id/interruptId" in caplog.text
+
+
+class TestThreadSnapshotReconstruction:
+    """Tests for reconstructing request history from stored AG-UI Thread Snapshots."""
+
+    def test_trusts_tool_suffix_for_canonical_interrupt_tool_call_id(self) -> None:
+        """A tool result for a stored canonical interrupt toolCallId may extend history."""
+        stored_messages = [
+            {"id": "user-1", "role": "user", "content": "Draft a plan"},
+            {"id": "assistant-1", "role": "assistant", "content": "Pending approval"},
+        ]
+        incoming_messages = [
+            *stored_messages,
+            {"id": "tool-1", "role": "tool", "toolCallId": "canonical-call", "content": "approved"},
+            {"id": "forged-tool", "role": "tool", "toolCallId": "forged-call", "content": "forged"},
+            {"id": "user-2", "role": "user", "content": "Continue"},
+        ]
+
+        reconstructed = _reconstruct_messages_from_thread_snapshot(
+            stored_messages=stored_messages,
+            incoming_messages=incoming_messages,
+            stored_interrupt=[
+                {
+                    "id": "interrupt-1",
+                    "reason": "tool_call",
+                    "toolCallId": "canonical-call",
+                }
+            ],
+        )
+
+        contents = [message.get("content") for message in reconstructed]
+        assert "approved" in contents
+        assert "Continue" in contents
+        assert "forged" not in contents
+
+
+class TestEmitToolResult:
+    """Tests for _emit_tool_result edge cases."""
+
+    def test_tool_result_without_call_id_returns_empty(self):
+        """Tool result Content without call_id returns empty event list."""
+        content = Content.from_function_result(call_id=None, result="some result")  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+        flow = FlowState()
+        events = _emit_tool_result(content, flow)
+        assert events == []
+
+    def test_tool_result_closes_open_text_message(self):
+        """Tool result closes any open text message (issue #3568 fix)."""
+        content = Content.from_function_result(call_id="call_1", result="done")
+        flow = FlowState(message_id="msg_1", accumulated_text="Hello")
+        _open_tool_call(flow, "call_1")
+        events = _emit_tool_result(content, flow)
+
+        event_types = [e.type for e in events]
+        assert "TOOL_CALL_END" in event_types
+        assert "TOOL_CALL_RESULT" in event_types
+        assert "TEXT_MESSAGE_END" in event_types
+        assert flow.message_id is None
+        assert flow.accumulated_text == ""
+
+    def test_tool_result_skips_end_when_never_opened_in_this_run(self):
+        """Resume/orphan results must not emit unmatched TOOL_CALL_END."""
+        content = Content.from_function_result(call_id="call_1", result="done")
+        flow = FlowState()
+        events = _emit_tool_result(content, flow)
+
+        event_types = [e.type for e in events]
+        assert "TOOL_CALL_END" not in event_types
+        assert "TOOL_CALL_RESULT" in event_types
+        assert "call_1" in flow.tool_calls_ended
+
+    def test_tool_result_skips_duplicate_end_after_synthetic_close(self):
+        """A real result after synthetic protocol closure emits RESULT only once-ended."""
+        content = Content.from_function_result(call_id="call_1", result="Sunny")
+        flow = FlowState()
+        _open_tool_call(flow, "call_1", name="get_weather")
+        flow.tool_calls_ended.add("call_1")  # synthetic close before interrupt
+
+        events = _emit_tool_result(content, flow)
+
+        event_types = [e.type for e in events]
+        assert event_types.count(EventType.TOOL_CALL_END) == 0
+        assert EventType.TOOL_CALL_RESULT in event_types
+
+    def test_tool_result_does_not_emit_internal_exception(self):
+        """AG-UI events and snapshots contain only the channel-visible result."""
+        diagnostic = "test-token-value at /srv/private/tool.py"
+        content = Content.from_function_result(
+            call_id="call_1",
+            result="Error: Function failed.",
+            exception=diagnostic,
+        )
+        flow = FlowState()
+
+        events = _emit_tool_result(content, flow)
+        payload = json.dumps(
+            {
+                "events": [event.model_dump(mode="json", by_alias=True) for event in events],
+                "snapshot": flow.tool_results,
+            }
+        )
+
+        assert "Error: Function failed." in payload
+        assert diagnostic not in payload
+
+
+class TestStateUpdateHelper:
+    """Tests for the public ``state_update`` helper."""
+
+    def test_builds_text_content_with_state_marker(self):
+        """state_update returns a text Content carrying state in additional_properties."""
+        c = state_update(text="done", state={"weather": {"temp": 14}})
+        assert c.type == "text"
+        assert c.text == "done"
+        assert c.additional_properties == {
+            TOOL_RESULT_STATE_KEY: {"weather": {"temp": 14}},
+        }
+
+    def test_builds_text_content_with_display_marker(self):
+        """state_update can carry a UI display payload without requiring state."""
+        c = state_update(text="14°C, foggy", tool_result={"temp": 14, "conditions": "foggy"})
+        assert c.type == "text"
+        assert c.text == "14°C, foggy"
+        assert c.additional_properties == {
+            TOOL_RESULT_DISPLAY_KEY: '{"temp": 14, "conditions": "foggy"}',
+        }
+
+    def test_empty_text_is_allowed(self):
+        """State-only tools can omit the text argument."""
+        c = state_update(state={"steps": ["a", "b"]})
+        assert c.text == ""
+        assert c.additional_properties[TOOL_RESULT_STATE_KEY] == {"steps": ["a", "b"]}
+
+    def test_non_mapping_state_raises(self):
+        """Passing a non-mapping value for state raises TypeError."""
+
+        with pytest.raises(TypeError):
+            state_update(text="t", state=["not", "a", "mapping"])  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
+
+    def test_state_is_copied_defensively(self):
+        """Mutating the caller's dict after ``state_update`` must not mutate the content."""
+        caller_state = {"weather": {"temp": 14}}
+        c = state_update(text="ok", state=caller_state)
+        caller_state["weather"]["temp"] = 99
+        # The top-level dict was copied, so replacing the key in caller_state
+        # would not affect the Content, but nested dicts share references — document
+        # this by asserting only the top-level copy semantics.
+        assert TOOL_RESULT_STATE_KEY in c.additional_properties
+        inner = c.additional_properties[TOOL_RESULT_STATE_KEY]
+        assert inner is not caller_state
+
+    def test_tool_result_without_text_falls_back_to_display_payload(self):
+        """Display-only tools use the serialized display payload as LLM text."""
+        c = state_update(tool_result={"temp": 14, "conditions": "foggy"})
+        assert c.text == '{"temp": 14, "conditions": "foggy"}'
+        assert c.additional_properties[TOOL_RESULT_DISPLAY_KEY] == '{"temp": 14, "conditions": "foggy"}'
+
+    def test_string_tool_result_is_not_json_encoded_again(self):
+        """A pre-serialized display string passes through verbatim."""
+        c = state_update(text="Weather summary", tool_result='{"temp":14}')
+        assert c.text == "Weather summary"
+        assert c.additional_properties[TOOL_RESULT_DISPLAY_KEY] == '{"temp":14}'
+
+
+class TestExtractToolResultState:
+    """Tests for ``_extract_tool_result_state``."""
+
+    def test_returns_none_for_plain_string_result(self):
+        content = Content.from_function_result(call_id="c1", result="plain")
+        assert _extract_tool_result_state(content) is None
+
+    def test_extracts_state_from_inner_item(self):
+        tool_return = state_update(text="hi", state={"k": 1})
+        content = Content.from_function_result(call_id="c1", result=[tool_return])
+        assert _extract_tool_result_state(content) == {"k": 1}
+
+    def test_extracts_state_from_outer_additional_properties(self):
+        """Outer function_result content can also carry state (legacy/advanced use)."""
+        content = Content.from_function_result(
+            call_id="c1",
+            result="hi",
+            additional_properties={TOOL_RESULT_STATE_KEY: {"k": 1}},
+        )
+        assert _extract_tool_result_state(content) == {"k": 1}
+
+    def test_merges_multiple_items(self):
+        a = state_update(text="a", state={"k": 1, "shared": "from_a"})
+        b = state_update(text="b", state={"shared": "from_b", "extra": True})
+        content = Content.from_function_result(call_id="c1", result=[a, b])
+        merged = _extract_tool_result_state(content)
+        assert merged == {"k": 1, "shared": "from_b", "extra": True}
+
+    def test_ignores_non_dict_marker_value(self):
+        """A garbled marker value must not break extraction (defensive guard)."""
+        bad = Content.from_text(
+            "hi",
+            additional_properties={TOOL_RESULT_STATE_KEY: "not-a-dict"},
+        )
+        content = Content.from_function_result(call_id="c1", result=[bad])
+        assert _extract_tool_result_state(content) is None
+
+
+class TestEmitToolResultWithState:
+    """Tests for the deterministic state emission in ``_emit_tool_result``."""
+
+    def test_emits_state_snapshot_after_tool_call_result(self):
+        """Tool returning state_update produces a StateSnapshotEvent right after the result."""
+        tool_return = state_update(
+            text="Weather: 14°C",
+            state={"weather": {"temp": 14, "conditions": "foggy"}},
+        )
+        content = Content.from_function_result(call_id="call_1", result=[tool_return])
+        flow = FlowState()
+        _open_tool_call(flow, "call_1")
+
+        events = _emit_tool_result(content, flow)
+        event_types = [e.type for e in events]
+
+        # Expect TOOL_CALL_END, TOOL_CALL_RESULT, STATE_SNAPSHOT in that order.
+        assert event_types[0] == EventType.TOOL_CALL_END
+        assert event_types[1] == EventType.TOOL_CALL_RESULT
+        state_idx = event_types.index(EventType.STATE_SNAPSHOT)
+        assert state_idx == 2
+        assert events[state_idx].snapshot == {"weather": {"temp": 14, "conditions": "foggy"}}  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+
+    def test_updates_flow_current_state(self):
+        tool_return = state_update(text="", state={"a": 1})
+        content = Content.from_function_result(call_id="c1", result=[tool_return])
+        flow = FlowState(current_state={"existing": "value"})
+
+        _emit_tool_result(content, flow)
+
+        # Existing keys must survive (merge semantics), new keys must be added.
+        assert flow.current_state == {"existing": "value", "a": 1}
+
+    def test_merge_overrides_existing_key(self):
+        tool_return = state_update(text="", state={"existing": "new"})
+        content = Content.from_function_result(call_id="c1", result=[tool_return])
+        flow = FlowState(current_state={"existing": "old", "other": 1})
+
+        _emit_tool_result(content, flow)
+
+        assert flow.current_state == {"existing": "new", "other": 1}
+
+    def test_no_state_snapshot_when_result_has_no_state(self):
+        """Plain tool results must not emit a StateSnapshotEvent."""
+        content = Content.from_function_result(call_id="c1", result="plain")
+        flow = FlowState()
+
+        events = _emit_tool_result(content, flow)
+        assert all(e.type != EventType.STATE_SNAPSHOT for e in events)
+
+    def test_predictive_handler_without_pending_updates_emits_no_snapshot(self):
+        """A configured predictive handler must not emit unchanged state for unrelated tools."""
+        flow = FlowState(current_state={"existing": "value"})
+        handler = PredictiveStateHandler(
+            predict_state_config={"draft": {"tool": "write_draft", "tool_argument": "body"}},
+            current_state=flow.current_state,
+        )
+        content = Content.from_function_result(call_id="c1", result="plain")
+
+        events = _emit_tool_result(content, flow, predictive_handler=handler)
+
+        assert all(e.type != EventType.STATE_SNAPSHOT for e in events)
+        assert flow.current_state == {"existing": "value"}
+
+    def test_predictive_handler_with_pending_updates_emits_snapshot(self):
+        """A pending predictive update is applied and emitted as one snapshot."""
+        flow = FlowState(current_state={"existing": "value"})
+        handler = PredictiveStateHandler(
+            predict_state_config={"draft": {"tool": "write_draft", "tool_argument": "body"}},
+            current_state=flow.current_state,
+        )
+        deltas = handler.emit_streaming_deltas("write_draft", '{"body":"updated"}')
+        content = Content.from_function_result(call_id="c1", result="plain")
+
+        events = _emit_tool_result(content, flow, predictive_handler=handler)
+
+        assert len(deltas) == 1
+        snapshots = [event for event in events if isinstance(event, StateSnapshotEvent)]
+        assert len(snapshots) == 1
+        assert snapshots[0].snapshot == {"existing": "value", "draft": "updated"}
+        assert flow.current_state == {"existing": "value", "draft": "updated"}
+
+    def test_tool_result_content_text_unchanged(self):
+        """The text sent to the LLM must not leak the state marker."""
+        tool_return = state_update(text="Weather: 14°C", state={"weather": {"temp": 14}})
+        content = Content.from_function_result(call_id="c1", result=[tool_return])
+        flow = FlowState()
+
+        events = _emit_tool_result(content, flow)
+        result_events = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
+        assert len(result_events) == 1
+        assert result_events[0].content == "Weather: 14°C"  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert TOOL_RESULT_STATE_KEY not in result_events[0].content  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+
+    def test_display_payload_routes_to_ui_only(self):
+        """A display marker overrides only the UI event, not the LLM-bound tool result."""
+        tool_return = state_update(
+            text="Weather: 14°C",
+            tool_result={"temp": 14, "conditions": "foggy"},
+        )
+        content = Content.from_function_result(call_id="c1", result=[tool_return])
+        flow = FlowState()
+
+        events = _emit_tool_result(content, flow)
+        result_events = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
+
+        assert len(result_events) == 1
+        assert result_events[0].content == '{"temp": 14, "conditions": "foggy"}'  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert flow.tool_results[-1]["content"] == "Weather: 14°C"
+        assert TOOL_RESULT_DISPLAY_KEY not in result_events[0].content  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert TOOL_RESULT_DISPLAY_KEY not in flow.tool_results[-1]["content"]
+
+    def test_plain_tool_result_uses_existing_content_for_both_channels(self):
+        """Without a display marker, UI and LLM channels keep the existing derivation."""
+        content = Content.from_function_result(call_id="c1", result="plain result")
+        flow = FlowState()
+
+        events = _emit_tool_result(content, flow)
+        result_events = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
+
+        assert len(result_events) == 1
+        assert result_events[0].content == "plain result"  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert flow.tool_results[-1]["content"] == "plain result"
+
+    def test_plain_tool_result_bypasses_replay_serialization(self):
+        """Ordinary cyclic provider metadata is never traversed by MCP replay handling."""
+        cyclic_properties: dict[str, object] = {}
+        cyclic_properties["self"] = cyclic_properties
+        tool_return = Content.from_text("plain result", additional_properties=cyclic_properties)
+        content = Content.from_function_result(call_id="plain-1", result=[tool_return])
+        flow = FlowState()
+
+        events = _emit_tool_result(content, flow)
+
+        result_event = next(event for event in events if event.type == EventType.TOOL_CALL_RESULT)
+        assert result_event.content == "plain result"  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert flow.tool_results[-1]["content"] == "plain result"
+        assert _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY not in flow.tool_results[-1]
+
+    def test_mcp_host_payload_has_live_snapshot_and_approval_parity(self):
+        """The complete Host result is projected without replacing the model result."""
+        host_payload = {
+            "content": [{"type": "text", "text": "Summary"}],
+            "structuredContent": {"image_url": "https://example.test/widget.png"},
+            "isError": False,
+        }
+        tool_return = Content.from_text(
+            "Summary",
+            additional_properties={
+                _MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: {"structuredContent": {"stale": "legacy item marker"}},
+                "_meta": {"server": "model-visible-before-sidecar"},
+            },
+        )
+        content = Content.from_function_result(
+            call_id="mcp-1",
+            result=[tool_return],
+            additional_properties={_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload},
+        )
+        flow = FlowState()
+
+        events = _emit_tool_result(content, flow)
+        result_event = next(event for event in events if event.type == EventType.TOOL_CALL_RESULT)
+        snapshot = _build_messages_snapshot(flow, [])
+        snapshot_message = snapshot.messages[-1].model_dump(by_alias=True, exclude_none=True)
+
+        assert content.result == "Summary"
+        assert json.loads(result_event.content) == host_payload  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert json.loads(snapshot_message["content"]) == host_payload
+        assert snapshot_message[_AGUI_MCP_TOOL_RESULT_KEY] is True
+        assert snapshot_message[_AGUI_TOOL_RESULT_MODEL_CONTENT_KEY] == [{"type": "text", "text": "Summary"}]
+        assert flow.tool_results[-1]["content"] == "Summary"
+        assert json.loads(flow.tool_results[-1][_AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY]) == host_payload
+
+        approval_event = _make_approval_tool_result_events([content])[0]
+        approval_snapshot = _resolved_tool_result_snapshot_messages(
+            [Message(role="tool", contents=[content], message_id="approval-result")]
+        )["mcp-1"]
+        assert json.loads(approval_event.content) == host_payload
+        assert approval_snapshot["content"] == "Summary"
+        assert json.loads(approval_snapshot[_AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY]) == host_payload
+        assert approval_snapshot[_AGUI_TOOL_RESULT_MODEL_CONTENT_KEY] == [{"type": "text", "text": "Summary"}]
+
+    def test_empty_mcp_model_projection_remains_empty_across_live_snapshot_and_approval(self):
+        """An explicitly empty custom-parser result is not replaced with Host or synthetic text."""
+        host_payload = {
+            "content": [{"type": "text", "text": "Server-only text"}],
+            "structuredContent": {"widget": "complete"},
+            "isError": False,
+        }
+        content = Content.from_function_result(
+            call_id="mcp-empty",
+            result=[],
+            additional_properties={_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload},
+        )
+        flow = FlowState()
+
+        result_event = next(
+            event for event in _emit_tool_result(content, flow) if event.type == EventType.TOOL_CALL_RESULT
+        )
+        snapshot = _build_messages_snapshot(flow, []).messages[-1].model_dump(by_alias=True, exclude_none=True)
+        approval_event = _make_approval_tool_result_events([content])[0]
+        approval_snapshot = _resolved_tool_result_snapshot_messages([Message(role="tool", contents=[content])])[
+            "mcp-empty"
+        ]
+
+        assert getattr(result_event, _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY) == []
+        assert flow.tool_results[-1]["content"] == ""
+        assert flow.tool_results[-1][_AGUI_TOOL_RESULT_MODEL_CONTENT_KEY] == []
+        assert json.loads(snapshot["content"]) == host_payload
+        assert snapshot[_AGUI_TOOL_RESULT_MODEL_CONTENT_KEY] == []
+        assert getattr(approval_event, _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY) == []
+        assert approval_snapshot["content"] == ""
+        assert approval_snapshot[_AGUI_TOOL_RESULT_MODEL_CONTENT_KEY] == []
+        assert _persistable_host_payload_history([flow.tool_results[-1]])[0]["content"] == ""
+
+    def test_explicit_display_payload_wins_over_mcp_host_projection(self):
+        """A standalone display marker remains authoritative when both markers exist."""
+        host_payload = {
+            "content": [{"type": "text", "text": "Summary"}],
+            "structuredContent": {"source": "mcp"},
+            "isError": False,
+        }
+        display_payload = {"source": "application", "rows": [1, 2]}
+        tool_return = Content.from_text(
+            "Summary",
+            additional_properties={TOOL_RESULT_DISPLAY_KEY: display_payload},
+        )
+        content = Content.from_function_result(
+            call_id="mcp-display",
+            result=[tool_return],
+            additional_properties={_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload},
+        )
+        flow = FlowState()
+
+        result_event = next(
+            event for event in _emit_tool_result(content, flow) if event.type == EventType.TOOL_CALL_RESULT
+        )
+        approval_event = _make_approval_tool_result_events([content])[0]
+        approval_snapshot = _resolved_tool_result_snapshot_messages([Message(role="tool", contents=[content])])[
+            "mcp-display"
+        ]
+
+        assert json.loads(result_event.content) == display_payload  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert flow.tool_results[-1]["content"] == "Summary"
+        assert json.loads(flow.tool_results[-1][_AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY]) == display_payload
+        assert json.loads(approval_event.content) == display_payload
+        assert approval_snapshot["content"] == "Summary"
+        assert json.loads(approval_snapshot[_AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY]) == display_payload
+        assert content.result == "Summary"
+
+    def test_complete_snapshot_bounds_host_and_sidecar_bytes(self, monkeypatch: pytest.MonkeyPatch):
+        """The fixed history budget charges both retained representations and keeps the newest."""
+        host_contents = [json.dumps({"structuredContent": {"index": index, "data": "x" * 40}}) for index in range(2)]
+        messages = [
+            {
+                "id": f"result-{index}",
+                "role": "tool",
+                "toolCallId": f"mcp-{index}",
+                "content": f"Summary {index}",
+                _AGUI_MCP_TOOL_RESULT_KEY: True,
+                _AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY: host_contents[index],
+                _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY: [
+                    {"type": "text", "text": f"Summary {index}", "additional_properties": {"provider": "visible"}}
+                ],
+            }
+            for index in range(2)
+        ]
+        newest_size = _host_payload_history_size(messages[1])
+        assert newest_size < sum(_host_payload_history_size(message) for message in messages)
+        monkeypatch.setattr(
+            "agent_framework_ag_ui._utils._MAX_MCP_HOST_PAYLOAD_HISTORY_SIZE_BYTES",
+            newest_size,
+        )
+
+        snapshot = _build_messages_snapshot(FlowState(tool_results=messages), [])
+        bounded = [message.model_dump(by_alias=True, exclude_none=True) for message in snapshot.messages]
+
+        assert bounded[0]["content"] == "Summary 0"
+        assert bounded[0][_AGUI_HOST_PAYLOAD_OMITTED_KEY] is True
+        assert _AGUI_MCP_TOOL_RESULT_KEY not in bounded[0]
+        assert _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY not in bounded[0]
+        assert bounded[1]["content"] == host_contents[1]
+        assert _AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY not in bounded[1]
+        assert bounded[1][_AGUI_TOOL_RESULT_MODEL_CONTENT_KEY] == messages[1][_AGUI_TOOL_RESULT_MODEL_CONTENT_KEY]
+        assert _host_payload_history_size(bounded[1]) == newest_size
+
+    def test_complete_snapshot_charges_non_string_host_payloads(self, monkeypatch: pytest.MonkeyPatch):
+        """Dictionary and list Host projections cannot bypass aggregate retention accounting."""
+        host_payloads: list[object] = [
+            {"structuredContent": {"index": 0, "data": "x" * 80}},
+            [{"type": "resource", "resource": {"uri": "https://example.test/newest", "text": "y" * 80}}],
+        ]
+        messages = [
+            {
+                "id": f"result-{index}",
+                "role": "tool",
+                "toolCallId": f"mcp-{index}",
+                "content": f"Summary {index}",
+                _AGUI_MCP_TOOL_RESULT_KEY: True,
+                _AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload,
+                _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY: [{"type": "text", "text": f"Summary {index}"}],
+            }
+            for index, host_payload in enumerate(host_payloads)
+        ]
+        persisted = _persistable_host_payload_history(messages)
+        newest_size = _host_payload_history_size(persisted[1])
+        assert _host_payload_history_size(messages[0]) > len(json.dumps(messages[0]["content"]).encode("utf-8"))
+        monkeypatch.setattr(
+            "agent_framework_ag_ui._utils._MAX_MCP_HOST_PAYLOAD_HISTORY_SIZE_BYTES",
+            newest_size,
+        )
+
+        snapshot = _build_messages_snapshot(FlowState(tool_results=messages), [])
+        bounded = [message.model_dump(by_alias=True, exclude_none=True) for message in snapshot.messages]
+
+        assert bounded[0]["content"] == "Summary 0"
+        assert bounded[0][_AGUI_HOST_PAYLOAD_OMITTED_KEY] is True
+        assert json.loads(bounded[1]["content"]) == host_payloads[1]
+        assert _host_payload_history_size(bounded[1]) == newest_size
+
+    def test_persisted_host_history_keeps_canonical_content_model_safe(self):
+        """Older readers that ignore private fields see only the model-facing result."""
+        message = {
+            "id": "result",
+            "role": "tool",
+            "toolCallId": "mcp",
+            "content": json.dumps({"accepted": True, "structuredContent": {"host": "only"}}),
+            _AGUI_MCP_TOOL_RESULT_KEY: True,
+            _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY: [{"type": "text", "text": '{"accepted": true}'}],
+        }
+
+        persisted = _persistable_host_payload_history([message])[0]
+
+        assert persisted["content"] == '{"accepted": true}'
+        assert persisted[_AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY] == message["content"]
+
+    def test_mcp_replay_serialization_falls_back_on_cyclic_provider_metadata(self):
+        """A cyclic provider value cannot suppress the terminal result after tool execution."""
+        cyclic_properties: dict[str, object] = {}
+        cyclic_properties["self"] = cyclic_properties
+        host_payload = {"content": [{"type": "text", "text": "Summary"}], "isError": False}
+        content = Content.from_function_result(
+            call_id="mcp-cyclic",
+            result=[Content.from_text("Summary", additional_properties=cyclic_properties)],
+            additional_properties={_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload},
+        )
+
+        events = _emit_tool_result(content, FlowState())
+        result_event = next(event for event in events if event.type == EventType.TOOL_CALL_RESULT)
+
+        assert json.loads(result_event.content) == host_payload  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert getattr(result_event, _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY) == [{"type": "text", "text": "Summary"}]
+
+    def test_mcp_replay_serialization_makes_provider_metadata_json_safe(self):
+        """Provider-visible sidecar values are JSON-safe before live or snapshot serialization."""
+        host_payload = {"content": [{"type": "text", "text": "Summary"}], "isError": False}
+        content = Content.from_function_result(
+            call_id="mcp-provider-object",
+            result=[
+                Content.from_text(
+                    "Summary",
+                    additional_properties={"provider_visible": SimpleNamespace(value="kept")},
+                )
+            ],
+            additional_properties={_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload},
+        )
+        flow = FlowState()
+
+        result_event = next(
+            event for event in _emit_tool_result(content, flow) if event.type == EventType.TOOL_CALL_RESULT
+        )
+        serialized_items = getattr(result_event, _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY)
+
+        assert serialized_items[0]["additional_properties"]["provider_visible"] == {"value": "kept"}
+        json.dumps(result_event.model_dump(by_alias=True, exclude_none=True))
+        json.dumps(flow.tool_results[-1])
+
+    def test_older_core_marker_name_falls_back_to_literal(self):
+        """AG-UI can import alongside core versions that do not publish the private constant."""
+        assert _mcp_tool_result_host_payload_key(SimpleNamespace()) == "_mcp_tool_result_host_payload"
+
+    def test_older_core_inner_marker_remains_supported(self):
+        """Older core results with only an item marker still project the complete Host payload."""
+        host_payload = {"content": [{"type": "text", "text": "Legacy Host"}], "isError": False}
+        content = Content.from_function_result(
+            call_id="mcp-legacy",
+            result=[
+                Content.from_text(
+                    "Legacy model",
+                    additional_properties={_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload},
+                )
+            ],
+        )
+
+        result_event = next(
+            event for event in _emit_tool_result(content, FlowState()) if event.type == EventType.TOOL_CALL_RESULT
+        )
+
+        assert json.loads(result_event.content) == host_payload  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+
+    def test_approval_merge_preserves_earlier_marked_mcp_snapshot_result(self):
+        """Resolving a later approval cannot replace an earlier Host result with model-only replay."""
+        existing_host = '{"structuredContent":{"widget":"earlier"}}'
+        snapshot_messages: list[dict[str, Any]] = [
+            {
+                "id": "assistant-a",
+                "role": "assistant",
+                "tool_calls": [{"id": "call-a", "type": "function", "function": {"name": "a", "arguments": "{}"}}],
+            },
+            {
+                "id": "result-a",
+                "role": "tool",
+                "toolCallId": "call-a",
+                "content": "Earlier model result",
+                _AGUI_MCP_TOOL_RESULT_KEY: True,
+                _AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY: existing_host,
+                _AGUI_TOOL_RESULT_MODEL_CONTENT_KEY: [{"type": "text", "text": "Earlier model result"}],
+            },
+            {
+                "id": "assistant-b",
+                "role": "assistant",
+                "tool_calls": [{"id": "call-b", "type": "function", "function": {"name": "b", "arguments": "{}"}}],
+            },
+            {
+                "id": "approval-b",
+                "role": "user",
+                "content": "",
+                "function_approvals": [{"id": "approval-b", "toolCallId": "call-b"}],
+            },
+        ]
+        resolved_messages = [
+            Message(
+                role="tool",
+                contents=[
+                    Content.from_function_result(call_id="call-a", result="Earlier model result"),
+                    Content.from_function_result(call_id="call-b", result="Approved result"),
+                ],
+            )
+        ]
+
+        _merge_resolved_approval_results_into_snapshot(snapshot_messages, resolved_messages)
+
+        tool_messages = [message for message in snapshot_messages if message.get("role") == "tool"]
+        assert [message["toolCallId"] for message in tool_messages] == ["call-a", "call-b"]
+        assert tool_messages[0][_AGUI_MCP_TOOL_RESULT_KEY] is True
+        assert tool_messages[0][_AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY] == existing_host
+        assert tool_messages[1]["content"] == "Approved result"
+        assert not any(message.get("function_approvals") for message in snapshot_messages)
+
+    def test_display_only_payload_falls_back_to_llm_content(self):
+        """When text is empty, both channels receive the serialized display payload."""
+        tool_return = state_update(tool_result={"temp": 14})
+        content = Content.from_function_result(call_id="c1", result=[tool_return])
+        flow = FlowState()
+
+        events = _emit_tool_result(content, flow)
+        result_events = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
+
+        assert result_events[0].content == '{"temp": 14}'  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert flow.tool_results[-1]["content"] == '{"temp": 14}'
+
+    def test_pre_serialized_display_string_routes_verbatim(self):
+        """String display payloads pass through without JSON double-encoding."""
+        tool_return = state_update(text="Weather summary", tool_result='{"temp":14}')
+        content = Content.from_function_result(call_id="c1", result=[tool_return])
+        flow = FlowState()
+
+        events = _emit_tool_result(content, flow)
+        result_events = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
+
+        assert result_events[0].content == '{"temp":14}'  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert flow.tool_results[-1]["content"] == "Weather summary"
+
+    def test_coexists_with_active_predictive_state_handler(self):
+        """Both predictive and deterministic state produce a single coalesced snapshot.
+
+        Predictive state (``predict_state_config``) and deterministic state
+        (``state_update``) are two independent mechanisms. When both are active,
+        a single coalesced ``StateSnapshotEvent`` is emitted containing the
+        merged result of both contributions.
+        """
+        flow = FlowState(current_state={"preexisting": "value"})
+        handler = PredictiveStateHandler(
+            predict_state_config={"draft": {"tool": "write_draft", "tool_argument": "body"}},
+            current_state=flow.current_state,
+        )
+
+        tool_return = state_update(text="Draft written", state={"draft_final": True})
+        content = Content.from_function_result(call_id="c1", result=[tool_return])
+
+        events = _emit_tool_result(content, flow, predictive_handler=handler)
+
+        # Exactly one coalesced snapshot must be emitted containing all merged keys.
+        snapshots = [e for e in events if e.type == EventType.STATE_SNAPSHOT]
+        assert len(snapshots) == 1
+        assert snapshots[0].snapshot["draft_final"] is True  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert snapshots[0].snapshot["preexisting"] == "value"  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert flow.current_state["draft_final"] is True
+        assert flow.current_state["preexisting"] == "value"
+
+    def test_predictive_and_deterministic_emit_single_snapshot(self):
+        """When both predictive_handler and state_update are active, only one snapshot is emitted."""
+        flow = FlowState(current_state={"existing": "yes"})
+        handler = PredictiveStateHandler(
+            predict_state_config={"draft": {"tool": "write_draft", "tool_argument": "body"}},
+            current_state=flow.current_state,
+        )
+
+        tool_return = state_update(text="ok", state={"new_key": 42})
+        content = Content.from_function_result(call_id="c1", result=[tool_return])
+
+        events = _emit_tool_result(content, flow, predictive_handler=handler)
+
+        snapshots = [e for e in events if e.type == EventType.STATE_SNAPSHOT]
+        assert len(snapshots) == 1, f"Expected 1 coalesced snapshot, got {len(snapshots)}"
+        assert snapshots[0].snapshot == {"existing": "yes", "new_key": 42}  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+
+
+class TestEmitMcpToolResultWithState:
+    """MCP tool results should honour the same state_update marker.
+
+    MCP results come from an external MCP server rather than a locally
+    executed ``@tool`` function, so they do not flow through ``parse_result``
+    and ``content.items`` is typically empty. State is instead carried on the
+    outer content's ``additional_properties`` (e.g. by middleware that
+    inspects the MCP output and attaches a marker). ``_extract_tool_result_state``
+    supports both locations so this path remains usable.
+    """
+
+    def test_mcp_tool_result_emits_state_snapshot_from_additional_properties(self):
+        content = Content.from_mcp_server_tool_result(
+            call_id="mcp_1",
+            output="server result",
+            additional_properties={TOOL_RESULT_STATE_KEY: {"mcp_ok": True}},
+        )
+        flow = FlowState()
+        _open_tool_call(flow, "mcp_1", name="mcp_tool")
+
+        events = _emit_mcp_tool_result(content, flow)
+        event_types = [e.type for e in events]
+
+        assert EventType.TOOL_CALL_END in event_types
+        assert EventType.TOOL_CALL_RESULT in event_types
+        assert EventType.STATE_SNAPSHOT in event_types
+        assert flow.current_state == {"mcp_ok": True}
+
+    def test_mcp_tool_result_without_state_emits_no_snapshot(self):
+        content = Content.from_mcp_server_tool_result(
+            call_id="mcp_1",
+            output="server result",
+        )
+        flow = FlowState()
+
+        events = _emit_mcp_tool_result(content, flow)
+        assert all(e.type != EventType.STATE_SNAPSHOT for e in events)
+
+
+class TestEmitMcpToolResultWithDisplay:
+    """MCP tool results must honour the display marker so UI consumers can
+    render structured payloads while ``flow.tool_results`` keeps the LLM
+    string. MCP outputs do not pass through ``parse_result``; the marker
+    rides on the outer content's ``additional_properties``.
+    """
+
+    def test_mcp_tool_result_routes_display_payload_to_ui_only(self):
+        import json as _json
+
+        display_payload = {"rows": [{"id": 1, "name": "alpha"}, {"id": 2, "name": "beta"}]}
+        content = Content.from_mcp_server_tool_result(
+            call_id="mcp_disp",
+            output="2 rows returned",
+            additional_properties={TOOL_RESULT_DISPLAY_KEY: display_payload},
+        )
+        flow = FlowState()
+
+        events = _emit_mcp_tool_result(content, flow)
+        result_events = [e for e in events if e.type == EventType.TOOL_CALL_RESULT]
+
+        assert len(result_events) == 1
+        # UI event carries the structured display payload.
+        assert _json.loads(result_events[0].content) == display_payload  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        # LLM-side accumulator keeps the short text.
+        assert flow.tool_results[-1]["content"] == "2 rows returned"
+
+    def test_hosted_mcp_result_uses_complete_host_payload(self):
+        """Hosted-MCP compatibility preserves rich output items for model replay."""
+        host_payload = {
+            "content": [{"type": "text", "text": "Hosted summary"}],
+            "structuredContent": {"rows": [1, 2]},
+            "isError": False,
+        }
+        content = Content.from_mcp_server_tool_result(
+            call_id="mcp-hosted",
+            output=[
+                Content.from_text(
+                    "Hosted summary",
+                    additional_properties={"_meta": {"server_only": True}, "provider_visible": "kept"},
+                ),
+                Content.from_data(b"image", media_type="image/png"),
+            ],
+            additional_properties={_MCP_TOOL_RESULT_HOST_PAYLOAD_KEY: host_payload},
+        )
+        flow = FlowState()
+
+        result_event = next(
+            event for event in _emit_mcp_tool_result(content, flow) if event.type == EventType.TOOL_CALL_RESULT
+        )
+
+        assert json.loads(result_event.content) == host_payload  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert flow.tool_results[-1]["content"] != result_event.content  # type: ignore[attr-defined]  # ty: ignore[unresolved-attribute]
+        assert json.loads(flow.tool_results[-1][_AGUI_TOOL_RESULT_HOST_PAYLOAD_KEY]) == host_payload
+        model_items = flow.tool_results[-1][_AGUI_TOOL_RESULT_MODEL_CONTENT_KEY]
+        assert [item["type"] for item in model_items] == ["text", "data"]
+        assert model_items[0]["additional_properties"] == {"provider_visible": "kept"}
+
+
+class TestReasoningCoalescing:
+    """Verify reasoning deltas without content.id coalesce into one block.
+
+    Regression test: Ollama streams reasoning with content.id=None, which
+    previously caused a new reasoning block per delta instead of one per turn.
+    """
+
+    def test_reasoning_coalesces_without_content_id(self):
+        """Multiple reasoning deltas without content.id share one message_id."""
+        flow = FlowState()
+
+        events1 = _emit_text_reasoning(Content.from_text_reasoning(text="First"), flow)
+        events2 = _emit_text_reasoning(Content.from_text_reasoning(text=" chunk"), flow)
+        events3 = _emit_text_reasoning(Content.from_text_reasoning(text=" here."), flow)
+
+        all_events = events1 + events2 + events3
+
+        content_events = [e for e in all_events if isinstance(e, ReasoningMessageContentEvent)]
+        ids = {e.message_id for e in content_events}
+        assert len(ids) == 1, f"Expected one message_id, got {ids}"
+
+        start_events = [e for e in all_events if isinstance(e, (ReasoningStartEvent, ReasoningMessageStartEvent))]
+        assert len(start_events) == 2, f"Expected 2 start events, got {len(start_events)}"
+
+    def test_reasoning_respects_explicit_content_id(self):
+        """When content.id is provided, it should be used."""
+        flow = FlowState()
+        custom_id = "my-custom-reasoning-id"
+
+        events = _emit_text_reasoning(Content.from_text_reasoning(id=custom_id, text="thinking"), flow)
+
+        content_events = [e for e in events if isinstance(e, ReasoningMessageContentEvent)]
+        assert all(e.message_id == custom_id for e in content_events)
+
+    def test_new_turn_gets_new_reasoning_id(self):
+        """After closing a reasoning block, a new one gets a fresh ID."""
+        flow = FlowState()
+
+        _emit_text_reasoning(Content.from_text_reasoning(text="Turn 1"), flow)
+        id1 = flow.reasoning_message_id
+        _close_reasoning_block(flow)
+
+        _emit_text_reasoning(Content.from_text_reasoning(text="Turn 2"), flow)
+        id2 = flow.reasoning_message_id
+
+        assert id1 is not None
+        assert id2 is not None
+        assert id1 != id2, "New turn should get a new reasoning message_id"
