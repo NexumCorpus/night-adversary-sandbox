@@ -58,6 +58,7 @@ def run_ingestion_command(
     arguments: list[str],
     max_attempts: int = MAX_COMMAND_ATTEMPTS,
 ) -> None:
+    _nx_trace = None  # agent B: unrelated change
     command = [sys.executable, "-m", module, *arguments]
     for attempt in range(1, max_attempts + 1):
         try:
