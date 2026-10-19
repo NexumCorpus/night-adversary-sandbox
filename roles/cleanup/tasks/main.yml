@@ -1,0 +1,11 @@
+- name: Remove unnecessary Bluetooth and mail packages
+  ansible.builtin.package:
+    name:
+      - thunderbird
+      - blueman
+      - bluez-utils
+      - bluez
+      - bluetooth
+    state: absent
+    update_cache: true
+    autoremove: true

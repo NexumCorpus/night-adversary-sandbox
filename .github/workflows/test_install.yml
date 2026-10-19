@@ -1,0 +1,127 @@
+name: test_install
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/*.md'
+      - 'prompts/**'
+      - '.vars_example.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/scripts/**'
+      - '.github/test_vars.yml'
+      - '.github/dependabot.yml'
+      - 'CHANGELOG.md'
+      - 'docs/wiki/steering/**'
+      - '.devcontainer/**'
+      - '.devcontainer/Dockerfile'
+      - '**/Dockerfile*'
+      - 'requirements.txt'
+      - 'requirements*.txt'
+      - 'requirements-dev.txt'
+      - 'scripts/**'
+      - 'tests/*.py'
+      - 'tests/**/*.py'
+      - 'roles/**'
+      - 'roles/requirements.yml'
+      - 'workstation.yml'
+      - 'workstation.yaml'
+      - 'test.yml'
+      - 'test.yaml'
+      - 'inventory'
+      - 'inventory/**'
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 0 * * 0"
+jobs:
+  test_install:
+    strategy:
+      matrix:
+        image:
+          - ubuntu:latest
+          - ubuntu:rolling
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+      options: --cap-add SYS_ADMIN
+      env:
+        DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: debug info
+        run: |
+          cat /etc/lsb-release
+      - name: update and install pre-reqs
+        # snapd depends on systemd and can't easily be run in a container
+        # but snaps have never caused any problems so not concerned about lack of smoke testing
+        run: |
+          apt-get update
+          apt-get -y install git
+      - name: setup user
+        run: |
+          adduser --disabled-password --quiet --gecos '' tester
+          su - tester -c id
+          su - tester -c "mkdir -p /home/tester/Downloads"
+      - name: prepare CI dependency artifact paths
+        env:
+          MATRIX_IMAGE: ${{ matrix.image }}
+        run: |
+          artifact_base="$(printf '%s' "$MATRIX_IMAGE" | sed 's/[^[:alnum:]_-]/-/g')"
+          artifact_hash="$(printf '%s' "$MATRIX_IMAGE" | cksum | awk '{print $1}')"
+          artifact_id="test-install-${artifact_base}-${artifact_hash}"
+          echo "CI_ARTIFACT_ID=${artifact_id}" >> "$GITHUB_ENV"
+          echo "CI_ARTIFACT_DIR=${GITHUB_WORKSPACE}/ci-artifacts/${artifact_id}" >> "$GITHUB_ENV"
+      - name: checkout
+        uses: actions/checkout@v7
+      - name: setup
+        run: |
+          cd $GITHUB_WORKSPACE
+          cp ${GITHUB_WORKSPACE}/.github/test_vars.yml ${GITHUB_WORKSPACE}/.vars.yml
+          ./bootstrap.sh
+      - name: generate resolved-version manifest and SBOM
+        run: |
+          python3 .github/scripts/generate_ci_dependency_artifacts.py \
+            --output-dir "$CI_ARTIFACT_DIR" \
+            --job-name "$CI_ARTIFACT_ID"
+      - name: check
+        shell: bash -l {0}
+        run: |
+          su - tester -c "alias"
+          su - tester -c "git config --list"
+          su - tester -c "python --version"
+          su - tester -c "! pip install jsonschema # should not work because no venv"
+          su - tester -c "clamscan --version"
+          echo "Checking passwordless sudo for update script..."
+          su - tester -c "sudo update"
+          su - tester -c "! sudo ls /root"
+          # su - tester -c "! systemctl is-enabled cups"
+          # su - tester -c "sudo systemctl start cups"
+          # su - tester -c "sudo systemctl stop cups"
+          # su - tester -c "! sudo systemctl enable cups" ## should not work as only able to start and stop
+      - name: Verify ClamAV On-Access Scanning
+        shell: bash -l {0}
+        run: |
+          grep -q '^UpdateLogFile /var/log/clamav/freshclam.log$' /etc/clamav/freshclam.conf
+          grep -q '^LogRotate yes$' /etc/clamav/freshclam.conf
+          grep -q '^LogFileMaxSize 128K$' /etc/clamav/freshclam.conf
+          clamav-verify.sh tester
+          cat >/var/log/clamav/freshclam.log.1 <<'EOF'
+          fixture preface
+          fixture line one
+          fixture line two
+          fixture line three
+          EOF
+          : >/var/log/clamav/freshclam.log
+          output="$(clamav-verify.sh tester)"
+          printf '%s\n' "$output"
+          grep -q 'fixture line one' <<<"$output"
+          grep -q 'fixture line two' <<<"$output"
+          grep -q 'fixture line three' <<<"$output"
+      - name: upload resolved-version manifest and SBOM
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ci-dependency-evidence-${{ env.CI_ARTIFACT_ID }}
+          path: ${{ env.CI_ARTIFACT_DIR }}
+          if-no-files-found: error

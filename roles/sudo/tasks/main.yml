@@ -1,0 +1,12 @@
+---
+- name: Timeout sudo immediately
+  ansible.builtin.lineinfile:
+    dest: /etc/sudoers
+    regexp: '^Defaults\s+env_reset'
+    line: 'Defaults        env_reset,timestamp_timeout=0'
+
+- name: Remove user from sudo group
+  ansible.builtin.command: 'gpasswd -d {{ username }} sudo'
+  register: sudo_command_result
+  changed_when: "not 'is not a member of' in sudo_command_result.stderr"
+  failed_when: false

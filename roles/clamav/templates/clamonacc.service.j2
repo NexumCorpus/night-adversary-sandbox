@@ -1,0 +1,14 @@
+[Unit]
+Description=ClamAV On-Access Scanner
+# This ensures clamd is running before clamonacc starts
+Requires=clamav-daemon.service
+After=clamav-daemon.service syslog.target network.target
+
+[Service]
+Type=simple
+User=root
+ExecStartPre=/bin/bash -c "while [ ! -S /run/clamav/clamd.ctl ]; do sleep 1; done"
+ExecStart=/usr/sbin/clamonacc -F --move={{ clamav_quarantine_dir }} --log=/var/log/clamav/clamonacc.log
+
+[Install]
+WantedBy=multi-user.target

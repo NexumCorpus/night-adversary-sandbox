@@ -1,0 +1,6 @@
+- name: Restart resolved
+  become: true
+  when: not is_gh_actions
+  ansible.builtin.systemd:
+    name: systemd-resolved
+    state: restarted

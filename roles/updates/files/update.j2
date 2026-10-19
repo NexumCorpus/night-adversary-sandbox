@@ -1,0 +1,21 @@
+#!/bin/sh
+
+echo "Package updates"
+
+apt-get update
+apt-get --with-new-pkgs upgrade
+apt-get autoremove
+
+echo "Snap updates"
+
+snap refresh
+
+echo "Firmware updates"
+
+fwupdmgr refresh --force
+fwupdmgr get-updates || true
+fwupdmgr update || true
+#############################
+echo "Running user updates"
+su -c '{{ user_update_script }}' '{{ username }}'
+#############################

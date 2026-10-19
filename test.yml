@@ -1,0 +1,8 @@
+---
+- name: Test playbook
+  hosts: localhost
+  vars_files:
+    - ./.vars.yml
+    - ./vars.yml
+  roles:
+    - role: ./roles/chrome_browser  # noqa role-name[path]

@@ -1,0 +1,8 @@
+{
+    "PasswordManagerEnabled": false,
+    "DefaultBrowserSettingEnabled": false,
+    "HttpsOnlyMode": "force_enabled",
+    "AdvancedProtectionAllowed": true,
+    "DownloadRestrictions": 4,
+    "SafeBrowsingProtectionLevel": 2
+}

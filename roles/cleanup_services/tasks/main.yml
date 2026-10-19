@@ -1,0 +1,49 @@
+# Gather service facts for conditional service management
+- name: Gather service facts
+  ansible.builtin.service_facts:
+
+- name: Stop ModemManager
+  ansible.builtin.systemd:
+    name: ModemManager
+    state: stopped
+  when:
+    - "'ModemManager.service' in ansible_facts.services"
+    - ansible_facts.services['ModemManager.service'].status != 'not-found'
+
+- name: Disable ModemManager
+  ansible.builtin.systemd:
+    name: ModemManager
+    enabled: false
+  when:
+    - "'ModemManager.service' in ansible_facts.services"
+    - ansible_facts.services['ModemManager.service'].status != 'not-found'
+
+- name: Remove modemmanager package
+  ansible.builtin.package:
+    name: modemmanager
+    state: absent
+    autoremove: true
+    update_cache: true
+
+- name: Stop avahi-daemon
+  ansible.builtin.systemd:
+    name: avahi-daemon
+    state: stopped
+  when:
+    - "'avahi-daemon.service' in ansible_facts.services"
+    - ansible_facts.services['avahi-daemon.service'].status != 'not-found'
+
+- name: Disable avahi-daemon
+  ansible.builtin.systemd:
+    name: avahi-daemon
+    enabled: false
+  when:
+    - "'avahi-daemon.service' in ansible_facts.services"
+    - ansible_facts.services['avahi-daemon.service'].status != 'not-found'
+
+- name: Remove avahi-daemon package
+  ansible.builtin.package:
+    name: avahi-daemon
+    state: absent
+    autoremove: true
+    update_cache: true

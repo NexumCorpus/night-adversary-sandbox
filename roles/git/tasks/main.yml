@@ -1,0 +1,25 @@
+---
+- name: Setup git username and email
+  become: true
+  become_user: '{{ username }}'
+  ansible.builtin.template:
+    src: files/.gitconfig.j2
+    dest: '{{ user_home }}/.gitconfig'
+    mode: '0644'
+
+- name: Enable cli completion
+  ansible.builtin.blockinfile:
+    path: '{{ user_bashrc }}'
+    marker: '# {mark} ANSIBLE_GIT'
+    block: |
+      source /usr/share/bash-completion/completions/git
+
+- name: Setup bash aliases
+  become: true
+  become_user: '{{ username }}'
+  ansible.builtin.blockinfile:
+    path: '{{ user_bashrc }}'
+    marker: '# {mark} GIT_ALIAS'
+    block: |
+      alias gitdefault="git symbolic-ref refs/remotes/origin/HEAD | sed 's@^refs/remotes/origin/@@'"
+      alias gitmain='git switch $(gitdefault) && git pull && git branch | grep -v $(gitdefault) | xargs -r git branch -D'

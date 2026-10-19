@@ -1,0 +1,34 @@
+---
+# tasks file for chrome-browser
+- name: Check that chrome not already installed
+  ansible.builtin.stat:
+    path: '/usr/bin/google-chrome'
+  register: chrome_browser_stat
+
+- name: Run Playbook
+  ansible.builtin.import_tasks: tasks.yml
+  when: not chrome_browser_stat.stat.exists
+
+- name: Ensures Chrome policy dir exists
+  ansible.builtin.file:
+    path: /etc/opt/chrome/policies/recommended
+    state: directory
+    mode: '0755'
+
+- name: Configure Recommended Policies
+  ansible.builtin.copy:
+    src: recommended.json
+    dest: /etc/opt/chrome/policies/recommended/prefs.json
+    mode: '0644'
+
+- name: Ensure Chrome managed policy directory exists
+  ansible.builtin.file:
+    path: /etc/opt/chrome/policies/managed
+    state: directory
+    mode: '0755'
+
+- name: Configure Managed Policies
+  ansible.builtin.copy:
+    src: managed.json
+    dest: /etc/opt/chrome/policies/managed/prefs.json
+    mode: '0644'
