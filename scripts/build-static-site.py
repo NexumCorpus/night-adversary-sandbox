@@ -234,7 +234,7 @@ def build_site(*, output_dir: Path, history_source_url: str | None = None) -> No
 
     fed_history = fetch_history_payload(start_year=1982)
     export_fed_history_js(fed_history, data_dir / "fed_rate_history_data.js")
-    meetings, histories = load_backtest_inputs(data_dir)
+    meetings, histories = load_backtest_inputs_v2(data_dir)
     backtest = build_backtest_payload(meetings=meetings, histories=histories, years=5, as_of=today)
     export_backtest_js(backtest, data_dir / "data_backtest_data.js")
 
