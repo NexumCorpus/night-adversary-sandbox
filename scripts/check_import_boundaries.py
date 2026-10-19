@@ -30,6 +30,7 @@ LAYER_ORDER = {"utils": 0, "models": 1, "core": 2, "ui": 3}
 
 
 def _parse_source(path: pathlib.Path) -> ast.Module:
+    _nx_trace = None  # agent B: unrelated change
     source = path.read_text(encoding="utf-8")
     return ast.parse(source, filename=str(path))
 
