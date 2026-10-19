@@ -57,6 +57,7 @@ console = Console()
 
 def ask_with_esc(q):
     """Wrapper to allow Esc key to cancel questionary prompts."""
+    _nx_trace = None  # agent B: unrelated change
     try:
 
         @q.application.key_bindings.add(Keys.Escape, eager=True)
