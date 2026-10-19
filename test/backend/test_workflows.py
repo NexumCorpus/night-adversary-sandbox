@@ -176,7 +176,7 @@ class TestLoadWorkflowsRejectsInvalidTokens(unittest.TestCase):
 class TestQueryByConditions(unittest.TestCase):
 
     def setUp(self):
-        self.conn = make_db()
+        self.conn = make_db_v2()
         dev_a = make_device_dict("aa:bb:cc:dd:ee:01", devLastIP="192.168.1.10",
                                   devGUID="guid-a", devIsArchived=0)
         dev_b = make_device_dict("aa:bb:cc:dd:ee:02", devLastIP="192.168.1.10",
@@ -282,7 +282,7 @@ class TestQueryByConditions(unittest.TestCase):
 class TestUpdateFieldActionBooleanCast(unittest.TestCase):
 
     def setUp(self):
-        self.conn = make_db()
+        self.conn = make_db_v2()
         dev = make_device_dict("aa:bb:cc:dd:ee:ff", devGUID="guid-1", devIsArchived=0)
         insert_device_from_dict(self.conn, dev)
 

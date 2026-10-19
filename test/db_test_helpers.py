@@ -122,7 +122,7 @@ CREATE_SETTINGS = """
 # DB factory
 # ---------------------------------------------------------------------------
 
-def make_db(sleep_minutes: int = 30) -> sqlite3.Connection:
+def make_db_v2(sleep_minutes: int = 30) -> sqlite3.Connection:
     """
     Return a fully seeded in-memory SQLite connection with DevicesView built.
 
@@ -163,7 +163,7 @@ def make_history_db(dev_hist_days: int = 14,
         dev_hist_days: Value for DEV_HIST_DAYS setting (0 disables tracking).
         tracked:       Python list literal string for DEV_HIST_TRACKED.
     """
-    conn = make_db()
+    conn = make_db_v2()
     cur = conn.cursor()
     cur.execute(
         "INSERT OR REPLACE INTO Settings (setKey, setValue) VALUES (?, ?)",
