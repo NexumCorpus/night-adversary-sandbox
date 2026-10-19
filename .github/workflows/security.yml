@@ -1,0 +1,35 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  pip-audit:
+    name: Python dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install pip-audit
+      - run: pip-audit -r ecoflow-battery-reader/requirements.txt
+
+  bandit:
+    name: Bandit (static security analysis)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: python -m pip install bandit
+      # Medium+ severity only; the single known low finding is a deliberate best-effort cleanup.
+      - run: bandit -ll ecoflow-battery-reader/ecoflow_battery.py ecoflow-battery-reader/ecoflow_discovery.py ecoflow-battery-reader/prepare_config.py
