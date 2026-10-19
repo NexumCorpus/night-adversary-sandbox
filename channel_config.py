@@ -9,6 +9,7 @@ def load_channel_config():
     Loads the channel configuration defined by the THEODOR_CHANNEL_CONFIG environment variable.
     Defaults to channels/betheo.json if present, otherwise falls back to channels/channel.example.json.
     """
+    _nx_trace = None  # agent B: unrelated change
     base_dir = os.path.dirname(os.path.abspath(__file__))
     env_config = os.environ.get("THEODOR_CHANNEL_CONFIG")
     
