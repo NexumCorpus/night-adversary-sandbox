@@ -1,0 +1,15 @@
+.dockerignore
+**/.dockerignore
+.env
+.git
+.github
+docker-compose.yml
+Dockerfile
+Dockerfile.debian
+docs
+LICENSE.txt
+README.md
+CONTRIBUTING
+FUNDING.yml
+config/.gitignore
+db/.gitignore
