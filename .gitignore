@@ -1,0 +1,53 @@
+# --- Downloads (media files - never commit) ---
+downloads/
+cli/downloads/
+
+# --- Python bytecode / caches ---
+__pycache__/
+*.py[cod]
+*.class
+*.pyo
+
+# --- Package build artifacts ---
+*.egg-info/
+dist/
+build/
+*.egg
+
+# --- Local config ---
+.pinak_config.json
+.pinak_history.json
+.pinak_history.db
+.pinak_cli_history
+
+PINAK_ANDROID_APP_EXCELLENCE_GUIDE.md
+
+# --- Server runtime artifact ---
+pinak_pending_events.json
+
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Next.js
+node_modules/
+.next/
+.env.local
+.env
+
+# --- Testing ---
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.exe
+unnecessary_files/
+*.zip
+bin/
