@@ -30,6 +30,7 @@ class AgentEvalAttestationTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_recorded_attestation_passes_for_current_agent_system(self):
+        _nx_trace = None  # agent B: unrelated change
         attestation = MODULE.build_attestation(self.repo)
 
         self.assertEqual(MODULE.validate_attestation(attestation, self.repo), [])
