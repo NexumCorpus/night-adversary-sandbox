@@ -1,0 +1,1322 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Hermetic unit tests for ``agent_framework_monty``.
+
+These tests inject a fake Monty runtime via ``monkeypatch`` so they run without
+the real ``pydantic-monty`` package doing any work. End-to-end tests against
+the real runtime live in ``test_monty_codeact_integration.py``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import sys
+import types
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Annotated, Any, Literal
+from unittest.mock import MagicMock
+
+import pytest
+from agent_framework import Content, FunctionTool, Message, tool
+from agent_framework._sessions import SessionContext
+from agent_framework.exceptions import ToolException
+
+from agent_framework_monty import MontyCodeActProvider, MontyExecuteCodeTool
+from agent_framework_monty import _execute_code_tool as execute_code_module
+from agent_framework_monty import _instructions as instructions_module
+from agent_framework_monty import _monty_bridge as bridge_module
+
+# ---------------------------------------------------------------------------
+# Fake Monty runtime - drop-in replacement for pydantic_monty
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _FakeMontyComplete:
+    output: Any = None
+
+
+@dataclass
+class _FakeFunctionSnapshot:
+    function_name: str
+    call_id: int
+    args: tuple[Any, ...] = ()
+    kwargs: dict[str, Any] = field(default_factory=dict)
+    is_os_function: bool = False
+    _script: _FakeScript | None = None
+
+    def resume(self, payload: Any) -> Any:
+        assert self._script is not None, "Snapshot must be attached to a script."
+        return self._script.advance(("function_resume", self, payload))
+
+    def resume_auto(self) -> Any:
+        assert self._script is not None, "Snapshot must be attached to a script."
+        return self._script.advance(("function_resume_auto", self, None))
+
+
+@dataclass
+class _FakeFutureSnapshot:
+    pending_call_ids: list[int]
+    _script: _FakeScript | None = None
+
+    def resume(self, payload: Any) -> Any:
+        assert self._script is not None, "Snapshot must be attached to a script."
+        return self._script.advance(("future_resume", self, payload))
+
+
+@dataclass
+class _FakeNameLookupSnapshot:
+    variable_name: str
+
+
+@dataclass
+class _PrintAction:
+    """Marker pushed onto a script to emit captured stdout via the print callback."""
+
+    text: str
+
+
+class _FakeScript:
+    """Replayable Monty progress script with a resume log."""
+
+    def __init__(self, items: Iterable[Any]) -> None:
+        self._queue: list[Any] = list(items)
+        self.resume_log: list[tuple[str, Any, Any]] = []
+
+    def attach(self, snapshot: Any) -> Any:
+        snapshot._script = self
+        return snapshot
+
+    def next_item(self) -> Any:
+        if not self._queue:
+            return _FakeMontyComplete(output=None)
+        item = self._queue.pop(0)
+        if isinstance(item, _FakeMontyComplete):
+            return item
+        if isinstance(item, _PrintAction):
+            return item
+        if isinstance(item, _FakeNameLookupSnapshot):
+            return item
+        return self.attach(item)
+
+    def advance(self, log_entry: tuple[str, Any, Any]) -> Any:
+        self.resume_log.append(log_entry)
+        return self.next_item()
+
+
+_current_script: list[_FakeScript | None] = [None]
+
+
+def _set_script(*items: Any) -> _FakeScript:
+    script = _FakeScript(items)
+    _current_script[0] = script
+    return script
+
+
+def _get_script() -> _FakeScript:
+    script = _current_script[0]
+    assert script is not None, "Test must call _set_script(...) before running code."
+    return script
+
+
+class _FakeSession:
+    """Fake ``MontySession`` matching the pydantic-monty pool/checkout API."""
+
+    def __init__(
+        self,
+        *,
+        script_name: str,
+        type_check: bool,
+        type_check_stubs: str | None,
+        limits: dict[str, Any] | None = None,
+    ) -> None:
+        self.script_name = script_name
+        self.type_check = type_check
+        self.type_check_stubs = type_check_stubs
+        self.limits = limits
+        self.code: str | None = None
+        self._script = _get_script()
+
+    def __enter__(self) -> _FakeSession:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+    def feed_start(
+        self,
+        code: str,
+        *,
+        print_callback: Any = None,
+        mount: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        self.code = code
+        self.mount = mount
+        while True:
+            item = self._script.next_item()
+            if isinstance(item, _PrintAction):
+                if print_callback is not None:
+                    print_callback("stdout", item.text)
+                continue
+            return item
+
+
+class _FakeMonty:
+    """Fake ``Monty`` pool: ``with Monty() as pool: with pool.checkout() as session``."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.pool_kwargs = kwargs
+        self.last_session: _FakeSession | None = None
+
+    def __enter__(self) -> _FakeMonty:
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        return None
+
+    def checkout(
+        self,
+        *,
+        script_name: str = "main.py",
+        type_check: bool = False,
+        type_check_stubs: str | None = None,
+        limits: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> _FakeSession:
+        self.last_session = _FakeSession(
+            script_name=script_name,
+            type_check=type_check,
+            type_check_stubs=type_check_stubs,
+            limits=limits,
+        )
+        return self.last_session
+
+
+@pytest.fixture(autouse=True)
+def fake_monty_module(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Install a fake ``pydantic_monty`` module for the duration of each test."""
+    fake = types.ModuleType("pydantic_monty")
+    fake.Monty = _FakeMonty  # type: ignore[attr-defined] # ty: ignore[unresolved-attribute]
+    fake.MontyComplete = _FakeMontyComplete  # type: ignore[attr-defined] # ty: ignore[unresolved-attribute]
+    fake.FunctionSnapshot = _FakeFunctionSnapshot  # type: ignore[attr-defined] # ty: ignore[unresolved-attribute]
+    fake.FutureSnapshot = _FakeFutureSnapshot  # type: ignore[attr-defined] # ty: ignore[unresolved-attribute]
+    fake.NameLookupSnapshot = _FakeNameLookupSnapshot  # type: ignore[attr-defined] # ty: ignore[unresolved-attribute]
+
+    monkeypatch.setitem(sys.modules, "pydantic_monty", fake)
+    _current_script[0] = None
+    yield
+    _current_script[0] = None
+
+
+# ---------------------------------------------------------------------------
+# Sample tools used across tests
+# ---------------------------------------------------------------------------
+
+
+@tool
+def add_tool(
+    a: Annotated[int, "First addend"],
+    b: Annotated[int, "Second addend"],
+) -> int:
+    """Add two integers."""
+    return a + b
+
+
+@tool
+def mul_tool(
+    a: Annotated[int, "First factor"],
+    b: Annotated[int, "Second factor"],
+) -> int:
+    """Multiply two integers."""
+    return a * b
+
+
+@tool(approval_mode="always_require")
+def dangerous_tool(payload: Annotated[str, "Anything"]) -> str:
+    """A tool that always requires approval."""
+    return payload
+
+
+def _decode_content_bytes(item: Content) -> bytes:
+    import base64
+
+    assert item.uri is not None
+    _, _, encoded = item.uri.partition("base64,")
+    return base64.b64decode(encoded)
+
+
+# ---------------------------------------------------------------------------
+# MontyExecuteCodeTool tests
+# ---------------------------------------------------------------------------
+
+
+def test_tool_construction_defaults() -> None:
+    monty_tool = MontyExecuteCodeTool()
+    assert monty_tool.name == "execute_code"
+    assert monty_tool.approval_mode == "never_require"
+    assert monty_tool.get_tools() == []
+
+
+@pytest.mark.parametrize("entry_point", [MontyExecuteCodeTool, MontyCodeActProvider])
+@pytest.mark.parametrize("register_later", [False, True])
+@pytest.mark.parametrize(
+    "properties",
+    [
+        {"source_integrity": "untrusted"},
+        {"confidentiality": "private"},
+        {"max_allowed_confidentiality": "public"},
+        {"max_allowed_confidentiality": None},
+        {"accepts_untrusted": False},
+        {"standing_guidance": []},
+        {"agent_framework.security.principals": []},
+        {"_agent_framework_internal_security_tool": object()},
+        {"_mcp_trust_server_ifc": False},
+    ],
+)
+def test_codeact_warns_for_fides_tool_metadata(
+    entry_point: type[MontyExecuteCodeTool] | type[MontyCodeActProvider],
+    register_later: bool,
+    properties: dict[str, Any],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    @tool(additional_properties=properties)
+    def annotated_tool(value: int) -> int:
+        return value
+
+    with caplog.at_level("WARNING", logger="agent_framework"):
+        codeact = entry_point(tools=None if register_later else annotated_tool)
+        if register_later:
+            codeact.add_tools(annotated_tool)
+
+    records = [
+        record for record in caplog.records if "FIDES is not supported with CodeAct providers." in record.message
+    ]
+    assert len(records) == 1
+    assert records[0].levelname == "WARNING"
+    assert records[0].args == ("annotated_tool",)
+    assert codeact.get_tools()[0] is annotated_tool
+    assert annotated_tool.additional_properties == properties
+    assert annotated_tool.invocation_count == annotated_tool.invocation_exception_count == 0
+
+
+@pytest.mark.parametrize("entry_point", [MontyExecuteCodeTool, MontyCodeActProvider])
+@pytest.mark.parametrize("properties", [None, {}, {"custom_property": False}])
+def test_codeact_does_not_warn_for_unannotated_tools(
+    entry_point: type[MontyExecuteCodeTool] | type[MontyCodeActProvider],
+    properties: dict[str, Any] | None,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    @tool(additional_properties=properties)
+    def plain_tool(value: int) -> int:
+        return value
+
+    with caplog.at_level("WARNING", logger="agent_framework"):
+        codeact = entry_point(tools=plain_tool)
+
+    assert "FIDES" not in caplog.text
+    assert codeact.get_tools()[0] is plain_tool
+
+
+def test_run_snapshot_warns_for_fides_metadata_added_after_registration(caplog: pytest.LogCaptureFixture) -> None:
+    @tool
+    def annotated_tool(value: int) -> int:
+        return value
+
+    codeact = MontyExecuteCodeTool(tools=annotated_tool)
+    assert annotated_tool.additional_properties is not None
+    annotated_tool.additional_properties["accepts_untrusted"] = False
+
+    with caplog.at_level("WARNING", logger="agent_framework"):
+        run_tool = codeact.create_run_tool()
+
+    assert "FIDES is not supported with CodeAct providers." in caplog.text
+    assert run_tool.get_tools()[0] is annotated_tool
+    assert annotated_tool.invocation_count == annotated_tool.invocation_exception_count == 0
+
+
+@pytest.mark.parametrize("entry_point", [MontyExecuteCodeTool, MontyCodeActProvider])
+def test_codeact_does_not_repeat_fides_warning_for_unrelated_registration(
+    entry_point: type[MontyExecuteCodeTool] | type[MontyCodeActProvider],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    @tool(additional_properties={"source_integrity": "untrusted"})
+    def annotated_tool(value: int) -> int:
+        return value
+
+    @tool
+    def plain_tool(value: int) -> int:
+        return value
+
+    with caplog.at_level("WARNING", logger="agent_framework"):
+        codeact = entry_point(tools=annotated_tool)
+        caplog.clear()
+        codeact.add_tools(plain_tool)
+
+    assert "FIDES" not in caplog.text
+    assert codeact.get_tools() == [annotated_tool, plain_tool]
+
+
+@pytest.mark.parametrize("entry_point", [MontyExecuteCodeTool, MontyCodeActProvider])
+def test_codeact_warns_once_for_annotated_tool_replacement(
+    entry_point: type[MontyExecuteCodeTool] | type[MontyCodeActProvider],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    @tool(name="shared")
+    def original_tool(value: int) -> int:
+        return value
+
+    @tool(name="shared", additional_properties={"accepts_untrusted": False})
+    def replacement_tool(value: int) -> int:
+        return value
+
+    codeact = entry_point(tools=original_tool)
+    with caplog.at_level("WARNING", logger="agent_framework"):
+        codeact.add_tools(replacement_tool)
+
+    records = [
+        record for record in caplog.records if "FIDES is not supported with CodeAct providers." in record.message
+    ]
+    assert len(records) == 1
+    assert records[0].args == ("shared",)
+    assert codeact.get_tools() == [replacement_tool]
+
+
+def test_add_remove_clear_tools_round_trip() -> None:
+    monty_tool = MontyExecuteCodeTool()
+
+    monty_tool.add_tools([add_tool, mul_tool])
+    assert [t.name for t in monty_tool.get_tools()] == ["add_tool", "mul_tool"]
+
+    monty_tool.remove_tool("add_tool")
+    assert [t.name for t in monty_tool.get_tools()] == ["mul_tool"]
+
+    with pytest.raises(KeyError):
+        monty_tool.remove_tool("missing")
+
+    monty_tool.clear_tools()
+    assert monty_tool.get_tools() == []
+
+
+def test_approval_required_tool_gates_execute_code() -> None:
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool])
+    assert monty_tool.approval_mode == "never_require"
+
+    monty_tool.add_tools([dangerous_tool])
+    assert monty_tool.approval_mode == "always_require"
+
+    monty_tool.remove_tool("dangerous_tool")
+    assert monty_tool.approval_mode == "never_require"
+
+
+def test_default_approval_mode_always_require_is_sticky() -> None:
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool], approval_mode="always_require")
+    assert monty_tool.approval_mode == "always_require"
+
+    monty_tool.clear_tools()
+    assert monty_tool.approval_mode == "always_require"
+
+
+def test_dynamic_description_reflects_registered_tools() -> None:
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool])
+    description = monty_tool.description
+    assert "add_tool" in description
+    assert "Monty" in description
+
+    monty_tool.add_tools([mul_tool])
+    description_updated = monty_tool.description
+    assert "mul_tool" in description_updated
+
+
+@pytest.fixture
+def documented_tool() -> FunctionTool:
+    return FunctionTool(
+        name="documented",
+        description="Documented scalar parameters.",
+        func=lambda **kwargs: kwargs,
+        input_model={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search text."},
+                "count": {"type": "integer", "description": "Result count.", "default": 0},
+                "enabled": {"type": "boolean", "default": False},
+                "ratio": {"type": "number", "enum": [0.5, 1.0], "default": 0.5},
+                "empty": {"type": "null", "default": None},
+            },
+            "required": ["query"],
+        },
+    )
+
+
+def _json_schemas(text: str) -> list[dict[str, Any]]:
+    return [json.loads(schema) for schema in re.findall(r"```json\n(.*?)\n\s*```", text, re.DOTALL)]
+
+
+@pytest.mark.parametrize("tools_visible_to_model", [False, True])
+@pytest.mark.parametrize("tool_description_format", ["compact", {}, {"documented": "compact"}])
+def test_compact_parameter_documentation(
+    documented_tool: FunctionTool,
+    tools_visible_to_model: bool,
+    tool_description_format: Any,
+) -> None:
+    monty_tool = MontyExecuteCodeTool(tools=[documented_tool], tool_description_format=tool_description_format)
+    instructions = monty_tool.build_instructions(tools_visible_to_model=tools_visible_to_model)
+    expected_lines = [
+        "- `documented`: Documented scalar parameters.",
+        "- `query` (string, required): Search text.",
+        "- `count` (integer, optional): Result count. Default: 0.",
+        "- `enabled` (boolean, optional) Default: false.",
+        "- `ratio` (number, optional) Allowed values: [0.5, 1.0]. Default: 0.5.",
+        "- `empty` (null, optional) Default: null.",
+    ]
+    for text in (monty_tool.description, instructions):
+        for line in expected_lines:
+            assert line in text
+        assert "JSON Schema" not in text
+        assert "await tool_name(param=value)" in text
+        assert "await call_tool('name', **kwargs)" in text
+        assert "asyncio.gather" in text
+        assert "type-checked" in text
+    usage_note = (
+        "Some tools may also appear directly"
+        if tools_visible_to_model
+        else "Provider-owned sandbox tools are not exposed separately"
+    )
+    assert usage_note in instructions
+    assert monty_tool.to_dict()["description"] == monty_tool.description
+    assert MontyExecuteCodeTool(tools=[documented_tool]).description == monty_tool.description
+
+
+@pytest.mark.parametrize("tools_visible_to_model", [False, True])
+@pytest.mark.parametrize(
+    ("tool_description_format", "json_tool_names"),
+    [
+        ("json", ["documented", "add_tool"]),
+        ({"documented": "json", "add_tool": "compact"}, ["documented"]),
+        ({"documented": "json"}, ["documented"]),
+        ({"Documented": "json", "unused": "json"}, []),
+    ],
+)
+def test_parameter_documentation_formats(
+    documented_tool: FunctionTool,
+    tools_visible_to_model: bool,
+    tool_description_format: Any,
+    json_tool_names: list[str],
+) -> None:
+    tools = [documented_tool, add_tool]
+    monty_tool = MontyExecuteCodeTool(tools=tools, tool_description_format=tool_description_format)
+    expected = [registered.parameters() for registered in tools if registered.name in json_tool_names]
+    for text in (
+        monty_tool.description,
+        monty_tool.build_instructions(tools_visible_to_model=tools_visible_to_model),
+    ):
+        assert _json_schemas(text) == expected
+        assert text.count("Parameters (JSON Schema)") == len(expected)
+        assert "Using JSON Schema because" not in text
+        if "add_tool" not in json_tool_names:
+            assert "- `a` (integer, required): First addend" in text
+        if "documented" not in json_tool_names:
+            assert "- `query` (string, required): Search text." in text
+    assert monty_tool.to_dict()["description"] == monty_tool.description
+    state = monty_tool.build_serializable_state()
+    assert state["tool_description_format"] == tool_description_format
+    assert json.loads(json.dumps(state)) == state
+
+
+@pytest.mark.parametrize("tool_description_format", ["compact", "json", {"rich": "compact"}, {"rich": "json"}])
+def test_rich_parameter_schema_is_preserved(tool_description_format: Any) -> None:
+    schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "items": {"type": "array", "items": {"$ref": "#/$defs/Entry"}, "minItems": 1},
+            "limit": {"type": "integer", "minimum": 1, "default": 2},
+        },
+        "$defs": {"Entry": {"type": "object", "properties": {"value": {"type": "string"}}}},
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+    rich = FunctionTool(name="rich", description="Rich schema.", func=lambda **kwargs: kwargs, input_model=schema)
+    monty_tool = MontyExecuteCodeTool(tools=[rich], tool_description_format=tool_description_format)
+    requested = tool_description_format if isinstance(tool_description_format, str) else tool_description_format["rich"]
+    for text in (
+        monty_tool.description,
+        monty_tool.build_instructions(tools_visible_to_model=False),
+        monty_tool.build_instructions(tools_visible_to_model=True),
+    ):
+        assert _json_schemas(text) == [rich.parameters()]
+        assert rich.parameters() == schema
+        assert (
+            "Using JSON Schema because the parameter schema cannot be represented faithfully in compact form." in text
+        ) == (requested == "compact")
+    assert monty_tool.to_dict()["description"] == monty_tool.description
+
+
+@pytest.mark.parametrize("constructor", [MontyExecuteCodeTool, MontyCodeActProvider])
+@pytest.mark.parametrize(
+    ("value", "error"),
+    [
+        ("unknown", ValueError),
+        ("JSON", ValueError),
+        (" compact", ValueError),
+        ({"inactive": "invalid"}, ValueError),
+        ({"inactive": "JSON"}, ValueError),
+        (None, TypeError),
+        (1, TypeError),
+        (False, TypeError),
+        (["compact"], TypeError),
+        ([("name", "json")], TypeError),
+        ({1: "json"}, TypeError),
+        ({"name": None}, TypeError),
+        ({"name": 1}, TypeError),
+        ({"name": ["json"]}, TypeError),
+    ],
+)
+def test_tool_description_format_validation(constructor: Any, value: Any, error: type[Exception]) -> None:
+    with pytest.raises(error, match="tool_description_format"):
+        constructor(tool_description_format=value)
+
+
+def test_description_format_mapping_is_copied_and_retained_for_dynamic_tools() -> None:
+    formats: dict[str, Literal["compact", "json"]] = {"add_tool": "json", "mul_tool": "json"}
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool], tool_description_format=types.MappingProxyType(formats))
+    run_tool = monty_tool.create_run_tool()
+    snapshot_description = run_tool.description
+    snapshot_instructions = run_tool.build_instructions(tools_visible_to_model=False)
+    formats.clear()
+    state = monty_tool.build_serializable_state()
+    state["tool_description_format"].clear()
+    assert monty_tool.build_serializable_state()["tool_description_format"] == {"add_tool": "json", "mul_tool": "json"}
+    assert run_tool._tool_description_format is not monty_tool._tool_description_format
+    monty_tool.add_tools(mul_tool)
+    assert _json_schemas(monty_tool.description) == [add_tool.parameters(), mul_tool.parameters()]
+    monty_tool.remove_tool("add_tool")
+    assert "- `add_tool`:" not in monty_tool.description
+    monty_tool.clear_tools()
+    assert "No tools are currently registered." in monty_tool.description
+    monty_tool.add_tools(add_tool)
+    assert _json_schemas(monty_tool.description) == [add_tool.parameters()]
+    assert run_tool.description == snapshot_description
+    assert run_tool.build_instructions(tools_visible_to_model=False) == snapshot_instructions
+
+
+@pytest.mark.parametrize("tool_description_format", ["compact", "json", {}])
+def test_empty_registry_and_zero_parameter_documentation(tool_description_format: Any) -> None:
+    monty_tool = MontyExecuteCodeTool(tool_description_format=tool_description_format)
+    assert "- No tools are currently registered." in monty_tool.description
+    assert "- No tools are currently registered." in monty_tool.build_instructions(tools_visible_to_model=False)
+    empty = FunctionTool(
+        name="empty", description="", func=lambda: None, input_model={"type": "object", "properties": {}}
+    )
+    monty_tool.add_tools(empty)
+    for text in (monty_tool.description, monty_tool.build_instructions(tools_visible_to_model=True)):
+        assert "- `empty`: No description provided." in text
+        if tool_description_format == "json":
+            assert _json_schemas(text) == [empty.parameters()]
+        else:
+            assert "Parameters: none." in text
+
+
+def test_create_run_tool_snapshots_current_state() -> None:
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool], approval_mode="never_require")
+    run_tool = monty_tool.create_run_tool()
+
+    assert run_tool is not monty_tool
+    assert [t.name for t in run_tool.get_tools()] == ["add_tool"]
+    assert run_tool.approval_mode == monty_tool.approval_mode
+
+    # Mutating the original must not leak into the snapshot.
+    monty_tool.add_tools([mul_tool])
+    assert [t.name for t in run_tool.get_tools()] == ["add_tool"]
+
+
+def test_build_serializable_state_matches_effective_config() -> None:
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool, dangerous_tool])
+    state = monty_tool.build_serializable_state()
+    assert state["runtime"] == "monty"
+    assert state["approval_mode"] == "always_require"
+    assert set(state["tool_names"]) == {"add_tool", "dangerous_tool"}
+    assert state["workspace_root"] is None
+    assert state["file_mounts"] == []
+    assert state["resource_limits"] is None
+    assert state["tool_description_format"] == "compact"
+
+
+def test_file_mounts_normalized_and_round_tripped(tmp_path: Path) -> None:
+    from agent_framework_monty import FileMount
+    from agent_framework_monty._execute_code_tool import _normalize_mount_path
+
+    host_a = tmp_path / "a"
+    host_a.mkdir()
+    host_b = tmp_path / "b"
+    host_b.mkdir()
+
+    monty_tool = MontyExecuteCodeTool(
+        file_mounts=[
+            str(host_a),  # shorthand: same path on both sides
+            (str(host_b), "/work"),  # explicit tuple
+            FileMount(host_path=host_a, mount_path="/data", mode="read-only"),
+        ],
+    )
+
+    mounts = monty_tool.get_file_mounts()
+    by_mount = {m.mount_path: m for m in mounts}
+
+    # The shorthand string is normalized through _normalize_mount_path (POSIX-style),
+    # so on Windows `C:\\...` becomes `/C:/...`. Compare against the same normalizer.
+    shorthand_key = _normalize_mount_path(str(host_a))
+    assert set(by_mount) == {shorthand_key, "/work", "/data"}
+    assert by_mount["/work"].host_path == host_b.resolve()
+    assert by_mount["/data"].mode == "read-only"
+    assert by_mount[shorthand_key].mode == "overlay"  # default
+
+
+def test_workspace_root_auto_mounts_at_input(tmp_path: Path) -> None:
+    monty_tool = MontyExecuteCodeTool(workspace_root=tmp_path)
+    mounts = monty_tool._effective_mounts()
+    assert any(m.mount_path == "/input" and m.mode == "read-write" for m in mounts)
+
+
+def test_workspace_root_yields_to_explicit_input_mount(tmp_path: Path) -> None:
+    from agent_framework_monty import FileMount
+
+    explicit = tmp_path / "explicit"
+    explicit.mkdir()
+    monty_tool = MontyExecuteCodeTool(
+        workspace_root=tmp_path,
+        file_mounts=[FileMount(host_path=explicit, mount_path="/input", mode="read-only")],
+    )
+    input_mounts = [m for m in monty_tool._effective_mounts() if m.mount_path == "/input"]
+    assert len(input_mounts) == 1
+    assert input_mounts[0].mode == "read-only"
+    assert input_mounts[0].host_path == explicit.resolve()
+
+
+def test_remove_file_mount_raises_on_missing() -> None:
+    monty_tool = MontyExecuteCodeTool()
+    with pytest.raises(KeyError):
+        monty_tool.remove_file_mount("/never-added")
+
+
+def test_dynamic_description_mentions_filesystem_when_mounts_configured(tmp_path: Path) -> None:
+    monty_tool = MontyExecuteCodeTool(workspace_root=tmp_path)
+    description = monty_tool.description
+    assert "Filesystem access is enabled" in description
+    assert "/input" in description
+
+
+def test_dynamic_description_default_mentions_no_filesystem() -> None:
+    monty_tool = MontyExecuteCodeTool()
+    description = monty_tool.description
+    assert "Filesystem access is unavailable" in description
+
+
+def test_instruction_builders_describe_write_caps_and_visible_tools(tmp_path: Path) -> None:
+    from agent_framework_monty import FileMount
+
+    mount = FileMount(host_path=tmp_path, mount_path="/work", mode="read-write", write_bytes_limit=128)
+    description = instructions_module.build_execute_code_description(tools=[add_tool], mounts=[mount])
+    instructions = instructions_module.build_codeact_instructions(
+        tools=[add_tool],
+        tools_visible_to_model=True,
+        mounts=[mount],
+    )
+
+    assert "write cap 128 bytes" in description
+    assert "Files written to `/work` are returned" in description
+    assert "Some tools may also appear directly" in instructions
+
+
+def test_resource_limits_round_trip() -> None:
+    monty_tool = MontyExecuteCodeTool(resource_limits={"max_duration_secs": 5.0})
+    assert monty_tool.resource_limits == {"max_duration_secs": 5.0}
+    state = monty_tool.build_serializable_state()
+    assert state["resource_limits"] == {"max_duration_secs": 5.0}
+
+
+def test_build_instructions_includes_registered_tools() -> None:
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool])
+    instructions = monty_tool.build_instructions(tools_visible_to_model=False)
+    assert "add_tool" in instructions
+    assert "execute_code" in instructions
+    assert "asyncio.gather" in instructions
+
+
+def test_execute_code_filtered_out_when_added_as_tool() -> None:
+    spurious = FunctionTool(
+        name="execute_code",
+        description="should not appear",
+        func=lambda: None,
+    )
+    monty_tool = MontyExecuteCodeTool(tools=[spurious, add_tool])
+    assert [t.name for t in monty_tool.get_tools()] == ["add_tool"]
+
+
+def test_mount_helpers_validate_inputs_and_convert_mounts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_framework_monty import FileMount
+
+    host_dir = tmp_path / "host"
+    host_dir.mkdir()
+    file_path = tmp_path / "file.txt"
+    file_path.write_text("x", encoding="utf-8")
+
+    assert execute_code_module._is_file_mount_pair((host_dir, "/work")) is True
+    assert execute_code_module._is_file_mount_pair(FileMount(host_path=host_dir, mount_path="/work")) is False
+    assert execute_code_module._is_file_mount_pair((host_dir, "/work", "extra")) is False
+    assert execute_code_module._is_file_mount_pair((host_dir, 1)) is False
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        execute_code_module._normalize_mount_path(" ")
+    with pytest.raises(ValueError, match="must not contain '..' segments"):
+        execute_code_module._normalize_mount_path("/work/../escape")
+    with pytest.raises(ValueError, match="must point to a concrete absolute path"):
+        execute_code_module._normalize_mount_path("/")
+    with pytest.raises(ValueError, match="existing directory"):
+        execute_code_module._resolve_existing_directory(file_path)
+
+    calls: list[dict[str, Any]] = []
+
+    class _FakeMountDir:
+        def __init__(self, **kwargs: Any) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(bridge_module, "load_monty", lambda: types.SimpleNamespace(MountDir=_FakeMountDir))
+    execute_code_module._to_monty_mount(
+        FileMount(host_path=host_dir, mount_path="/work", mode="read-write", write_bytes_limit=12)
+    )
+
+    assert calls == [
+        {
+            "virtual_path": "/work",
+            "host_path": str(host_dir),
+            "mode": "read-write",
+            "write_bytes_limit": 12,
+        }
+    ]
+
+
+def test_to_dict_materializes_dynamic_description(tmp_path: Path) -> None:
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool], workspace_root=tmp_path)
+    serialized = monty_tool.to_dict()
+
+    assert monty_tool.workspace_root == tmp_path.resolve()
+    assert "description" in serialized
+    assert "add_tool" in serialized["description"]
+
+
+# ---------------------------------------------------------------------------
+# _run_code behavior with the fake Monty runtime
+# ---------------------------------------------------------------------------
+
+
+async def test_run_code_with_no_tools_returns_default_text() -> None:
+    _set_script(_FakeMontyComplete(output=None))
+
+    monty_tool = MontyExecuteCodeTool()
+    result = await monty_tool._run_code(code="None")
+
+    assert len(result) == 1
+    assert isinstance(result[0], Content)
+
+
+async def test_run_code_surfaces_stdout_and_output() -> None:
+    _set_script(_PrintAction("hello\n"), _FakeMontyComplete(output=42))
+
+    monty_tool = MontyExecuteCodeTool()
+    result = await monty_tool._run_code(code="print('hello')")
+
+    text_contents = [c for c in result if c.type == "text"]
+    assert any("hello" in (c.text or "") for c in text_contents)
+    assert any(
+        (c.text or "").strip() and json.loads(c.text or "null") == 42
+        for c in text_contents
+        if (c.text or "").strip().isdigit()
+    )
+
+
+async def test_run_code_direct_typed_call_invokes_registered_tool() -> None:
+    func_snapshot = _FakeFunctionSnapshot(
+        function_name="add_tool",
+        call_id=1,
+        kwargs={"a": 2, "b": 3},
+    )
+    future_snapshot = _FakeFutureSnapshot(pending_call_ids=[1])
+    script = _set_script(func_snapshot, future_snapshot, _FakeMontyComplete(output=None))
+
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool])
+    await monty_tool._run_code(code="await add_tool(a=2, b=3)")
+
+    payloads = [payload for _, _, payload in script.resume_log]
+    assert {"future": ...} in payloads
+    final_resume = next(p for p in payloads if isinstance(p, dict) and 1 in p)
+    assert final_resume[1] == {"return_value": 5}
+
+
+async def test_run_code_call_tool_fallback_invokes_registered_tool() -> None:
+    func_snapshot = _FakeFunctionSnapshot(
+        function_name="call_tool",
+        call_id=7,
+        args=("add_tool",),
+        kwargs={"a": 4, "b": 8},
+    )
+    future_snapshot = _FakeFutureSnapshot(pending_call_ids=[7])
+    script = _set_script(func_snapshot, future_snapshot, _FakeMontyComplete(output=None))
+
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool])
+    await monty_tool._run_code(code="await call_tool('add_tool', a=4, b=8)")
+
+    payloads = [payload for _, _, payload in script.resume_log]
+    final_resume = next(p for p in payloads if isinstance(p, dict) and 7 in p)
+    assert final_resume[7] == {"return_value": 12}
+
+
+async def test_run_code_unknown_tool_returns_nameerror_resume() -> None:
+    func_snapshot = _FakeFunctionSnapshot(
+        function_name="does_not_exist",
+        call_id=11,
+    )
+    script = _set_script(func_snapshot, _FakeMontyComplete(output=None))
+
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool])
+    await monty_tool._run_code(code="await does_not_exist()")
+
+    payloads = [payload for _, _, payload in script.resume_log]
+    assert any(isinstance(p, dict) and p.get("exc_type") == "NameError" for p in payloads)
+
+
+async def test_run_code_os_function_is_rejected_with_permissionerror() -> None:
+    os_snapshot = _FakeFunctionSnapshot(
+        function_name="os.listdir",
+        call_id=12,
+        is_os_function=True,
+    )
+    script = _set_script(os_snapshot, _FakeMontyComplete(output=None))
+
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool])
+    await monty_tool._run_code(code="import os; os.listdir('.')")
+
+    payloads = [payload for _, _, payload in script.resume_log]
+    assert any(isinstance(p, dict) and p.get("exc_type") == "PermissionError" for p in payloads)
+
+
+async def test_when_any_returns_nameerror_now_that_it_is_removed() -> None:
+    """`when_any` is no longer part of the DSL and should resolve to a NameError."""
+    func_snapshot = _FakeFunctionSnapshot(
+        function_name="when_any",
+        call_id=99,
+        args=([{"tool": "add_tool", "kwargs": {"a": 1, "b": 2}}],),
+    )
+    script = _set_script(func_snapshot, _FakeMontyComplete(output=None))
+
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool])
+    await monty_tool._run_code(code="await when_any([{'tool': 'add_tool', 'kwargs': {'a': 1, 'b': 2}}])")
+
+    payloads = [payload for _, _, payload in script.resume_log]
+    assert any(isinstance(p, dict) and p.get("exc_type") == "NameError" for p in payloads)
+
+
+async def test_run_code_call_tool_with_unregistered_name_returns_error() -> None:
+    func_snapshot = _FakeFunctionSnapshot(
+        function_name="call_tool",
+        call_id=20,
+        args=("missing",),
+        kwargs={},
+    )
+    script = _set_script(func_snapshot, _FakeMontyComplete(output=None))
+
+    monty_tool = MontyExecuteCodeTool(tools=[add_tool])
+    await monty_tool._run_code(code="await call_tool('missing')")
+
+    payloads = [payload for _, _, payload in script.resume_log]
+    assert any(
+        isinstance(p, dict) and p.get("exc_type") == "ValueError" and "Tool 'missing'" in p.get("message", "")
+        for p in payloads
+    )
+
+
+async def test_run_code_returns_error_content_on_runtime_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _BoomBridge:
+        def __init__(self, tool_map: Any, **_: Any) -> None:
+            pass
+
+        async def run(self, code: str) -> dict[str, Any]:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(execute_code_module, "InlineCodeBridge", _BoomBridge)
+
+    monty_tool = MontyExecuteCodeTool()
+    result = await monty_tool._run_code(code="x = 1")
+    assert len(result) == 1
+    assert result[0].type == "error"
+    assert "boom" in (result[0].error_details or "")
+
+
+def test_build_execution_contents_handles_truncation_and_non_json_output() -> None:
+    truncated = execute_code_module._build_execution_contents(
+        result={"stdout": "hello", "truncated": True, "output": complex(1, 2)}
+    )
+    assert [item.text for item in truncated] == ["hello\n\n[stdout truncated]", "(1+2j)"]
+
+    truncated_only = execute_code_module._build_execution_contents(
+        result={"stdout": "", "truncated": True, "output": None}
+    )
+    assert [item.text for item in truncated_only] == ["[stdout truncated]"]
+
+
+def test_capture_written_files_returns_new_files_and_omits_large_ones(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_framework_monty import FileMount
+
+    writable = tmp_path / "writable"
+    writable.mkdir()
+    readonly = tmp_path / "readonly"
+    readonly.mkdir()
+    nested = writable / "nested"
+    nested.mkdir()
+
+    existing = writable / "existing.txt"
+    existing.write_text("before", encoding="utf-8")
+    (nested / "report.txt").write_text("old", encoding="utf-8")
+    (readonly / "ignored.txt").write_text("unchanged", encoding="utf-8")
+
+    mounts = [
+        FileMount(host_path=writable, mount_path="/work", mode="read-write"),
+        FileMount(host_path=readonly, mount_path="/readonly", mode="read-only"),
+    ]
+    pre_state = execute_code_module._snapshot_writable_mounts(mounts)
+
+    existing.write_text("after", encoding="utf-8")
+    (nested / "report.txt").write_text("updated", encoding="utf-8")
+    (writable / "artifact.bin").write_bytes(b"\x00\x01")
+    (writable / "large.txt").write_text("123456789", encoding="utf-8")
+    monkeypatch.setattr(execute_code_module, "MAX_CAPTURED_FILE_BYTES", 8)
+
+    captured = execute_code_module._capture_written_files(mounts, pre_state)
+    data_items = [item for item in captured if item.type == "data"]
+    text_items = [item for item in captured if item.type == "text"]
+
+    assert set(pre_state) == {"/work"}
+    assert "existing.txt" in pre_state["/work"]
+    assert "ignored.txt" not in pre_state["/work"]
+    assert {item.additional_properties["path"] for item in data_items} == {
+        "/work/artifact.bin",
+        "/work/existing.txt",
+        "/work/nested/report.txt",
+    }
+    assert any("large.txt" in (item.text or "") and "omitted" in (item.text or "") for item in text_items)
+    assert any(
+        _decode_content_bytes(item) == b"after"
+        for item in data_items
+        if item.additional_properties["path"] == "/work/existing.txt"
+    )
+    assert all(not item.additional_properties["path"].startswith("/readonly/") for item in data_items)
+
+
+# ---------------------------------------------------------------------------
+# MontyCodeActProvider tests
+# ---------------------------------------------------------------------------
+
+
+async def test_provider_injects_execute_code_tool_and_instructions() -> None:
+    provider = MontyCodeActProvider(tools=[add_tool])
+    context = SessionContext(input_messages=[Message(role="user", contents=[Content.from_text("hi")])])
+    state: dict[str, Any] = {}
+
+    await provider.before_run(agent=MagicMock(), session=None, context=context, state=state)
+
+    assert state["monty_codeact"]["tool_names"] == ["add_tool"]
+    assert any("add_tool" in instruction for instruction in context.instructions)
+    assert len(context.tools) == 1
+    assert isinstance(context.tools[0], MontyExecuteCodeTool)
+    # The injected tool is a per-run snapshot, not the provider's stored copy.
+    assert context.tools[0] is not provider._execute_code_tool  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("tool_description_format", ["compact", "json", {"add_tool": "json"}])
+async def test_provider_parameter_documentation_and_run_state(tool_description_format: Any) -> None:
+    provider = MontyCodeActProvider(tools=[add_tool, mul_tool], tool_description_format=tool_description_format)
+    context = SessionContext(input_messages=[])
+    state: dict[str, Any] = {}
+    await provider.before_run(agent=MagicMock(), session=None, context=context, state=state)
+    run_tool = context.tools[0]
+    assert isinstance(run_tool, MontyExecuteCodeTool)
+    instructions = "\n".join(context.instructions)
+    expected_registry = instructions_module._format_tool_summaries(
+        [add_tool, mul_tool], tool_description_format=tool_description_format
+    )
+    assert expected_registry in run_tool.description
+    assert expected_registry in instructions
+    assert "Provider-owned sandbox tools are not exposed separately" in instructions
+    assert state["monty_codeact"]["tool_description_format"] == tool_description_format
+    assert run_tool.to_dict()["description"] == run_tool.description
+
+
+async def test_provider_copies_format_mapping_and_snapshots_dynamic_registry() -> None:
+    formats: dict[str, Literal["compact", "json"]] = {"add_tool": "json", "mul_tool": "json"}
+    configuration: Mapping[str, Literal["compact", "json"]] = types.MappingProxyType(formats)
+    provider = MontyCodeActProvider(tools=[add_tool], tool_description_format=configuration)
+    formats["add_tool"] = "compact"
+    first = SessionContext(input_messages=[])
+    await provider.before_run(agent=MagicMock(), session=None, context=first, state={})
+    first_tool = first.tools[0]
+    assert isinstance(first_tool, MontyExecuteCodeTool)
+    first_description = first_tool.description
+    assert _json_schemas(first_description) == [add_tool.parameters()]
+    provider.clear_tools()
+    provider.add_tools([mul_tool])
+    second = SessionContext(input_messages=[])
+    state: dict[str, Any] = {}
+    await provider.before_run(agent=MagicMock(), session=None, context=second, state=state)
+    second_tool = second.tools[0]
+    assert isinstance(second_tool, MontyExecuteCodeTool)
+    assert _json_schemas(second_tool.description) == [mul_tool.parameters()]
+    assert state["monty_codeact"]["tool_description_format"] == {"add_tool": "json", "mul_tool": "json"}
+    assert first_tool.description == first_description
+
+
+def test_provider_delegates_tool_management_to_internal_tool() -> None:
+    provider = MontyCodeActProvider()
+    provider.add_tools([add_tool, mul_tool])
+    assert [t.name for t in provider.get_tools()] == ["add_tool", "mul_tool"]
+
+    provider.remove_tool("add_tool")
+    assert [t.name for t in provider.get_tools()] == ["mul_tool"]
+
+    provider.clear_tools()
+    assert provider.get_tools() == []
+
+
+def test_provider_delegates_file_mount_management_to_internal_tool(tmp_path: Path) -> None:
+    provider = MontyCodeActProvider()
+    provider.add_file_mounts((tmp_path, "/work"))
+
+    assert [mount.mount_path for mount in provider.get_file_mounts()] == ["/work"]
+
+    provider.remove_file_mount("/work")
+    assert provider.get_file_mounts() == []
+
+    provider.add_file_mounts((tmp_path, "/again"))
+    provider.clear_file_mounts()
+    assert provider.get_file_mounts() == []
+
+
+# ---------------------------------------------------------------------------
+# generate_type_stubs - signature smoke test
+# ---------------------------------------------------------------------------
+
+
+def test_generate_type_stubs_emits_dsl_and_tool_signatures() -> None:
+    def custom(x: int, y: str = "z") -> bool:
+        """Stub-test tool."""
+        return True
+
+    stubs = bridge_module.generate_type_stubs({"custom": custom})
+
+    assert "async def call_tool(name: str, **kwargs: Any) -> Any:" in stubs
+    assert "async def custom(x: int, y: str = ...) -> bool:" in stubs
+    assert "when_any" not in stubs
+
+
+def test_generate_type_stubs_preserves_none_and_optional() -> None:
+
+    def nullable_return(x: int) -> None:
+        """Returns nothing."""
+        return
+
+    def optional_param(x: int | None = None) -> bool:  # noqa: UP045 - intentional
+        """Optional via typing.Optional."""
+        return x is None
+
+    def union_param(x: int | str | None) -> str:  # noqa: UP007 - intentional
+        """Union with None."""
+        return str(x)
+
+    stubs = bridge_module.generate_type_stubs({
+        "nullable_return": nullable_return,
+        "optional_param": optional_param,
+        "union_param": union_param,
+    })
+
+    # ``None`` return must round-trip as None, not Any.
+    assert "async def nullable_return(x: int) -> None:" in stubs
+    # ``Optional[X]`` is ``Union[X, None]`` at runtime; preserve None.
+    assert "async def optional_param(x: int | None = ...) -> bool:" in stubs
+    # Multi-arm union with None.
+    assert "async def union_param(x: int | str | None) -> str:" in stubs
+
+
+def test_generate_type_stubs_skips_non_identifier_tool_names() -> None:
+    """Tool names that are not valid Python identifiers must not be splatted into stub source.
+
+    The model can still reach them via ``call_tool("weird-name", ...)`` at
+    runtime; they just don't get type-checked stubs.
+    """
+
+    def evil(x: int) -> int:
+        return x
+
+    def normal(x: int) -> int:
+        return x
+
+    stubs = bridge_module.generate_type_stubs({
+        # Hyphens are not valid identifier chars.
+        "weird-name": evil,
+        # Newlines in the name would inject arbitrary stub source.
+        "broken\n    pass\nasync def injected": evil,
+        # Python keywords are valid identifiers per ``str.isidentifier()`` but
+        # would still produce uncompilable stubs.
+        "async": evil,
+        # Real tool that should still appear.
+        "normal": normal,
+    })
+
+    assert "async def normal(x: int) -> int:" in stubs
+    assert "weird-name" not in stubs
+    assert "injected" not in stubs
+    assert "async def async(" not in stubs
+
+
+async def test_invoke_tool_awaits_partial_wrapped_async_method() -> None:
+    """A FunctionTool callback registered via partial(FunctionTool.invoke, ...) must be awaited.
+
+    Regression for PR #5915 review feedback: relying on ``inspect.iscoroutinefunction``
+    to choose between ``await`` and ``asyncio.to_thread`` is fragile for
+    ``functools.partial`` wrappers (cpython#98590) and would surface the
+    returned coroutine as a JSON-serialization error instead of the real
+    tool result. The bridge must always ``await`` entries in ``self.tool_map``.
+    """
+    from functools import partial
+
+    from agent_framework_monty._monty_bridge import InlineCodeBridge
+
+    @tool
+    def adder(a: Annotated[int, ""], b: Annotated[int, ""]) -> int:
+        """Add."""
+        return a + b
+
+    # Mirrors what _make_tool_callback returns.
+    cb = partial(adder.invoke, skip_parsing=True)
+    bridge = InlineCodeBridge({"adder": cb})
+
+    cid, payload = await bridge._invoke_tool(7, "adder", {"a": 6, "b": 7})
+    assert cid == 7
+    assert payload == {"return_value": 13}, payload
+
+
+async def test_tool_callbacks_share_registered_invocation_limit() -> None:
+    @tool(max_invocations=1)
+    def limited() -> int:
+        return 42
+
+    first = execute_code_module._make_tool_callback(limited)
+    second = execute_code_module._make_tool_callback(limited)
+    assert await first() == 42
+    assert limited.invocation_count == 1
+    for callback in (first, second, execute_code_module._make_tool_callback(limited)):
+        with pytest.raises(ToolException, match="maximum invocation limit"):
+            await callback()
+    assert limited.invocation_count == 1
+
+    limited.invocation_count = 0
+    assert await second() == 42
+    assert limited.invocation_count == 1
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+async def test_tool_callbacks_share_registered_exception_limit(is_async: bool) -> None:
+    def fail() -> int:
+        raise ValueError("expected failure")
+
+    async def async_fail() -> int:
+        await asyncio.sleep(0)
+        return fail()
+
+    failing = FunctionTool(name="failing", func=async_fail if is_async else fail, max_invocation_exceptions=1)
+    with pytest.raises(ValueError, match="expected failure"):
+        await execute_code_module._make_tool_callback(failing)()
+    with pytest.raises(ToolException, match="maximum exception limit"):
+        await execute_code_module._make_tool_callback(failing)()
+    assert failing.invocation_count == 1
+    assert failing.invocation_exception_count == 1
+
+
+async def test_concurrent_tool_callbacks_share_registered_invocation_limit() -> None:
+    @tool(max_invocations=1)
+    async def limited() -> int:
+        await asyncio.sleep(0)
+        return 42
+
+    bridges = [
+        bridge_module.InlineCodeBridge({"limited": execute_code_module._make_tool_callback(limited)}) for _ in range(8)
+    ]
+    results = await asyncio.gather(*(bridge._invoke_tool(index, "limited", {}) for index, bridge in enumerate(bridges)))
+
+    assert sum(payload == {"return_value": 42} for _, payload in results) == 1
+    assert sum(payload.get("exc_type") == "ToolException" for _, payload in results) == 7
+    assert limited.invocation_count == 1
+
+
+async def test_tool_callback_preserves_bound_instance_and_result_parser() -> None:
+    parser = MagicMock(return_value=[Content.from_text("parsed")])
+
+    class Counter:
+        def __init__(self) -> None:
+            self.value = 0
+
+        @tool(max_invocations=1, result_parser=parser)
+        def increment(self) -> int:
+            self.value += 1
+            return self.value
+
+    first_owner = Counter()
+    second_owner = Counter()
+    first_tool = first_owner.increment
+    second_tool = second_owner.increment
+
+    assert await execute_code_module._make_tool_callback(first_tool)() == 1
+    with pytest.raises(ToolException, match="maximum invocation limit"):
+        await execute_code_module._make_tool_callback(first_tool)()
+    assert await execute_code_module._make_tool_callback(second_tool)() == 1
+    assert first_owner.value == second_owner.value == 1
+    assert first_tool.invocation_count == second_tool.invocation_count == 1
+    assert first_tool.result_parser is parser
+    parser.assert_not_called()
+
+    first_tool.invocation_count = 0
+    assert await first_tool.invoke() == [Content.from_text("parsed")]
+    parser.assert_called_once_with(2)
+
+
+async def test_provider_runs_share_registered_tool_invocation_limit() -> None:
+    @tool(max_invocations=1)
+    def limited() -> int:
+        return 42
+
+    provider = MontyCodeActProvider(tools=[limited])
+    for run_index in range(2):
+        context = SessionContext(input_messages=[])
+        await provider.before_run(agent=MagicMock(), session=None, context=context, state={})
+        run_tool = context.tools[0]
+        assert isinstance(run_tool, MontyExecuteCodeTool)
+        assert run_tool.get_tools()[0] is limited
+        script = _set_script(
+            _FakeFunctionSnapshot(function_name="limited", call_id=1),
+            _FakeFutureSnapshot(pending_call_ids=[1]),
+            _FakeMontyComplete(),
+        )
+        await run_tool._run_code(code="await limited()")
+        payload = script.resume_log[-1][2][1]
+        if run_index == 0:
+            assert payload == {"return_value": 42}
+        else:
+            assert payload["exc_type"] == "ToolException"
+            assert "maximum invocation limit" in payload["message"]
+        assert limited.invocation_count == 1

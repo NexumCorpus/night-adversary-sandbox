@@ -1,0 +1,1537 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Tests for AGUIChatClient."""
+
+import asyncio
+import json
+from collections.abc import AsyncGenerator, Awaitable, Mapping, MutableSequence
+from contextlib import AbstractContextManager, nullcontext
+from typing import Any, cast
+
+import httpx
+import pytest
+from ag_ui.core import Interrupt, ResumeEntry
+from agent_framework import (
+    Agent,
+    AgentResponseUpdate,
+    ChatOptions,
+    ChatResponse,
+    ChatResponseUpdate,
+    Content,
+    Message,
+    ResponseStream,
+    tool,
+)
+from pytest import MonkeyPatch
+
+from agent_framework_ag_ui._client import AGUIChatClient
+from agent_framework_ag_ui._event_converters import AGUIEventConverter
+from agent_framework_ag_ui._http_service import AGUIHttpService
+
+
+class StubAGUIChatClient(AGUIChatClient):
+    """Testable wrapper exposing protected helpers."""
+
+    @property
+    def http_service(self) -> AGUIHttpService:
+        """Expose http service for monkeypatching."""
+        return self._http_service
+
+    def extract_state_from_messages(self, messages: list[Message]) -> tuple[list[Message], dict[str, Any] | None]:
+        """Expose state extraction helper."""
+        return self._extract_state_from_messages(messages)
+
+    def convert_messages_to_agui_format(self, messages: list[Message]) -> list[dict[str, Any]]:
+        """Expose message conversion helper."""
+        return self._convert_messages_to_agui_format(messages)
+
+    def get_thread_id(self, options: ChatOptions[Any] | dict[str, Any] | None) -> str:
+        """Expose thread id helper."""
+        return self._get_thread_id(options)  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+
+    def inner_get_response(
+        self,
+        *,
+        messages: MutableSequence[Message],
+        options: Mapping[str, Any],
+        stream: bool = False,
+    ) -> Awaitable[ChatResponse] | ResponseStream[ChatResponseUpdate, ChatResponse]:
+        """Proxy to protected response call."""
+        return self._inner_get_response(messages=messages, options=options, stream=stream)  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+
+
+class _GatedSSEStream(httpx.AsyncByteStream):
+    """Yield one SSE chunk and keep the next event gated until another pull."""
+
+    def __init__(
+        self,
+        *,
+        aclose_error: BaseException | None = None,
+        iteration_error: BaseException | None = None,
+    ) -> None:
+        self._tail_release = asyncio.Event()
+        self._iterator: AsyncGenerator[bytes, None] | None = None
+        self.aclose_error = aclose_error
+        self.iteration_error = iteration_error
+        self.tail_waiting = asyncio.Event()
+        self.chunk_indexes_yielded: list[int] = []
+        self.tail_requested = False
+        self.tail_yielded = False
+        self.exhausted = False
+        self.aclose_calls = 0
+        self.closed = False
+        self.iterator_finally = False
+        events = [
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "first"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "later"},
+        ]
+        self._chunks = [f"data: {json.dumps(event)}\n\n".encode() for event in events]
+
+    def __aiter__(self) -> AsyncGenerator[bytes, None]:
+        if self._iterator is None:
+            self._iterator = self._iterate()
+        return self._iterator
+
+    async def _iterate(self) -> AsyncGenerator[bytes, None]:
+        try:
+            self.chunk_indexes_yielded.append(0)
+            yield self._chunks[0]
+            self.tail_requested = True
+            self.tail_waiting.set()
+            await self._tail_release.wait()
+            if self.iteration_error is not None:
+                raise self.iteration_error
+            self.chunk_indexes_yielded.append(1)
+            self.tail_yielded = True
+            yield self._chunks[1]
+            self.exhausted = True
+        finally:
+            self.iterator_finally = True
+
+    def release_tail(self) -> None:
+        self._tail_release.set()
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        self.closed = True
+        self._tail_release.set()
+        if self._iterator is not None:
+            await self._iterator.aclose()
+        if self.aclose_error is not None and self.aclose_calls == 1:
+            raise self.aclose_error
+
+
+class _FailingAGUIEventStream:
+    """Yield a public AG-UI event, then fail or wait while its close fails."""
+
+    def __init__(
+        self,
+        event: dict[str, Any],
+        *,
+        close_error: OSError,
+        iteration_error: BaseException | None = None,
+        wait_after_event: bool = False,
+    ) -> None:
+        self._event = event
+        self._close_error = close_error
+        self._iteration_error = iteration_error
+        self._wait_after_event = wait_after_event
+        self._index = 0
+        self._release = asyncio.Event()
+        self.waiting = asyncio.Event()
+        self.aclose_calls = 0
+        self.aclose_completed = 0
+
+    def __aiter__(self) -> "_FailingAGUIEventStream":
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        if self._index == 0:
+            self._index += 1
+            return self._event
+        if self._wait_after_event:
+            self.waiting.set()
+            await self._release.wait()
+        if self._iteration_error is not None:
+            raise self._iteration_error
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.aclose_calls += 1
+        self._release.set()
+        await asyncio.sleep(0)
+        self.aclose_completed += 1
+        if self.aclose_calls == 1:
+            raise self._close_error
+
+
+class TestAGUIChatClient:
+    """Test suite for AGUIChatClient."""
+
+    async def test_client_initialization(self) -> None:
+        """Test client initialization."""
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+
+        assert client.http_service is not None
+        assert client.http_service.endpoint.startswith("http://localhost:8888")
+
+    async def test_client_context_manager(self) -> None:
+        """Test client as async context manager."""
+        async with StubAGUIChatClient(endpoint="http://localhost:8888/") as client:
+            assert client is not None
+
+    @pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+    @pytest.mark.parametrize("set_cookie", [False, True], ids=["no_cookie_control", "response_cookie"])
+    @pytest.mark.parametrize("first_status", [200, 503], ids=["successful_response", "failed_response"])
+    @pytest.mark.parametrize("second_thread_id", ["thread_a", "thread_b"], ids=["same_thread", "different_thread"])
+    async def test_default_client_does_not_replay_response_cookies_between_runs(
+        self, monkeypatch: MonkeyPatch, stream: bool, set_cookie: bool, first_status: int, second_thread_id: str
+    ) -> None:
+        """Response cookies must not persist between runs, regardless of thread ID."""
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            payload = json.loads(await request.aread())
+            headers = {"content-type": "text/event-stream"}
+            if set_cookie and len(requests) == 1:
+                headers["set-cookie"] = "session=thread-a-only; Path=/; HttpOnly; Secure"
+            events = [
+                {"type": "RUN_STARTED", "threadId": payload["thread_id"], "runId": payload["run_id"]},
+                {"type": "TEXT_MESSAGE_START", "messageId": "msg_1", "role": "assistant"},
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": "ok"},
+                {"type": "TEXT_MESSAGE_END", "messageId": "msg_1"},
+                {"type": "RUN_FINISHED", "threadId": payload["thread_id"], "runId": payload["run_id"]},
+            ]
+            return httpx.Response(
+                first_status if len(requests) == 1 else 200,
+                headers=headers,
+                content="".join(f"data: {json.dumps(event)}\n\n" for event in events).encode(),
+            )
+
+        async with httpx.MockTransport(handler) as transport:
+
+            async def handle_async_request(
+                _transport: httpx.AsyncHTTPTransport, request: httpx.Request
+            ) -> httpx.Response:
+                return await transport.handle_async_request(request)
+
+            # Replace only network I/O, preserving the default client's real cookie handling.
+            monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request)
+            async with StubAGUIChatClient(endpoint="https://agui.example.test/") as client:
+                http_client = client.http_service.http_client
+                for index, thread_id in enumerate(("thread_a", second_thread_id)):
+                    messages = [Message(role="user", contents=["Hello"])]
+                    expected_error: AbstractContextManager[object] = (
+                        pytest.raises(httpx.HTTPStatusError, match="503")
+                        if index == 0 and first_status == 503
+                        else nullcontext()
+                    )
+                    with expected_error:
+                        if stream:
+                            updates = [
+                                update
+                                async for update in client.get_response(
+                                    messages, stream=True, options={"metadata": {"thread_id": thread_id}}
+                                )
+                            ]
+                            assert "".join(update.text for update in updates) == "ok"
+                        else:
+                            response = await client.get_response(
+                                messages, options={"metadata": {"thread_id": thread_id}}
+                            )
+                            assert response.text == "ok"
+                    assert client.http_service.http_client is http_client
+
+        assert len(requests) == 2
+        assert [json.loads(request.content)["thread_id"] for request in requests] == ["thread_a", second_thread_id]
+        assert all(request.method == "POST" for request in requests)
+        assert all(request.headers["accept"] == "text/event-stream" for request in requests)
+        assert requests[0].headers.get("cookie") is None
+        assert requests[1].headers.get("cookie") is None
+        assert not http_client.cookies
+
+    @pytest.mark.parametrize("stream", [False, True], ids=["non_streaming", "streaming"])
+    async def test_default_client_does_not_replay_cookies_while_another_response_is_open(
+        self, monkeypatch: MonkeyPatch, stream: bool
+    ) -> None:
+        """Response cookies must be rejected before an overlapping request is built."""
+        requests: list[httpx.Request] = []
+        first_headers_received = asyncio.Event()
+        second_request_received = asyncio.Event()
+        response_body = (
+            b'data: {"type":"TEXT_MESSAGE_START","messageId":"msg_1","role":"assistant"}\n\n'
+            b'data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"msg_1","delta":"ok"}\n\n'
+            b'data: {"type":"TEXT_MESSAGE_END","messageId":"msg_1"}\n\n'
+        )
+
+        class PendingResponseStream(httpx.AsyncByteStream):
+            async def __aiter__(self) -> AsyncGenerator[bytes, None]:
+                # HTTPX has processed response headers before it starts reading this body.
+                first_headers_received.set()
+                await second_request_received.wait()
+                yield response_body
+
+        async def handle_async_request(_transport: httpx.AsyncHTTPTransport, request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            await request.aread()
+            if len(requests) == 1:
+                return httpx.Response(
+                    200,
+                    headers={
+                        "content-type": "text/event-stream",
+                        "set-cookie": "session=thread-a-only; Path=/; HttpOnly; Secure",
+                    },
+                    stream=PendingResponseStream(),
+                )
+            second_request_received.set()
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=response_body)
+
+        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle_async_request)
+        async with StubAGUIChatClient(endpoint="https://agui.example.test/") as client:
+            http_client = client.http_service.http_client
+
+            async def run(thread_id: str) -> str:
+                if thread_id == "thread_b":
+                    await first_headers_received.wait()
+                messages = [Message(role="user", contents=["Hello"])]
+                if stream:
+                    updates = [
+                        update
+                        async for update in client.get_response(
+                            messages, stream=True, options={"metadata": {"thread_id": thread_id}}
+                        )
+                    ]
+                    return "".join(update.text for update in updates)
+                response = await client.get_response(messages, options={"metadata": {"thread_id": thread_id}})
+                return response.text
+
+            tasks = [asyncio.create_task(run(thread_id)) for thread_id in ("thread_a", "thread_b")]
+            try:
+                responses = await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            assert responses == ["ok", "ok"]
+            assert client.http_service.http_client is http_client
+
+        assert len(requests) == 2
+        assert [json.loads(request.content)["thread_id"] for request in requests] == ["thread_a", "thread_b"]
+        assert requests[0].headers.get("cookie") is None
+        assert requests[1].headers.get("cookie") is None
+        assert not http_client.cookies
+
+    @pytest.mark.parametrize("raise_in_context", [False, True], ids=["normal_exit", "exception_exit"])
+    async def test_context_manager_closes_owned_http_client(self, raise_in_context: bool) -> None:
+        """Owned HTTP clients close on both normal and exceptional context exits."""
+        client = StubAGUIChatClient(endpoint="https://agui.example.test/", timeout=17.0)
+        http_client = client.http_service.http_client
+        expected_error: AbstractContextManager[object] = (
+            pytest.raises(RuntimeError, match="context failed") if raise_in_context else nullcontext()
+        )
+        try:
+            with expected_error:
+                async with client:
+                    assert not http_client.is_closed
+                    assert http_client.timeout == httpx.Timeout(17.0)
+                    if raise_in_context:
+                        raise RuntimeError("context failed")
+
+            assert http_client.is_closed
+            await client.close()
+            assert http_client.is_closed
+        finally:
+            await http_client.aclose()
+
+    @pytest.mark.parametrize("raise_in_context", [False, True], ids=["normal_exit", "exception_exit"])
+    async def test_context_manager_preserves_supplied_http_client(self, raise_in_context: bool) -> None:
+        """Caller-owned clients retain their configuration and remain usable after cleanup."""
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200,
+                headers={
+                    "content-type": "text/event-stream",
+                    "set-cookie": "response=session-only; Path=/; HttpOnly; Secure",
+                },
+                content=(
+                    b'data: {"type":"RUN_STARTED","threadId":"thread_1","runId":"run_1"}\n\n'
+                    b'data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"msg_1","delta":"ok"}\n\n'
+                    b'data: {"type":"RUN_FINISHED","threadId":"thread_1","runId":"run_1"}\n\n'
+                ),
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            headers={"Authorization": "Bearer test-token"},
+            cookies={"configured": "caller-owned"},
+            timeout=17.0,
+        ) as http_client:
+            client = StubAGUIChatClient(endpoint="https://agui.example.test/", http_client=http_client)
+            expected_error: AbstractContextManager[object] = (
+                pytest.raises(RuntimeError, match="context failed") if raise_in_context else nullcontext()
+            )
+            with expected_error:
+                async with client:
+                    assert client.http_service.http_client is http_client
+                    chat_response = await client.get_response(
+                        [Message(role="user", contents=["Hello"])],
+                        options={"metadata": {"thread_id": "thread_1"}},
+                    )
+                    assert chat_response.text == "ok"
+                    if raise_in_context:
+                        raise RuntimeError("context failed")
+
+            await client.close()
+            assert not http_client.is_closed
+            assert http_client.headers["authorization"] == "Bearer test-token"
+            assert http_client.cookies["configured"] == "caller-owned"
+            assert http_client.cookies["response"] == "session-only"
+            assert http_client.timeout == httpx.Timeout(17.0)
+            http_response = await http_client.get("https://agui.example.test/health")
+            assert http_response.status_code == 200
+
+        assert [request.method for request in requests] == ["POST", "GET"]
+        assert all(request.headers["authorization"] == "Bearer test-token" for request in requests)
+        assert requests[0].headers["cookie"] == "configured=caller-owned"
+        assert set(requests[1].headers["cookie"].split("; ")) == {"configured=caller-owned", "response=session-only"}
+
+    async def test_extract_state_from_messages_no_state(self) -> None:
+        """Test state extraction when no state is present."""
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        messages = [
+            Message(role="user", contents=["Hello"]),
+            Message(role="assistant", contents=["Hi there"]),
+        ]
+
+        result_messages, state = client.extract_state_from_messages(messages)
+
+        assert result_messages == messages
+        assert state is None
+
+    async def test_extract_state_from_messages_with_state(self) -> None:
+        """A marked state carrier populates the request state."""
+        from agent_framework_ag_ui import state_carrier
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+
+        state_data = {"key": "value", "count": 42}
+
+        messages = [
+            Message(role="user", contents=["Hello"]),
+            Message(
+                role="user",
+                contents=[state_carrier(state_data)],
+            ),
+        ]
+
+        result_messages, state = client.extract_state_from_messages(messages)
+
+        assert len(result_messages) == 1
+        assert result_messages[0].text == "Hello"
+        assert state == state_data
+
+    async def test_extract_state_from_messages_removes_historical_carriers_and_uses_latest_state(self) -> None:
+        """Historical carriers are removed and the most recent carrier supplies state."""
+        from agent_framework_ag_ui import state_carrier
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        old_carrier = Message(role="user", contents=[state_carrier({"version": "old"})])
+        new_carrier = Message(role="user", contents=[state_carrier({"version": "new"})])
+        messages = [
+            Message(role="user", contents=["Initial prompt"]),
+            old_carrier,
+            Message(role="assistant", contents=["Initial response"]),
+            new_carrier,
+            Message(role="user", contents=["Follow-up prompt"]),
+        ]
+
+        result_messages, state = client.extract_state_from_messages(messages)
+
+        assert result_messages == [messages[0], messages[2], messages[4]]
+        assert state == {"version": "new"}
+
+    async def test_explicit_final_carrier_wins_over_legacy_fallback(self) -> None:
+        """Legacy mode does not reinterpret an earlier document after removing a final carrier."""
+        from agent_framework_ag_ui import state_carrier
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        messages = [
+            Message(
+                role="user",
+                contents=[Content.from_data(b'{"document":"keep"}', media_type="application/json")],
+            ),
+            Message(role="user", contents=[state_carrier({"source": "explicit"})]),
+        ]
+
+        result_messages, state = client._extract_state_from_messages(
+            messages,
+            allow_legacy_state_carrier=True,
+        )
+
+        assert result_messages == messages[:1]
+        assert state == {"source": "explicit"}
+
+    async def test_extract_state_from_messages_with_parameterized_data_uri(self) -> None:
+        """Test state extraction from JSON data URIs with media type parameters."""
+        import base64
+
+        from agent_framework_ag_ui._state import STATE_CARRIER_KEY
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+
+        state_data = {"key": "value", "count": 42}
+        state_json = json.dumps(state_data)
+        state_b64 = base64.b64encode(state_json.encode("utf-8")).decode("utf-8")
+
+        messages = [
+            Message(role="user", contents=["Hello"]),
+            Message(
+                role="user",
+                contents=[
+                    Content.from_uri(
+                        uri=f"data:application/json;charset=utf-8;base64,{state_b64}",
+                        additional_properties={STATE_CARRIER_KEY: True},
+                    )
+                ],
+            ),
+        ]
+
+        result_messages, state = client.extract_state_from_messages(messages)
+
+        assert len(result_messages) == 1
+        assert result_messages[0].text == "Hello"
+        assert state == state_data
+
+    async def test_extract_state_invalid_json(self) -> None:
+        """Test state extraction with invalid JSON."""
+        import base64
+
+        from agent_framework_ag_ui._state import STATE_CARRIER_KEY
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+
+        invalid_json = "not valid json"
+        state_b64 = base64.b64encode(invalid_json.encode("utf-8")).decode("utf-8")
+
+        messages = [
+            Message(
+                role="user",
+                contents=[
+                    Content.from_uri(
+                        uri=f"data:application/json;base64,{state_b64}",
+                        additional_properties={STATE_CARRIER_KEY: True},
+                    )
+                ],
+            ),
+        ]
+
+        result_messages, state = client.extract_state_from_messages(messages)
+
+        assert result_messages == []
+        assert state is None
+
+    async def test_extract_state_invalid_base64(self) -> None:
+        """Test state extraction with invalid base64."""
+        from agent_framework_ag_ui._state import STATE_CARRIER_KEY
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+
+        messages = [
+            Message(
+                role="user",
+                contents=[
+                    Content.from_uri(
+                        uri="data:application/json;base64,not-valid-base64!",
+                        additional_properties={STATE_CARRIER_KEY: True},
+                    )
+                ],
+            ),
+        ]
+
+        result_messages, state = client.extract_state_from_messages(messages)
+
+        assert result_messages == []
+        assert state is None
+
+    async def test_convert_messages_to_agui_format(self) -> None:
+        """Test message conversion to AG-UI format."""
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        messages = [
+            Message(role="user", contents=["What is the weather?"]),
+            Message(role="assistant", contents=["Let me check."], message_id="msg_123"),
+        ]
+
+        agui_messages = client.convert_messages_to_agui_format(messages)
+
+        assert len(agui_messages) == 2
+        assert agui_messages[0]["role"] == "user"
+        assert agui_messages[0]["content"] == "What is the weather?"
+        assert agui_messages[1]["role"] == "assistant"
+        assert agui_messages[1]["content"] == "Let me check."
+        assert agui_messages[1]["id"] == "msg_123"
+
+    async def test_sends_multimodal_messages_in_request(self) -> None:
+        """The client sends ordered multimodal content in the HTTP request JSON."""
+        captured_request: dict[str, Any] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured_request.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=(
+                    b'data: {"type":"RUN_STARTED","threadId":"thread_1","runId":"run_1"}\n\n'
+                    b'data: {"type":"TEXT_MESSAGE_CONTENT","messageId":"msg_1","delta":"ok"}\n\n'
+                    b'data: {"type":"RUN_FINISHED","threadId":"thread_1","runId":"run_1"}\n\n'
+                ),
+            )
+
+        message = Message(
+            role="user",
+            contents=[
+                Content.from_text("describe this"),
+                Content.from_uri("https://example.com/cat.png", media_type="image/png"),
+                Content.from_data(b"abc", media_type="image/png"),
+            ],
+            message_id="msg-request",
+        )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = StubAGUIChatClient(endpoint="http://localhost:8888/", http_client=http_client)
+            response = await client.inner_get_response(messages=[message], options={})
+
+        assert response is not None
+        assert captured_request["messages"] == [
+            {
+                "id": "msg-request",
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "value": "https://example.com/cat.png",
+                            "mimeType": "image/png",
+                        },
+                    },
+                    {
+                        "type": "image",
+                        "source": {"type": "data", "value": "YWJj", "mimeType": "image/png"},
+                    },
+                ],
+            }
+        ]
+
+    async def test_sends_mixed_json_attachment_when_legacy_compatibility_is_enabled(self) -> None:
+        """Legacy compatibility does not consume a prompt with a JSON attachment."""
+        captured_request: dict[str, Any] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured_request.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=(
+                    b'data: {"type":"RUN_STARTED","threadId":"thread_1","runId":"run_1"}\n\n'
+                    b'data: {"type":"RUN_FINISHED","threadId":"thread_1","runId":"run_1"}\n\n'
+                ),
+            )
+
+        message = Message(
+            role="user",
+            contents=[
+                Content.from_text("summarize the attached JSON document"),
+                Content.from_data(b'{"document":"keep me"}', media_type="application/json"),
+            ],
+            message_id="msg-json-document",
+        )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = StubAGUIChatClient(endpoint="http://localhost:8888/", http_client=http_client)
+            response = await client.inner_get_response(
+                messages=[message],
+                options={"allow_legacy_state_carrier": True},
+            )
+
+        assert response is not None
+        assert "state" not in captured_request
+        assert captured_request["messages"] == [
+            {
+                "id": "msg-json-document",
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "summarize the attached JSON document"},
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "data",
+                            "value": "eyJkb2N1bWVudCI6ImtlZXAgbWUifQ==",
+                            "mimeType": "application/json",
+                        },
+                    },
+                ],
+            }
+        ]
+
+    async def test_sends_json_attachment_without_state_carrier_in_request(self) -> None:
+        """An unmarked JSON-only document is sent as AG-UI document input."""
+        captured_request: dict[str, Any] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured_request.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=(
+                    b'data: {"type":"RUN_STARTED","threadId":"thread_1","runId":"run_1"}\n\n'
+                    b'data: {"type":"RUN_FINISHED","threadId":"thread_1","runId":"run_1"}\n\n'
+                ),
+            )
+
+        message = Message(
+            role="user",
+            contents=[Content.from_data(b'{"document":"keep me"}', media_type="application/json")],
+            message_id="msg-json-only-document",
+        )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = StubAGUIChatClient(endpoint="http://localhost:8888/", http_client=http_client)
+            response = await client.inner_get_response(messages=[message], options={})
+
+        assert response is not None
+        assert "state" not in captured_request
+        assert captured_request["messages"] == [
+            {
+                "id": "msg-json-only-document",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "data",
+                            "value": "eyJkb2N1bWVudCI6ImtlZXAgbWUifQ==",
+                            "mimeType": "application/json",
+                        },
+                    }
+                ],
+            }
+        ]
+
+    async def test_sends_legacy_json_state_with_compatibility_option(self) -> None:
+        """The legacy option extracts an unmarked final JSON state during migration."""
+        captured_request: dict[str, Any] = {}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured_request.update(json.loads(request.content))
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=(
+                    b'data: {"type":"RUN_STARTED","threadId":"thread_1","runId":"run_1"}\n\n'
+                    b'data: {"type":"RUN_FINISHED","threadId":"thread_1","runId":"run_1"}\n\n'
+                ),
+            )
+
+        message = Message(
+            role="user",
+            contents=[Content.from_data(b'{"legacy":"keep"}', media_type="application/json")],
+            message_id="msg-legacy-state",
+        )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = StubAGUIChatClient(endpoint="http://localhost:8888/", http_client=http_client)
+            with pytest.warns(DeprecationWarning, match="state_carrier"):
+                response = await client.inner_get_response(
+                    messages=[message],
+                    options={"allow_legacy_state_carrier": True},
+                )
+
+        assert response is not None
+        assert captured_request["state"] == {"legacy": "keep"}
+        assert captured_request["messages"] == []
+
+    async def test_get_thread_id_from_metadata(self) -> None:
+        """Test thread ID extraction from metadata."""
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        chat_options = ChatOptions(metadata={"thread_id": "existing_thread_123"})
+
+        thread_id = client.get_thread_id(chat_options)
+
+        assert thread_id == "existing_thread_123"
+
+    async def test_get_thread_id_generation(self) -> None:
+        """Test automatic thread ID generation."""
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        chat_options = ChatOptions()
+
+        thread_id = client.get_thread_id(chat_options)
+
+        assert thread_id.startswith("thread_")
+        assert len(thread_id) > 7
+
+    async def test_get_response_streaming(self, monkeypatch: MonkeyPatch) -> None:
+        """Test streaming response method."""
+        mock_events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": "Hello"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": " world"},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            for event in mock_events:
+                yield event
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        messages = [Message(role="user", contents=["Test message"])]
+        chat_options = ChatOptions()
+
+        updates: list[ChatResponseUpdate] = []
+        stream = client.inner_get_response(messages=messages, stream=True, options=chat_options)
+        assert isinstance(stream, ResponseStream)
+        async for update in stream:
+            updates.append(cast(ChatResponseUpdate, update))
+
+        assert len(updates) == 4
+        assert updates[0].additional_properties is not None
+        assert updates[0].additional_properties["thread_id"] == "thread_1"
+
+        first_content = updates[1].contents[0]
+        second_content = updates[2].contents[0]
+        assert first_content.type == "text"
+        assert second_content.type == "text"
+        assert first_content.text == "Hello"
+        assert second_content.text == " world"
+
+    @pytest.mark.timeout(10)
+    @pytest.mark.parametrize(
+        ("caller", "function_invocation_enabled", "close_mode"),
+        [
+            pytest.param("client", True, "explicit_close", id="client-fi_default-explicit_close"),
+            pytest.param("client", True, "async_with_break", id="client-fi_default-async_with_break"),
+            pytest.param("client", False, "explicit_close", id="client-fi_disabled-explicit_close"),
+            pytest.param("client", False, "async_with_break", id="client-fi_disabled-async_with_break"),
+            pytest.param("agent", True, "explicit_close", id="agent-fi_default-explicit_close"),
+            pytest.param("agent", True, "async_with_break", id="agent-fi_default-async_with_break"),
+            pytest.param("agent", False, "explicit_close", id="agent-fi_disabled-explicit_close"),
+            pytest.param("agent", False, "async_with_break", id="agent-fi_disabled-async_with_break"),
+        ],
+    )
+    async def test_public_stream_close_releases_http_response(
+        self,
+        caller: str,
+        function_invocation_enabled: bool,
+        close_mode: str,
+    ) -> None:
+        """Closing a public stream releases its HTTP response and preserves supplied clients."""
+        body = _GatedSSEStream()
+        response: httpx.Response | None = None
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal response
+            if request.method == "GET":
+                return httpx.Response(204, request=request)
+            await request.aread()
+            response = httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=body,
+                request=request,
+            )
+            return response
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client_options: dict[str, Any] = {}
+            if not function_invocation_enabled:
+                client_options["function_invocation_configuration"] = {"enabled": False}
+            client = AGUIChatClient(
+                endpoint="https://agui.example.test/run",
+                http_client=http_client,
+                **client_options,
+            )
+            assert client.function_invocation_configuration["enabled"] is function_invocation_enabled
+
+            agent = Agent(client=client) if caller == "agent" else None
+            messages = [Message(role="user", contents=["Question"])]
+            stream = (
+                agent.run(messages, stream=True) if agent is not None else client.get_response(messages, stream=True)
+            )
+
+            def assert_first_chunk_only() -> None:
+                assert response is not None
+                assert not response.is_closed
+                assert body.aclose_calls == 0
+                assert body.chunk_indexes_yielded == [0]
+                assert not body.tail_requested
+                assert not body.tail_yielded
+                assert not body.exhausted
+
+            try:
+                if close_mode == "explicit_close":
+                    # Keep pull and close in one task; wait_for creates a child task on Python 3.10/3.11.
+                    first = await anext(stream)
+                    assert isinstance(first, (ChatResponseUpdate, AgentResponseUpdate))
+                    assert first.text == "first"
+                    assert_first_chunk_only()
+                    await stream.close()
+                else:
+                    async with stream:
+                        async for update in stream:
+                            assert isinstance(update, (ChatResponseUpdate, AgentResponseUpdate))
+                            assert update.text == "first"
+                            assert_first_chunk_only()
+                            break
+
+                assert response is not None
+                assert response.is_closed
+                assert body.aclose_calls == 1
+                assert body.closed
+                assert body.iterator_finally
+                assert body.chunk_indexes_yielded == [0]
+                assert not body.tail_yielded
+                assert not body.exhausted
+
+                await stream.close()
+                assert body.aclose_calls == 1
+
+                if agent is not None:
+                    await agent.close()
+                else:
+                    await client.close()
+                assert not http_client.is_closed
+                health_response = await http_client.get("https://agui.example.test/health")
+                assert health_response.status_code == 204
+            finally:
+                try:
+                    await stream.close()
+                finally:
+                    try:
+                        if response is not None and not response.is_closed:
+                            await response.aclose()
+                    finally:
+                        if agent is not None:
+                            await agent.close()
+                        else:
+                            await client.close()
+
+    @pytest.mark.timeout(10)
+    @pytest.mark.parametrize("caller", ["client", "agent"], ids=["client", "agent"])
+    @pytest.mark.parametrize("failure_kind", ["iteration", "conversion", "cancel"])
+    async def test_primary_failure_survives_event_or_http_body_aclose_error(
+        self,
+        monkeypatch: MonkeyPatch,
+        caller: str,
+        failure_kind: str,
+    ) -> None:
+        """AG-UI keeps event, conversion, and cancellation failures over close errors."""
+        primary = RuntimeError("AG-UI primary failure")
+        close_failure = OSError("stream close failed")
+        body = _GatedSSEStream(aclose_error=close_failure)
+        response: httpx.Response | None = None
+        event_source = (
+            _FailingAGUIEventStream(
+                {"type": "TEXT_MESSAGE_CONTENT", "messageId": "m1", "delta": "first"},
+                close_error=close_failure,
+                iteration_error=primary if failure_kind == "iteration" else None,
+                wait_after_event=failure_kind == "cancel",
+            )
+            if failure_kind != "conversion"
+            else None
+        )
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal response
+            if request.method == "GET":
+                return httpx.Response(204, request=request)
+            await request.aread()
+            response = httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=body,
+                request=request,
+            )
+            return response
+
+        if failure_kind == "conversion":
+
+            def fail_convert_event(_converter: AGUIEventConverter, _event: dict[str, Any]) -> ChatResponseUpdate | None:
+                raise primary
+
+            monkeypatch.setattr(AGUIEventConverter, "convert_event", fail_convert_event)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = AGUIChatClient(
+                endpoint="https://agui.example.test/run",
+                http_client=http_client,
+                function_invocation_configuration={"enabled": False},
+            )
+            agent = Agent(client=client) if caller == "agent" else None
+            messages = [Message(role="user", contents=["Question"])]
+            stream = (
+                agent.run(messages, stream=True) if agent is not None else client.get_response(messages, stream=True)
+            )
+
+            if event_source is not None:
+                monkeypatch.setattr(client._http_service, "post_run", lambda *args, **kwargs: event_source)
+
+            if failure_kind == "iteration":
+                first = await stream.__anext__()
+                assert first.text == "first"
+                with pytest.raises(RuntimeError) as error:
+                    await stream.__anext__()
+                assert error.value is primary
+            elif failure_kind == "conversion":
+                with pytest.raises(RuntimeError) as error:
+                    await stream.__anext__()
+                assert error.value is primary
+            else:
+                first = await stream.__anext__()
+                assert first.text == "first"
+                consumer = asyncio.create_task(stream.__anext__())
+                try:
+                    assert event_source is not None
+                    await asyncio.wait_for(event_source.waiting.wait(), timeout=5)
+                    consumer.cancel("consumer cancelled")
+                    with pytest.raises(asyncio.CancelledError) as cancel_error:
+                        await consumer
+                    assert isinstance(cancel_error.value, asyncio.CancelledError)
+                    assert consumer.cancelled()
+                finally:
+                    consumer.cancel()
+                    await asyncio.gather(consumer, return_exceptions=True)
+
+        if failure_kind == "conversion":
+            assert response is not None
+            assert body.aclose_calls >= 1
+            assert body.closed
+            assert body.iterator_finally
+        else:
+            assert event_source is not None
+            assert event_source.aclose_calls >= 1
+            assert event_source.aclose_completed == event_source.aclose_calls
+
+    @pytest.mark.timeout(10)
+    @pytest.mark.parametrize("caller", ["client", "agent"], ids=["client", "agent"])
+    async def test_http_body_task_cancel_survives_aclose_error(self, caller: str) -> None:
+        """A task canceled during HTTP body iteration remains canceled when body close fails."""
+        close_failure = OSError("HTTP response body close failed")
+        body = _GatedSSEStream(aclose_error=close_failure)
+        response: httpx.Response | None = None
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal response
+            if request.method == "GET":
+                return httpx.Response(204, request=request)
+            await request.aread()
+            response = httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=body,
+                request=request,
+            )
+            return response
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = AGUIChatClient(
+                endpoint="https://agui.example.test/run",
+                http_client=http_client,
+                function_invocation_configuration={"enabled": False},
+            )
+            agent = Agent(client=client) if caller == "agent" else None
+            messages = [Message(role="user", contents=["Question"])]
+            stream = (
+                agent.run(messages, stream=True) if agent is not None else client.get_response(messages, stream=True)
+            )
+            first = await stream.__anext__()
+            assert first.text == "first"
+            consumer = asyncio.create_task(stream.__anext__())
+            try:
+                await asyncio.wait_for(body.tail_waiting.wait(), timeout=5)
+                consumer.cancel("consumer cancelled")
+                with pytest.raises(asyncio.CancelledError):
+                    await consumer
+                assert consumer.cancelled()
+            finally:
+                consumer.cancel()
+                await asyncio.gather(consumer, return_exceptions=True)
+
+        assert response is not None
+        assert body.aclose_calls >= 1
+        assert body.closed
+        assert body.iterator_finally
+
+    @pytest.mark.timeout(10)
+    @pytest.mark.parametrize("caller", ["client", "agent"], ids=["client", "agent"])
+    async def test_http_body_iteration_error_survives_aclose_error(
+        self,
+        caller: str,
+    ) -> None:
+        """An HTTP body iteration failure should remain primary when body close fails."""
+        primary = RuntimeError("HTTP event iteration failed")
+        close_failure = OSError("HTTP response body close failed")
+        body = _GatedSSEStream(aclose_error=close_failure, iteration_error=primary)
+        response: httpx.Response | None = None
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal response
+            if request.method == "GET":
+                return httpx.Response(204, request=request)
+            await request.aread()
+            response = httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=body,
+                request=request,
+            )
+            return response
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = AGUIChatClient(
+                endpoint="https://agui.example.test/run",
+                http_client=http_client,
+                function_invocation_configuration={"enabled": False},
+            )
+            agent = Agent(client=client) if caller == "agent" else None
+            messages = [Message(role="user", contents=["Question"])]
+            stream = (
+                agent.run(messages, stream=True) if agent is not None else client.get_response(messages, stream=True)
+            )
+
+            first = await stream.__anext__()
+            assert first.text == "first"
+            body.release_tail()
+            with pytest.raises(RuntimeError) as error:
+                await stream.__anext__()
+
+        assert error.value is primary
+        assert response is not None
+        assert body.aclose_calls >= 1
+        assert body.closed
+        assert body.iterator_finally
+
+    @pytest.mark.timeout(10)
+    @pytest.mark.parametrize("caller", ["client", "agent"], ids=["client", "agent"])
+    @pytest.mark.parametrize("close_mode", ["explicit", "complete"], ids=["public-close", "normal-completion"])
+    async def test_http_body_aclose_error_propagates_without_primary_failure(
+        self,
+        caller: str,
+        close_mode: str,
+    ) -> None:
+        """A body close failure remains visible when no operation failure takes precedence."""
+        close_failure = OSError("HTTP response body close failed")
+        body = _GatedSSEStream(aclose_error=close_failure)
+        response: httpx.Response | None = None
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal response
+            if request.method == "GET":
+                return httpx.Response(204, request=request)
+            await request.aread()
+            response = httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=body,
+                request=request,
+            )
+            return response
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+            client = AGUIChatClient(
+                endpoint="https://agui.example.test/run",
+                http_client=http_client,
+                function_invocation_configuration={"enabled": False},
+            )
+            agent = Agent(client=client) if caller == "agent" else None
+            messages = [Message(role="user", contents=["Question"])]
+            stream = (
+                agent.run(messages, stream=True) if agent is not None else client.get_response(messages, stream=True)
+            )
+
+            if close_mode == "explicit":
+                first = await stream.__anext__()
+                assert first.text == "first"
+                with pytest.raises(OSError) as error:
+                    await stream.close()
+            else:
+                body.release_tail()
+                with pytest.raises(OSError) as error:
+                    async for _ in stream:
+                        pass
+
+            assert error.value is close_failure
+
+        assert response is not None
+        assert body.aclose_calls >= 1
+        assert body.closed
+        assert body.iterator_finally
+
+    async def test_get_response_non_streaming(self, monkeypatch: MonkeyPatch) -> None:
+        """Test non-streaming response method."""
+        mock_events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": "Complete response"},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            for event in mock_events:
+                yield event
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        messages = [Message(role="user", contents=["Test message"])]
+        chat_options: dict[str, Any] = {}
+
+        response = await client.inner_get_response(messages=messages, options=chat_options)
+
+        assert response is not None
+        assert len(response.messages) > 0
+        assert "Complete response" in response.text
+
+    async def test_tool_handling(self, monkeypatch: MonkeyPatch) -> None:
+        """Test that client tool metadata is sent to server.
+
+        Client tool metadata (name, description, schema) is sent to server for planning.
+        When server requests a client function, function invocation mixin
+        intercepts and executes it locally. This matches .NET AG-UI implementation.
+        """
+        from agent_framework import tool
+
+        @tool
+        def test_tool(param: str) -> str:
+            """Test tool."""
+            return "result"
+
+        mock_events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            # Client tool metadata should be sent to server
+            tools: list[dict[str, Any]] | None = kwargs.get("tools")
+            assert tools is not None
+            assert len(tools) == 1
+            tool_entry = tools[0]
+            assert tool_entry["name"] == "test_tool"
+            assert tool_entry["description"] == "Test tool."
+            assert "parameters" in tool_entry
+            for event in mock_events:
+                yield event
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        messages = [Message(role="user", contents=["Test with tools"])]
+        chat_options = ChatOptions(tools=[test_tool])
+
+        response = await client.inner_get_response(messages=messages, options=chat_options)
+
+        assert response is not None
+
+    async def test_server_tool_calls_unwrapped_after_invocation(self, monkeypatch: MonkeyPatch) -> None:
+        """Ensure server-side tool calls are exposed as FunctionCallContent after processing."""
+
+        mock_events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "TOOL_CALL_START", "toolCallId": "call_1", "toolName": "get_time_zone"},
+            {"type": "TOOL_CALL_ARGS", "toolCallId": "call_1", "delta": '{"location": "Seattle"}'},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            for event in mock_events:
+                yield event
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        messages = [Message(role="user", contents=["Test server tool execution"])]
+
+        updates: list[ChatResponseUpdate] = []
+        async for update in client.get_response(messages, stream=True):
+            updates.append(update)
+
+        function_calls = [
+            content for update in updates for content in update.contents if content.type == "function_call"
+        ]
+        assert function_calls
+        assert function_calls[0].name == "get_time_zone"
+
+        assert not any(content.type == "server_function_call" for update in updates for content in update.contents)
+
+    async def test_server_tool_calls_not_executed_locally(self, monkeypatch: MonkeyPatch) -> None:
+        """Server tools should not trigger local function invocation even when client tools exist."""
+
+        @tool
+        def client_tool() -> str:
+            """Client tool stub."""
+            return "client"
+
+        mock_events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "TOOL_CALL_START", "toolCallId": "call_1", "toolName": "get_time_zone"},
+            {"type": "TOOL_CALL_ARGS", "toolCallId": "call_1", "delta": '{"location": "Seattle"}'},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            for event in mock_events:
+                yield event
+
+        async def fake_auto_invoke(*args: object, **kwargs: Any) -> None:
+            function_call = kwargs.get("function_call_content") or args[0]
+            raise AssertionError(f"Unexpected local execution of server tool: {getattr(function_call, 'name', '?')}")
+
+        monkeypatch.setattr("agent_framework._tools._auto_invoke_function", fake_auto_invoke)
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        messages = [Message(role="user", contents=["Test server tool execution"])]
+
+        async for _ in client.get_response(
+            messages, stream=True, options={"tool_choice": "auto", "tools": [client_tool]}
+        ):
+            pass
+
+    async def test_state_transmission(self, monkeypatch: MonkeyPatch) -> None:
+        """A marked state carrier is transmitted through the request state field."""
+        from agent_framework_ag_ui import state_carrier
+
+        state_data = {"user_id": "123", "session": "abc"}
+
+        messages = [
+            Message(role="user", contents=["Hello"]),
+            Message(
+                role="user",
+                contents=[state_carrier(state_data)],
+            ),
+        ]
+
+        mock_events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            assert kwargs.get("state") == state_data
+            for event in mock_events:
+                yield event
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        chat_options = ChatOptions()
+
+        response = await client.inner_get_response(messages=messages, options=chat_options)
+
+        assert response is not None
+
+    async def test_extract_state_from_empty_messages(self) -> None:
+        """Empty messages list returns empty list and None state."""
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        result_messages, state = client.extract_state_from_messages([])
+        assert result_messages == []
+        assert state is None
+
+    async def test_register_server_tool_non_dict_config(self) -> None:
+        """Non-dict function_invocation_configuration is a no-op."""
+        client = StubAGUIChatClient(
+            endpoint="http://localhost:8888/",
+            function_invocation_configuration=None,  # type: ignore[arg-type]
+        )
+        # Should not raise
+        client._register_server_tool_placeholder("some_tool")
+
+    async def test_non_streaming_response(self, monkeypatch: MonkeyPatch) -> None:
+        """Non-streaming path collects updates into ChatResponse."""
+        mock_events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": "Hello"},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            for event in mock_events:
+                yield event
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        messages = [Message(role="user", contents=["Test"])]
+        response = await client.inner_get_response(messages=messages, options={}, stream=False)
+
+        assert response is not None
+        assert len(response.messages) > 0
+
+    async def test_client_tool_sets_additional_properties(self, monkeypatch: MonkeyPatch) -> None:
+        """Client tool content gets agui_thread_id additional property."""
+
+        @tool
+        def my_tool(param: str) -> str:
+            """My tool."""
+            return "result"
+
+        mock_events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "TOOL_CALL_START", "toolCallId": "call_1", "toolName": "my_tool"},
+            {"type": "TOOL_CALL_ARGS", "toolCallId": "call_1", "delta": '{"param": "test"}'},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            for event in mock_events:
+                yield event
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        messages = [Message(role="user", contents=["Test"])]
+        updates: list[ChatResponseUpdate] = []
+        stream = client.inner_get_response(messages=messages, stream=True, options={"tools": [my_tool]})
+        assert isinstance(stream, ResponseStream)
+        async for update in stream:
+            updates.append(cast(ChatResponseUpdate, update))
+
+        # Find the function_call content - it should have agui_thread_id
+        found = False
+        for update in updates:
+            for content in update.contents:
+                if content.type == "function_call" and content.name == "my_tool":
+                    assert content.additional_properties is not None
+                    assert "agui_thread_id" in content.additional_properties
+                    found = True
+                    break
+        assert found, "Expected to find function_call content for my_tool"
+
+    async def test_tool_call_args_id_mismatch_does_not_execute_current_client_tool(
+        self, monkeypatch: MonkeyPatch
+    ) -> None:
+        """Mismatched TOOL_CALL_ARGS must not be rebound to the latest client tool."""
+        executed: list[int] = []
+
+        @tool
+        def danger_tool(amount: int) -> str:
+            """Record an invocation for the regression assertion."""
+            executed.append(amount)
+            return f"danger={amount}"
+
+        call_count = 0
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                mock_events = [
+                    {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+                    {"type": "TOOL_CALL_START", "toolCallId": "safe", "toolName": "safe_tool"},
+                    {"type": "TOOL_CALL_START", "toolCallId": "danger", "toolName": "danger_tool"},
+                    {"type": "TOOL_CALL_ARGS", "toolCallId": "safe", "delta": '{"amount": 100}'},
+                    {"type": "TOOL_CALL_END", "toolCallId": "safe"},
+                    {"type": "TOOL_CALL_END", "toolCallId": "danger"},
+                    {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+                ]
+            else:
+                mock_events = [
+                    {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_2"},
+                    {"type": "TEXT_MESSAGE_CONTENT", "messageId": "msg_1", "delta": "done"},
+                    {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_2"},
+                ]
+
+            for event in mock_events:
+                yield event
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        response = await client.get_response(
+            [Message(role="user", contents=["Test"])],
+            options={"tools": [danger_tool]},
+        )
+
+        assert response.text == "done"
+        assert executed == []
+
+    async def test_interrupt_options_transmission(self, monkeypatch: MonkeyPatch) -> None:
+        """Interrupt option fields are forwarded to the HTTP service."""
+        available_interrupts = [{"id": "req_1", "type": "request_info"}]
+        expected_available_interrupts = [{"id": "req_1", "reason": "input_required"}]
+        resume_payload = {"interrupts": [{"id": "req_1", "value": "approved"}]}
+        expected_resume_payload = [{"interruptId": "req_1", "status": "resolved", "payload": "approved"}]
+
+        mock_events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            assert kwargs.get("available_interrupts") == expected_available_interrupts
+            assert kwargs.get("resume") == expected_resume_payload
+            for event in mock_events:
+                yield event
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        messages = [Message(role="user", contents=["continue"])]
+        options = {
+            "available_interrupts": available_interrupts,
+            "resume": resume_payload,
+        }
+
+        response = await client.inner_get_response(messages=messages, options=options)
+        assert response is not None
+
+    async def test_typed_interrupt_options_forward_canonical_protocol_shape(self, monkeypatch: MonkeyPatch) -> None:
+        """Typed interrupt options are forwarded as canonical protocol JSON."""
+        mock_events = [
+            {"type": "RUN_STARTED", "threadId": "thread_1", "runId": "run_1"},
+            {"type": "RUN_FINISHED", "threadId": "thread_1", "runId": "run_1"},
+        ]
+
+        async def mock_post_run(*args: object, **kwargs: Any) -> AsyncGenerator[dict[str, Any], None]:
+            assert kwargs.get("available_interrupts") == [
+                {
+                    "id": "approval_1",
+                    "reason": "tool_call",
+                    "toolCallId": "call_1",
+                    "responseSchema": {"type": "object"},
+                }
+            ]
+            assert kwargs.get("resume") == [
+                {"interruptId": "approval_1", "status": "resolved", "payload": {"approved": True}}
+            ]
+            for event in mock_events:
+                yield event
+
+        client = StubAGUIChatClient(endpoint="http://localhost:8888/")
+        monkeypatch.setattr(client.http_service, "post_run", mock_post_run)
+
+        options: dict[str, Any] = {
+            "available_interrupts": [
+                Interrupt(
+                    id="approval_1",
+                    reason="tool_call",
+                    tool_call_id="call_1",
+                    response_schema={"type": "object"},
+                )
+            ],
+            "resume": [ResumeEntry(interrupt_id="approval_1", status="resolved", payload={"approved": True})],
+        }
+
+        response = await client.inner_get_response(
+            messages=[Message(role="user", contents=["continue"])],
+            options=options,
+        )
+
+        assert response is not None

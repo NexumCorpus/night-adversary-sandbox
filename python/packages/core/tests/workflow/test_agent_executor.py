@@ -1,0 +1,1035 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+from collections.abc import AsyncIterable, Awaitable
+from typing import Any, Literal, overload
+
+import pytest
+
+from agent_framework import (
+    AgentExecutor,
+    AgentResponse,
+    AgentResponseUpdate,
+    AgentRunInputs,
+    AgentSession,
+    BaseAgent,
+    Content,
+    Message,
+    ResponseStream,
+    WorkflowBuilder,
+    WorkflowEvent,
+    WorkflowRunState,
+)
+from agent_framework._workflows._agent_executor import AgentExecutorResponse
+from agent_framework._workflows._agent_utils import prepare_executor_run_kwargs
+from agent_framework._workflows._checkpoint import InMemoryCheckpointStorage
+from agent_framework._workflows._const import (
+    GLOBAL_KWARGS_KEY,
+    RAW_CLIENT_KWARGS_KEY,
+    RAW_FUNCTION_INVOCATION_KWARGS_KEY,
+)
+
+
+class _CountingAgent(BaseAgent):
+    """Agent that echoes messages with a counter to verify session state persistence."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.call_count = 0
+
+    @overload
+    def run(
+        self,
+        messages: AgentRunInputs | None = ...,
+        *,
+        stream: Literal[False] = ...,
+        session: AgentSession | None = ...,
+        **kwargs: Any,
+    ) -> Awaitable[AgentResponse[Any]]: ...
+    @overload
+    def run(
+        self,
+        messages: AgentRunInputs | None = ...,
+        *,
+        stream: Literal[True],
+        session: AgentSession | None = ...,
+        **kwargs: Any,
+    ) -> ResponseStream[AgentResponseUpdate, AgentResponse[Any]]: ...
+
+    def run(
+        self,
+        messages: AgentRunInputs | None = None,
+        *,
+        stream: bool = False,
+        session: AgentSession | None = None,
+        **kwargs: Any,
+    ) -> Awaitable[AgentResponse[Any]] | ResponseStream[AgentResponseUpdate, AgentResponse[Any]]:
+        self.call_count += 1
+        if stream:
+
+            async def _stream() -> AsyncIterable[AgentResponseUpdate]:
+                yield AgentResponseUpdate(
+                    contents=[Content.from_text(text=f"Response #{self.call_count}: {self.name}")]
+                )
+
+            return ResponseStream(_stream(), finalizer=AgentResponse.from_updates)
+
+        async def _run() -> AgentResponse:
+            return AgentResponse(messages=[Message("assistant", [f"Response #{self.call_count}: {self.name}"])])
+
+        return _run()
+
+
+class _StreamingHookAgent(BaseAgent):
+    """Agent that exposes whether its streaming result hook was executed."""
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        self.result_hook_called = False
+
+    @overload
+    def run(
+        self,
+        messages: AgentRunInputs | None = ...,
+        *,
+        stream: Literal[False] = ...,
+        session: AgentSession | None = ...,
+        **kwargs: Any,
+    ) -> Awaitable[AgentResponse[Any]]: ...
+    @overload
+    def run(
+        self,
+        messages: AgentRunInputs | None = ...,
+        *,
+        stream: Literal[True],
+        session: AgentSession | None = ...,
+        **kwargs: Any,
+    ) -> ResponseStream[AgentResponseUpdate, AgentResponse[Any]]: ...
+
+    def run(
+        self,
+        messages: AgentRunInputs | None = None,
+        *,
+        stream: bool = False,
+        session: AgentSession | None = None,
+        **kwargs: Any,
+    ) -> Awaitable[AgentResponse[Any]] | ResponseStream[AgentResponseUpdate, AgentResponse[Any]]:
+        if stream:
+
+            async def _stream() -> AsyncIterable[AgentResponseUpdate]:
+                yield AgentResponseUpdate(
+                    contents=[Content.from_text(text="hook test")],
+                    role="assistant",
+                )
+
+            async def _mark_result_hook_called(
+                response: AgentResponse,
+            ) -> AgentResponse:
+                self.result_hook_called = True
+                return response
+
+            return ResponseStream(_stream(), finalizer=AgentResponse.from_updates).with_result_hook(
+                _mark_result_hook_called
+            )
+
+        async def _run() -> AgentResponse:
+            return AgentResponse(messages=[Message("assistant", ["hook test"])])
+
+        return _run()
+
+
+async def test_agent_executor_streaming_finalizes_stream_and_runs_result_hooks() -> None:
+    """AgentExecutor should call get_final_response() so stream result hooks execute."""
+    agent = _StreamingHookAgent(id="hook_agent", name="HookAgent")
+    executor = AgentExecutor(agent, id="hook_exec")
+    workflow = WorkflowBuilder(start_executor=executor).build()
+
+    output_events: list[Any] = []
+    async for event in workflow.run("run hook test", stream=True):
+        if event.type == "output":
+            output_events.append(event)
+
+    assert output_events
+    assert agent.result_hook_called
+
+
+async def test_agent_executor_checkpoint_stores_and_restores_state() -> None:
+    """Test that workflow checkpoint stores AgentExecutor's cache and session states and restores them correctly."""
+    storage = InMemoryCheckpointStorage()
+
+    # Create two agents to form a two-step workflow
+    initial_agent_a = _CountingAgent(id="agent_a", name="AgentA")
+    initial_agent_b = _CountingAgent(id="agent_b", name="AgentB")
+    initial_session = AgentSession()
+
+    # Add some initial messages to the session state to verify session state persistence
+    initial_messages = [
+        Message(role="user", contents=["Initial message 1"]),
+        Message(role="assistant", contents=["Initial response 1"]),
+    ]
+    initial_session.state["history"] = {"messages": initial_messages}
+
+    # Create AgentExecutors — first executor gets the custom session
+    exec_a = AgentExecutor(initial_agent_a, id="exec_a", session=initial_session)
+    exec_b = AgentExecutor(initial_agent_b, id="exec_b")
+
+    # Build two-executor workflow with checkpointing enabled
+    wf = WorkflowBuilder(start_executor=exec_a, checkpoint_storage=storage).add_edge(exec_a, exec_b).build()
+
+    # Run the workflow with a user message
+    first_run_output: AgentExecutorResponse | None = None
+    async for ev in wf.run("First workflow run", stream=True):
+        if ev.type == "output":
+            first_run_output = ev.data  # type: ignore[assignment]
+        if ev.type == "status" and ev.state == WorkflowRunState.IDLE:
+            break
+
+    assert first_run_output is not None
+    assert initial_agent_a.call_count == 1
+
+    # Verify checkpoint was created
+    checkpoints = await storage.list_checkpoints(workflow_name=wf.name)
+    assert len(checkpoints) >= 2, "Expected at least 2 checkpoints: one after exec_a and one after exec_b."
+
+    # Get the first checkpoint that contains exec_a's state (taken after exec_a completes,
+    # before exec_b runs)
+    checkpoints.sort(key=lambda cp: cp.timestamp)
+    restore_checkpoint = next(
+        cp for cp in checkpoints if "_executor_state" in cp.state and "exec_a" in cp.state["_executor_state"]
+    )
+
+    # Verify checkpoint contains executor state with both cache and session
+    executor_states = restore_checkpoint.state["_executor_state"]
+    assert isinstance(executor_states, dict)
+    assert exec_a.id in executor_states
+
+    executor_state = executor_states[exec_a.id]  # type: ignore[index]
+    assert "cache" in executor_state, "Checkpoint should store executor cache state"
+    assert "agent_session" in executor_state, "Checkpoint should store executor session state"
+
+    # Verify session state structure
+    session_state = executor_state["agent_session"]  # type: ignore[index]
+    assert "session_id" in session_state, "Session state should include session_id"
+    assert "state" in session_state, "Session state should include state dict"
+
+    # Verify checkpoint contains pending requests from agents and responses to be sent
+    assert "pending_agent_requests" in executor_state
+    assert "pending_responses_to_agent" in executor_state
+
+    # Create new agents and executors for restoration
+    # This simulates starting from a fresh state and restoring from checkpoint
+    restored_agent_a = _CountingAgent(id="agent_a", name="AgentA")
+    restored_agent_b = _CountingAgent(id="agent_b", name="AgentB")
+    restored_session = AgentSession()
+    restored_exec_a = AgentExecutor(restored_agent_a, id="exec_a", session=restored_session)
+    restored_exec_b = AgentExecutor(restored_agent_b, id="exec_b")
+
+    # Verify the restored agents start with a fresh state
+    assert restored_agent_a.call_count == 0
+    assert restored_agent_b.call_count == 0
+
+    # Build new workflow with the restored executors
+    wf_resume = (
+        WorkflowBuilder(start_executor=restored_exec_a, checkpoint_storage=storage)
+        .add_edge(restored_exec_a, restored_exec_b)
+        .build()
+    )
+
+    # Resume from checkpoint — exec_a already ran, so exec_b should run and produce output
+    resumed_output: AgentExecutorResponse | None = None
+    async for ev in wf_resume.run(checkpoint_id=restore_checkpoint.checkpoint_id, stream=True):
+        if ev.type == "output":
+            resumed_output = ev.data  # type: ignore[assignment]
+        if ev.type == "status" and ev.state in (
+            WorkflowRunState.IDLE,
+            WorkflowRunState.IDLE_WITH_PENDING_REQUESTS,
+        ):
+            break
+
+    assert resumed_output is not None
+
+    # Verify the restored executor's session state was restored
+    restored_session_obj = restored_exec_a._session  # pyright: ignore[reportPrivateUsage]
+    assert restored_session_obj is not None
+    assert restored_session_obj.session_id == initial_session.session_id
+
+
+async def test_agent_executor_save_and_restore_state_directly() -> None:
+    """Test AgentExecutor's on_checkpoint_save and on_checkpoint_restore methods directly."""
+    # Create agent with session containing state
+    agent = _CountingAgent(id="direct_test_agent", name="DirectTestAgent")
+    session = AgentSession()
+
+    # Add messages to session state
+    session_messages = [
+        Message(role="user", contents=["Message in session 1"]),
+        Message(role="assistant", contents=["Session response 1"]),
+        Message(role="user", contents=["Message in session 2"]),
+    ]
+    session.state["history"] = {"messages": session_messages}
+
+    executor = AgentExecutor(agent, session=session)
+
+    # Add messages to executor cache
+    cache_messages = [
+        Message(role="user", contents=["Cached user message"]),
+        Message(role="assistant", contents=["Cached assistant response"]),
+    ]
+    executor._cache = list(cache_messages)  # pyright: ignore[reportPrivateUsage]
+
+    # Snapshot the state
+    state = await executor.on_checkpoint_save()
+
+    # Verify snapshot contains both cache and session
+    assert "cache" in state
+    assert "agent_session" in state
+
+    # Verify session state structure
+    session_state = state["agent_session"]  # type: ignore[index]
+    assert "session_id" in session_state
+    assert "state" in session_state
+
+    # Create new executor to restore into
+    new_agent = _CountingAgent(id="direct_test_agent", name="DirectTestAgent")
+    new_session = AgentSession()
+    new_executor = AgentExecutor(new_agent, session=new_session)
+
+    # Verify new executor starts empty
+    assert len(new_executor._cache) == 0  # pyright: ignore[reportPrivateUsage]
+    assert len(new_session.state) == 0
+
+    # Restore state
+    await new_executor.on_checkpoint_restore(state)
+
+    # Verify cache is restored
+    restored_cache = new_executor._cache  # pyright: ignore[reportPrivateUsage]
+    assert len(restored_cache) == len(cache_messages)
+    assert restored_cache[0].text == "Cached user message"
+    assert restored_cache[1].text == "Cached assistant response"
+
+    # Verify session was restored with correct session_id
+    restored_session = new_executor._session  # pyright: ignore[reportPrivateUsage]
+    assert restored_session.session_id == session.session_id
+
+
+async def test_prepare_agent_run_args_extracts_invocation_kwargs() -> None:
+    """_prepare_agent_run_args extracts function_invocation_kwargs and client_kwargs."""
+    agent = _CountingAgent(id="test_agent", name="TestAgent")
+    executor = AgentExecutor(agent, id="test_exec")
+
+    raw: dict[str, Any] = {
+        "function_invocation_kwargs": {"__global__": {"key": "fi_val"}},
+        "client_kwargs": {"__global__": {"key": "ci_val"}},
+    }
+    fi_kwargs, ci_kwargs = executor._prepare_agent_run_args(raw)  # pyright: ignore[reportPrivateUsage]
+    assert fi_kwargs == {"key": "fi_val"}
+    assert ci_kwargs == {"key": "ci_val"}
+
+
+async def test_prepare_agent_run_args_returns_none_when_no_kwargs() -> None:
+    """_prepare_agent_run_args returns None for both when raw dict has no invocation kwargs."""
+    agent = _CountingAgent(id="test_agent", name="TestAgent")
+    executor = AgentExecutor(agent, id="test_exec")
+
+    fi_kwargs, ci_kwargs = executor._prepare_agent_run_args({})  # pyright: ignore[reportPrivateUsage]
+    assert fi_kwargs is None
+    assert ci_kwargs is None
+
+
+async def test_prepare_executor_run_kwargs_resolves_channels_and_removes_internal_state() -> None:
+    """Executor-ready kwargs preserve options without leaking raw-routing snapshots."""
+    raw = {
+        "function_invocation_kwargs": {GLOBAL_KWARGS_KEY: {"legacy": True}},
+        "client_kwargs": {GLOBAL_KWARGS_KEY: {"legacy": True}},
+        RAW_FUNCTION_INVOCATION_KWARGS_KEY: {"agent": {"raw": True}},
+        RAW_CLIENT_KWARGS_KEY: {"agent": {"raw": True}},
+        "options": {"temperature": 0.5},
+    }
+    resolved = {
+        "function_invocation_kwargs": {
+            "global_kwargs": {"shared": "G"},
+            "executor_kwargs": {"agent": {"specific": "A"}},
+        },
+        "client_kwargs": {"executor_kwargs": {"other": {"ignored": True}}},
+    }
+
+    actual = prepare_executor_run_kwargs("agent", raw, resolved)
+
+    assert actual == {
+        "function_invocation_kwargs": {"shared": "G", "specific": "A"},
+        "options": {"temperature": 0.5},
+    }
+    assert prepare_executor_run_kwargs("agent", raw, {}) == {"options": {"temperature": 0.5}}
+    with pytest.raises(TypeError, match="Resolved workflow run kwargs state must be a dict"):
+        prepare_executor_run_kwargs("agent", raw, "invalid")
+
+
+class _NonCopyableRaw:
+    """Simulates an LLM SDK response object that cannot be deep-copied (e.g., proto/gRPC)."""
+
+    def __deepcopy__(self, memo: dict) -> Any:
+        raise TypeError("Cannot deepcopy this object")
+
+
+class _AgentWithRawRepr(BaseAgent):
+    """Agent that returns responses with a non-copyable raw_representation."""
+
+    def __init__(self, raw: Any, **kwargs: Any):
+        super().__init__(**kwargs)
+        self._raw = raw
+
+    def run(
+        self,
+        messages: str | Message | list[str] | list[Message] | None = None,
+        *,
+        stream: bool = False,
+        session: AgentSession | None = None,
+        **kwargs: Any,
+    ) -> Awaitable[AgentResponse] | ResponseStream[AgentResponseUpdate, AgentResponse]:
+        async def _run() -> AgentResponse:
+            return AgentResponse(
+                messages=[Message("assistant", [f"reply from {self.name}"])],
+                raw_representation=self._raw,
+            )
+
+        return _run()
+
+
+async def test_agent_executor_workflow_with_non_copyable_raw_representation() -> None:
+    """Workflow should complete when AgentResponse contains a raw_representation that cannot be deep-copied."""
+    raw = _NonCopyableRaw()
+
+    agent_a = _AgentWithRawRepr(raw=raw, id="a", name="AgentA")
+    agent_b = _CountingAgent(id="b", name="AgentB")
+
+    exec_a = AgentExecutor(agent_a, id="exec_a")  # type: ignore[arg-type]  # pyrefly: ignore[bad-argument-type]  # ty: ignore[invalid-argument-type]
+    exec_b = AgentExecutor(agent_b, id="exec_b")
+
+    workflow = WorkflowBuilder(start_executor=exec_a).add_edge(exec_a, exec_b).build()
+    events = await workflow.run("hello")
+
+    completed = [e for e in events if isinstance(e, WorkflowEvent) and e.type == "executor_completed"]
+    completed_a = [e for e in completed if e.executor_id == "exec_a"]
+
+    assert len(completed_a) == 1
+    assert completed_a[0].data is not None
+
+    # The yielded AgentResponse should preserve its raw_representation reference
+    agent_responses = [d for d in completed_a[0].data if isinstance(d, AgentResponse)]
+    assert len(agent_responses) > 0
+    assert agent_responses[0].text == "reply from AgentA"
+    assert agent_responses[0].raw_representation is raw
+
+
+# ---------------------------------------------------------------------------
+# Context mode tests
+# ---------------------------------------------------------------------------
+
+
+class _MessageCapturingAgent(BaseAgent):
+    """Agent that records the messages it received and returns a configurable reply."""
+
+    def __init__(self, *, reply_text: str = "reply", **kwargs: Any):
+        super().__init__(**kwargs)
+        self.reply_text = reply_text
+        self.last_messages: list[Message] = []
+
+    @overload
+    def run(
+        self,
+        messages: AgentRunInputs | None = ...,
+        *,
+        stream: Literal[False] = ...,
+        session: AgentSession | None = ...,
+        **kwargs: Any,
+    ) -> Awaitable[AgentResponse[Any]]: ...
+    @overload
+    def run(
+        self,
+        messages: AgentRunInputs | None = ...,
+        *,
+        stream: Literal[True],
+        session: AgentSession | None = ...,
+        **kwargs: Any,
+    ) -> ResponseStream[AgentResponseUpdate, AgentResponse[Any]]: ...
+
+    def run(
+        self,
+        messages: AgentRunInputs | None = None,
+        *,
+        stream: bool = False,
+        session: AgentSession | None = None,
+        **kwargs: Any,
+    ) -> Awaitable[AgentResponse[Any]] | ResponseStream[AgentResponseUpdate, AgentResponse[Any]]:
+        captured: list[Message] = []
+        if messages:
+            for m in messages:  # type: ignore[union-attr]  # ty: ignore[not-iterable]
+                if isinstance(m, Message):
+                    captured.append(m)
+                elif isinstance(m, str):
+                    captured.append(Message("user", [m]))
+        self.last_messages = captured
+
+        if stream:
+
+            async def _stream() -> AsyncIterable[AgentResponseUpdate]:
+                yield AgentResponseUpdate(contents=[Content.from_text(text=self.reply_text)])
+
+            return ResponseStream(_stream(), finalizer=AgentResponse.from_updates)
+
+        async def _run() -> AgentResponse:
+            return AgentResponse(messages=[Message("assistant", [self.reply_text])])
+
+        return _run()
+
+
+def test_context_mode_custom_requires_context_filter() -> None:
+    """context_mode='custom' without context_filter must raise ValueError."""
+    agent = _CountingAgent(id="a", name="A")
+    with pytest.raises(ValueError, match="context_filter must be provided"):
+        AgentExecutor(agent, context_mode="custom")
+
+
+def test_context_mode_custom_with_filter_succeeds() -> None:
+    """context_mode='custom' with a context_filter should not raise."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, context_mode="custom", context_filter=lambda msgs: msgs[-1:])
+    assert executor._context_mode == "custom"  # pyright: ignore[reportPrivateUsage]
+    assert executor._context_filter is not None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_context_mode_defaults_to_full() -> None:
+    """Default context_mode should be 'full'."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent)
+    assert executor._context_mode == "full"  # pyright: ignore[reportPrivateUsage]
+
+
+def test_context_mode_invalid_value_raises() -> None:
+    """Invalid context_mode value should raise ValueError."""
+    agent = _CountingAgent(id="a", name="A")
+    with pytest.raises(ValueError, match="context_mode must be one of"):
+        AgentExecutor(agent, context_mode="invalid_mode")  # type: ignore
+
+
+async def test_from_response_context_mode_full_passes_full_conversation() -> None:
+    """context_mode='full' (default) should pass full_conversation to the second agent."""
+    first = _MessageCapturingAgent(id="first", name="First", reply_text="first reply")
+    second = _MessageCapturingAgent(id="second", name="Second", reply_text="second reply")
+
+    exec_a = AgentExecutor(first, id="exec_a")
+    exec_b = AgentExecutor(second, id="exec_b", context_mode="full")
+
+    wf = WorkflowBuilder(start_executor=exec_a).add_edge(exec_a, exec_b).build()
+
+    async for ev in wf.run("hello", stream=True):
+        if ev.type == "status" and ev.state == WorkflowRunState.IDLE:
+            break
+
+    # Second agent should see full conversation: [user("hello"), assistant("first reply")]
+    seen = second.last_messages
+    assert len(seen) == 2
+    assert seen[0].role == "user" and "hello" in (seen[0].text or "")
+    assert seen[1].role == "assistant" and "first reply" in (seen[1].text or "")
+
+
+async def test_from_response_context_mode_last_agent_passes_only_agent_messages() -> None:
+    """context_mode='last_agent' should pass only the previous agent's response messages."""
+    first = _MessageCapturingAgent(id="first", name="First", reply_text="first reply")
+    second = _MessageCapturingAgent(id="second", name="Second", reply_text="second reply")
+
+    exec_a = AgentExecutor(first, id="exec_a")
+    exec_b = AgentExecutor(second, id="exec_b", context_mode="last_agent")
+
+    wf = WorkflowBuilder(start_executor=exec_a).add_edge(exec_a, exec_b).build()
+
+    async for ev in wf.run("hello", stream=True):
+        if ev.type == "status" and ev.state == WorkflowRunState.IDLE:
+            break
+
+    # Second agent should see only the assistant message from first: [assistant("first reply")]
+    seen = second.last_messages
+    assert len(seen) == 1
+    assert seen[0].role == "assistant" and "first reply" in (seen[0].text or "")
+
+
+async def test_from_response_context_mode_custom_uses_filter() -> None:
+    """context_mode='custom' should invoke context_filter on full_conversation."""
+    first = _MessageCapturingAgent(id="first", name="First", reply_text="first reply")
+    second = _MessageCapturingAgent(id="second", name="Second", reply_text="second reply")
+
+    # Custom filter: keep only user messages
+    def only_user_messages(msgs: list[Message]) -> list[Message]:
+        return [m for m in msgs if m.role == "user"]
+
+    exec_a = AgentExecutor(first, id="exec_a")
+    exec_b = AgentExecutor(second, id="exec_b", context_mode="custom", context_filter=only_user_messages)
+
+    wf = WorkflowBuilder(start_executor=exec_a).add_edge(exec_a, exec_b).build()
+
+    async for ev in wf.run("hello", stream=True):
+        if ev.type == "status" and ev.state == WorkflowRunState.IDLE:
+            break
+
+    # Second agent should see only user messages: [user("hello")]
+    seen = second.last_messages
+    assert len(seen) == 1
+    assert seen[0].role == "user" and "hello" in (seen[0].text or "")
+
+
+async def test_checkpoint_save_does_not_include_context_mode() -> None:
+    """on_checkpoint_save should not include context_mode in the saved state."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, context_mode="last_agent")
+
+    state = await executor.on_checkpoint_save()
+
+    assert "context_mode" not in state
+    assert "cache" in state
+    assert "agent_session" in state
+
+
+async def test_checkpoint_restore_works_without_context_mode_in_state() -> None:
+    """on_checkpoint_restore should succeed when state does not contain context_mode."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, context_mode="last_agent")
+
+    # Simulate a checkpoint state without context_mode (as saved by the new code)
+    state: dict[str, Any] = {
+        "cache": [Message(role="user", contents=["cached msg"])],
+        "full_conversation": [],
+        "agent_session": AgentSession().to_dict(),
+        "pending_agent_requests": {},
+        "pending_responses_to_agent": [],
+    }
+
+    await executor.on_checkpoint_restore(state)
+
+    cache = executor._cache  # pyright: ignore[reportPrivateUsage]
+    assert len(cache) == 1
+    assert cache[0].text == "cached msg"
+    # context_mode should remain as configured in the constructor, not changed by restore
+    assert executor._context_mode == "last_agent"  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_agent_executor_checkpoint_state_public_schema_keys() -> None:
+    """Saved AgentExecutor checkpoint state exposes the public TypedDict keys."""
+    from agent_framework import AgentExecutorCheckpointState
+    from agent_framework._sessions import AgentSessionDict
+
+    agent = _CountingAgent(id="schema_agent", name="SchemaAgent")
+    executor = AgentExecutor(agent)
+    executor._cache = [Message(role="user", contents=["hello"])]  # pyright: ignore[reportPrivateUsage]
+
+    state = await executor.on_checkpoint_save()
+
+    assert set(state) == {
+        "cache",
+        "full_conversation",
+        "agent_session",
+        "pending_agent_requests",
+        "pending_responses_to_agent",
+        "pending_request_order",
+    }
+    assert isinstance(state, dict)
+    assert len(state["cache"]) == 1
+    assert "session_id" in state["agent_session"]
+    # Checkpoint schema stays public; session payload TypedDict is sessions-internal.
+    _: type[AgentExecutorCheckpointState] = AgentExecutorCheckpointState
+    __: type[AgentSessionDict] = AgentSessionDict
+    assert isinstance(state["agent_session"], dict)
+    # Postponed annotations must not mark optional AgentSessionDict fields as required.
+    assert AgentSessionDict.__required_keys__ == frozenset({"session_id"})
+    assert AgentSessionDict.__optional_keys__ == frozenset({"type", "service_session_id", "state"})
+
+
+async def test_agent_executor_checkpoint_restore_missing_optional_fields() -> None:
+    """Restore accepts older partial payloads (missing optional TypedDict fields)."""
+    agent = _CountingAgent(id="partial_agent", name="PartialAgent")
+    executor = AgentExecutor(agent)
+    executor._cache = [Message(role="user", contents=["stale"])]  # pyright: ignore[reportPrivateUsage]
+
+    await executor.on_checkpoint_restore({})
+
+    assert executor._cache == []  # pyright: ignore[reportPrivateUsage]
+    assert executor._full_conversation == []  # pyright: ignore[reportPrivateUsage]
+    assert executor._pending_agent_requests == {}  # pyright: ignore[reportPrivateUsage]
+    assert executor._pending_responses_to_agent == []  # pyright: ignore[reportPrivateUsage]
+    assert executor._pending_request_order == []  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_agent_executor_restores_legacy_pending_request_order() -> None:
+    """A checkpoint without ordering metadata can still order replies when none were queued."""
+    request = Content.from_function_call(id="request-1", call_id="call-1", name="tool", arguments={})
+    executor = AgentExecutor(_CountingAgent(id="legacy_agent", name="LegacyAgent"))
+
+    await executor.on_checkpoint_restore({"pending_agent_requests": {"request-1": request}})
+
+    assert executor._pending_request_order == ["request-1"]  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(("pending", "responses"), [(1, 1), (0, 2)])
+async def test_agent_executor_rejects_ambiguous_legacy_partial_checkpoint(pending: int, responses: int) -> None:
+    """Old checkpoints cannot reconstruct call order once multiple outcomes are in flight."""
+    from agent_framework import WorkflowCheckpointException
+
+    request = Content.from_function_call(id="request-1", call_id="call-1", name="tool", arguments={})
+    result = Content.from_function_result(call_id="call-2", result="done")
+    executor = AgentExecutor(_CountingAgent(id="legacy_agent", name="LegacyAgent"))
+    state = {
+        "pending_agent_requests": {"request-1": request} if pending else {},
+        "pending_responses_to_agent": [result] * responses,
+    }
+
+    with pytest.raises(WorkflowCheckpointException, match="pending_request_order"):
+        await executor.on_checkpoint_restore(state)
+
+
+async def test_agent_executor_checkpoint_restore_rejects_malformed_fields() -> None:
+    """Restore raises WorkflowCheckpointException for wrong field types."""
+    from agent_framework import Content, WorkflowCheckpointException
+
+    agent = _CountingAgent(id="bad_agent", name="BadAgent")
+    executor = AgentExecutor(agent)
+
+    with pytest.raises(WorkflowCheckpointException, match="cache"):
+        await executor.on_checkpoint_restore({"cache": "not-a-list"})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match=r"'cache'\[0\]"):
+        await executor.on_checkpoint_restore({"cache": ["not-a-message"]})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match="pending_responses_to_agent"):
+        await executor.on_checkpoint_restore({"pending_responses_to_agent": ["bad"]})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match="pending_request_order"):
+        await executor.on_checkpoint_restore({"pending_request_order": "not-a-list"})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match="pending_request_order"):
+        await executor.on_checkpoint_restore({"pending_request_order": [1]})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match="pending_request_order"):
+        await executor.on_checkpoint_restore({"pending_request_order": ["req", "req"]})
+
+    with pytest.raises(WorkflowCheckpointException, match="agent_session"):
+        await executor.on_checkpoint_restore({"agent_session": "not-a-dict"})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match="agent_session.session_id"):
+        await executor.on_checkpoint_restore({"agent_session": {}})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match="agent_session.session_id"):
+        await executor.on_checkpoint_restore({"agent_session": {"session_id": 1}})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match="agent_session.state"):
+        await executor.on_checkpoint_restore({"agent_session": {"session_id": "s", "state": []}})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match="pending_agent_requests"):
+        await executor.on_checkpoint_restore({"pending_agent_requests": []})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match="pending_agent_requests"):
+        await executor.on_checkpoint_restore({"pending_agent_requests": {1: Content(type="text", text="x")}})  # type: ignore[typeddict-item]
+
+    with pytest.raises(WorkflowCheckpointException, match="pending_agent_requests"):
+        await executor.on_checkpoint_restore({"pending_agent_requests": {"req": "not-content"}})  # type: ignore[typeddict-item]
+
+
+async def test_agent_executor_checkpoint_restore_ignores_unknown_keys() -> None:
+    """Forward-compatible restore ignores unknown checkpoint keys."""
+    agent = _CountingAgent(id="fwd_agent", name="FwdAgent")
+    executor = AgentExecutor(agent)
+
+    await executor.on_checkpoint_restore({
+        "cache": [Message(role="user", contents=["ok"])],
+        "future_field": {"ignored": True},
+    })
+
+    assert len(executor._cache) == 1  # pyright: ignore[reportPrivateUsage]
+    assert executor._cache[0].text == "ok"  # pyright: ignore[reportPrivateUsage]
+
+
+# ---------------------------------------------------------------------------
+# Per-executor kwargs resolution tests
+# ---------------------------------------------------------------------------
+
+
+async def test_resolve_executor_kwargs_returns_global_kwargs() -> None:
+    """_resolve_executor_kwargs with the global kwargs key returns the global kwargs."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, id="exec_a")
+
+    resolved = {GLOBAL_KWARGS_KEY: {"tool_param": "value"}}
+    result = executor._resolve_executor_kwargs(resolved)  # pyright: ignore[reportPrivateUsage]
+    assert result == {"tool_param": "value"}
+
+
+async def test_resolve_executor_kwargs_returns_per_executor_kwargs() -> None:
+    """_resolve_executor_kwargs with matching executor ID returns that executor's kwargs."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, id="exec_a")
+
+    resolved = {"exec_a": {"my_param": 42}, "exec_b": {"other_param": 99}}
+    result = executor._resolve_executor_kwargs(resolved)  # pyright: ignore[reportPrivateUsage]
+    assert result == {"my_param": 42}
+
+
+async def test_resolve_executor_kwargs_returns_none_for_unmatched_per_executor() -> None:
+    """_resolve_executor_kwargs returns None when per-executor dict has no matching ID."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, id="exec_c")
+
+    resolved = {"exec_a": {"my_param": 42}, "exec_b": {"other_param": 99}}
+    result = executor._resolve_executor_kwargs(resolved)  # pyright: ignore[reportPrivateUsage]
+    assert result is None
+
+
+async def test_resolve_executor_kwargs_returns_none_for_none_input() -> None:
+    """_resolve_executor_kwargs returns None when input is None."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, id="exec_a")
+
+    result = executor._resolve_executor_kwargs(None)  # pyright: ignore[reportPrivateUsage]
+    assert result is None
+
+
+async def test_resolve_executor_kwargs_merges_executor_id_over_global() -> None:
+    """_resolve_executor_kwargs merges executor-specific entries over __global__."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, id="exec_a")
+
+    # Dict has both a per-executor entry and a global entry
+    resolved = {"exec_a": {"specific": True}, GLOBAL_KWARGS_KEY: {"global": True}}
+    result = executor._resolve_executor_kwargs(resolved)  # pyright: ignore[reportPrivateUsage]
+    assert result == {"global": True, "specific": True}
+
+
+async def test_prepare_agent_run_args_extracts_function_invocation_kwargs() -> None:
+    """_prepare_agent_run_args extracts function_invocation_kwargs from the state dict."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, id="exec_a")
+
+    raw: dict[str, Any] = {
+        "function_invocation_kwargs": {GLOBAL_KWARGS_KEY: {"tool_key": "tool_val"}},
+    }
+    fi_kwargs, client_kwargs = executor._prepare_agent_run_args(raw)  # pyright: ignore[reportPrivateUsage]
+    assert fi_kwargs == {"tool_key": "tool_val"}
+    assert client_kwargs is None
+
+
+async def test_prepare_agent_run_args_extracts_client_kwargs() -> None:
+    """_prepare_agent_run_args extracts client_kwargs from the state dict."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, id="exec_a")
+
+    raw: dict[str, Any] = {
+        "client_kwargs": {GLOBAL_KWARGS_KEY: {"model": "gpt-4"}},
+    }
+    fi_kwargs, client_kwargs = executor._prepare_agent_run_args(raw)  # pyright: ignore[reportPrivateUsage]
+    assert fi_kwargs is None
+    assert client_kwargs == {"model": "gpt-4"}
+
+
+async def test_prepare_agent_run_args_per_executor_resolution() -> None:
+    """_prepare_agent_run_args resolves per-executor function_invocation_kwargs using self.id."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, id="exec_a")
+
+    raw: dict[str, Any] = {
+        "function_invocation_kwargs": {
+            "exec_a": {"my_tool_key": "my_val"},
+            "exec_b": {"other_tool_key": "other_val"},
+        },
+    }
+    fi_kwargs, _ = executor._prepare_agent_run_args(raw)  # pyright: ignore[reportPrivateUsage]
+    assert fi_kwargs == {"my_tool_key": "my_val"}
+
+
+async def test_prepare_agent_run_args_per_executor_no_match() -> None:
+    """_prepare_agent_run_args returns None for function_invocation_kwargs when executor ID not found."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, id="exec_c")
+
+    raw: dict[str, Any] = {
+        "function_invocation_kwargs": {
+            "exec_a": {"my_tool_key": "my_val"},
+            "exec_b": {"other_tool_key": "other_val"},
+        },
+    }
+    fi_kwargs, _ = executor._prepare_agent_run_args(raw)  # pyright: ignore[reportPrivateUsage]
+    assert fi_kwargs is None
+
+
+async def test_resolve_executor_kwargs_empty_per_executor_keeps_global_kwargs() -> None:
+    """An explicit empty per-executor dict keeps the global kwargs."""
+    agent = _CountingAgent(id="a", name="A")
+    executor = AgentExecutor(agent, id="exec_a")
+
+    # Per-executor entry for exec_a is empty, so only global values apply.
+    resolved = {"exec_a": {}, GLOBAL_KWARGS_KEY: {"global_key": "global_val"}}  # type: ignore[var-annotated]
+    result = executor._resolve_executor_kwargs(resolved)  # pyright: ignore[reportPrivateUsage]
+    assert result == {"global_key": "global_val"}
+
+
+# region Tool approval emission
+
+
+class _ApprovalEmittingAgent(BaseAgent):
+    """Agent that returns a single ``function_approval_request`` Content.
+
+    Used to verify that ``AgentExecutor`` does *not* surface the approval
+    payload via both an ``output`` event and a ``request_info`` event in the
+    same superstep — only the ``request_info`` event must carry it.
+    """
+
+    def __init__(
+        self,
+        *,
+        approval_request_id: str = "apr_1",
+        tool_name: str = "delete_file",
+        tool_arguments: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(**kwargs)
+        self._approval_request_id = approval_request_id
+        self._tool_name = tool_name
+        self._tool_arguments: dict[str, Any] = tool_arguments or {"path": "/tmp/secret.txt"}
+        self.run_count = 0
+
+    def _build_approval_content(self) -> Content:
+        function_call = Content.from_function_call(
+            call_id=self._approval_request_id,
+            name=self._tool_name,
+            arguments=self._tool_arguments,
+        )
+        return Content.from_function_approval_request(id=self._approval_request_id, function_call=function_call)
+
+    @overload
+    def run(
+        self,
+        messages: AgentRunInputs | None = ...,
+        *,
+        stream: Literal[False] = ...,
+        session: AgentSession | None = ...,
+        **kwargs: Any,
+    ) -> Awaitable[AgentResponse[Any]]: ...
+
+    @overload
+    def run(
+        self,
+        messages: AgentRunInputs | None = ...,
+        *,
+        stream: Literal[True],
+        session: AgentSession | None = ...,
+        **kwargs: Any,
+    ) -> ResponseStream[AgentResponseUpdate, AgentResponse[Any]]: ...
+
+    def run(
+        self,
+        messages: AgentRunInputs | None = None,
+        *,
+        stream: bool = False,
+        session: AgentSession | None = None,
+        **kwargs: Any,
+    ) -> Awaitable[AgentResponse[Any]] | ResponseStream[AgentResponseUpdate, AgentResponse[Any]]:
+        self.run_count += 1
+        approval = self._build_approval_content()
+
+        if stream:
+
+            async def _stream() -> AsyncIterable[AgentResponseUpdate]:
+                yield AgentResponseUpdate(contents=[approval], role="assistant")
+
+            return ResponseStream(_stream(), finalizer=AgentResponse.from_updates)
+
+        async def _run() -> AgentResponse:
+            return AgentResponse(messages=[Message("assistant", [approval])])
+
+        return _run()
+
+
+def _has_approval_payload(event: WorkflowEvent[Any]) -> bool:
+    """Return True if the event's data carries a ``function_approval_request`` content."""
+    data: Any = event.data
+
+    def _contents_of(value: Any) -> list[Content]:
+        if isinstance(value, AgentResponseUpdate):
+            return list(value.contents)
+        if isinstance(value, AgentResponse):
+            return [c for m in value.messages for c in m.contents]
+        if isinstance(value, AgentExecutorResponse):
+            return [c for m in value.agent_response.messages for c in m.contents]
+        if isinstance(value, Message):
+            return list(value.contents)
+        if isinstance(value, Content):
+            return [value]
+        return []
+
+    return any(c.type == "function_approval_request" for c in _contents_of(data))
+
+
+async def test_agent_executor_does_not_double_emit_approval_non_streaming() -> None:
+    """Non-streaming: approval payload must only appear in the ``request_info`` event.
+
+    Regression test for the bug where ``AgentExecutor._run_agent`` first
+    ``yield_output``-ed the response (carrying the approval Content) and then
+    additionally emitted a ``request_info`` event for the same payload.
+    """
+    agent = _ApprovalEmittingAgent(id="approve_agent", name="ApproveAgent", approval_request_id="apr_ns_1")
+    executor = AgentExecutor(agent, id="approve_exec")
+    workflow = WorkflowBuilder(start_executor=executor).build()
+
+    request_info_events: list[WorkflowEvent[Any]] = []
+    output_events: list[WorkflowEvent[Any]] = []
+
+    for event in await workflow.run("please delete it"):
+        if event.type == "request_info":
+            request_info_events.append(event)
+        elif event.type == "output":
+            output_events.append(event)
+
+    assert len(request_info_events) == 1
+    assert _has_approval_payload(request_info_events[0])
+    # The approval payload must not also be surfaced as a workflow output.
+    assert not any(_has_approval_payload(e) for e in output_events)
+    assert agent.run_count == 1
+
+
+async def test_agent_executor_does_not_double_emit_approval_streaming() -> None:
+    """Streaming: per-update approval payload must not be ``yield_output``-ed."""
+    agent = _ApprovalEmittingAgent(id="approve_agent_s", name="ApproveAgentS", approval_request_id="apr_st_1")
+    executor = AgentExecutor(agent, id="approve_exec_s")
+    workflow = WorkflowBuilder(start_executor=executor).build()
+
+    request_info_events: list[WorkflowEvent[Any]] = []
+    output_events: list[WorkflowEvent[Any]] = []
+
+    async for event in workflow.run("please delete it", stream=True):
+        if event.type == "request_info":
+            request_info_events.append(event)
+        elif event.type == "output":
+            output_events.append(event)
+
+    assert len(request_info_events) == 1
+    assert _has_approval_payload(request_info_events[0])
+    assert not any(_has_approval_payload(e) for e in output_events)
+    assert agent.run_count == 1
+
+
+async def test_agent_executor_request_info_uses_user_input_request_id() -> None:
+    """``ctx.request_info`` must register the request under the agent's approval id.
+
+    This makes the workflow's pending-request id round-trip with the
+    ``function_approval_response.id`` the caller echoes back, so
+    ``Workflow._send_responses_internal`` can look it up directly.
+    """
+    agent = _ApprovalEmittingAgent(id="approve_agent_id", name="ApproveAgentId", approval_request_id="apr_match")
+    executor = AgentExecutor(agent, id="approve_exec_id")
+    workflow = WorkflowBuilder(start_executor=executor).build()
+
+    request_info_events: list[WorkflowEvent[Any]] = []
+    async for event in workflow.run("please delete it", stream=True):
+        if event.type == "request_info":
+            request_info_events.append(event)
+
+    assert len(request_info_events) == 1
+    assert request_info_events[0].request_id == "apr_match"
+
+
+# endregion Tool approval emission

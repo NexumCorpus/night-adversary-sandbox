@@ -1,0 +1,177 @@
+﻿// Copyright (c) Microsoft. All rights reserved.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Agents.AI.Workflows.InProc;
+
+namespace Microsoft.Agents.AI.Workflows.Sample;
+
+internal static class Step5EntryPoint
+{
+    public static async ValueTask<string> RunAsync(TextWriter writer, Func<string, int> userGuessCallback, InProcessExecutionEnvironment environment, bool rehydrateToRestore = false, CheckpointManager? checkpointManager = null)
+    {
+        Dictionary<CheckpointInfo, (NumberSignal signal, string? prompt)> checkpointedOutputs = [];
+
+        NumberSignal signal = NumberSignal.Init;
+        string? prompt = Step4EntryPoint.UpdatePrompt(null, signal);
+
+        checkpointManager ??= CheckpointManager.Default;
+
+        Workflow workflow = Step4EntryPoint.CreateWorkflowInstance(out JudgeExecutor judge);
+
+        StreamingRun handle =
+            await environment.WithCheckpointing(checkpointManager)
+                             .RunStreamingAsync(workflow, NumberSignal.Init)
+                             .ConfigureAwait(false);
+
+        List<CheckpointInfo> checkpoints = [];
+
+        string? result = await RunStreamToHaltOrMaxStepAsync(maxStep: 6).ConfigureAwait(false);
+
+        Assert.Null(result);
+        Assert.Equal(6, checkpoints.Count);
+
+        CheckpointInfo targetCheckpoint = checkpoints[2];
+
+        Console.WriteLine($"Restoring to checkpoint {targetCheckpoint} from session {targetCheckpoint.SessionId}");
+        if (rehydrateToRestore)
+        {
+            await handle.DisposeAsync().ConfigureAwait(false);
+
+            handle = await environment.WithCheckpointing(checkpointManager)
+                                      .ResumeStreamingAsync(workflow, targetCheckpoint, CancellationToken.None)
+                                      .ConfigureAwait(false);
+        }
+        else
+        {
+            await handle.RestoreCheckpointAsync(checkpoints[2], CancellationToken.None).ConfigureAwait(false);
+        }
+
+        (signal, prompt) = checkpointedOutputs[targetCheckpoint];
+
+        checkpoints.Clear();
+        result = await RunStreamToHaltOrMaxStepAsync().ConfigureAwait(false);
+
+        Assert.NotNull(result);
+
+        // Depending on the timing of the response with respect to the underlying workflow
+        // we may end up with extra supersteps in between.
+        Assert.True(checkpoints.Count >= 6, $"Expected at least 6 checkpoints, got {checkpoints.Count}.");
+        Assert.True(checkpoints.Count <= 12, $"Expected at most 12 checkpoints, got {checkpoints.Count}.");
+
+        return result;
+
+        async ValueTask<string?> RunStreamToHaltOrMaxStepAsync(int? maxStep = null)
+        {
+            List<ExternalRequest> requests = [];
+            bool stopAtNextHalt = false;
+
+            while (true)
+            {
+                await foreach (WorkflowEvent evt in handle.WatchStreamAsync(blockOnPendingRequest: false).ConfigureAwait(false))
+                {
+                    Console.WriteLine($"!!! Processing event: {evt}");
+                    if (stopAtNextHalt)
+                    {
+                        // The requested checkpoint boundary is already captured. Ignore later
+                        // events while draining the producer to its next safe halt.
+                        continue;
+                    }
+
+                    switch (evt)
+                    {
+                        case WorkflowOutputEvent outputEvent:
+                            switch (outputEvent.ExecutorId)
+                            {
+                                case Step4EntryPoint.JudgeId:
+                                    if (outputEvent.Is(out NumberSignal newSignal))
+                                    {
+                                        prompt = Step4EntryPoint.UpdatePrompt(prompt, signal = newSignal);
+                                    }
+                                    // TODO: We should make some well-defined way to avoid this kind of
+                                    // if/elseif chain, because .Is() chains are slow
+                                    else if (!outputEvent.Is<TryCount>())
+                                    {
+                                        throw new InvalidOperationException($"Unexpected output type {outputEvent.Data!.GetType()}");
+                                    }
+                                    break;
+                            }
+
+                            break;
+
+                        case RequestInfoEvent requestInputEvt:
+                            Console.WriteLine($"!!! Queuing request: {requestInputEvt.Request}");
+                            requests.Add(requestInputEvt.Request);
+                            break;
+
+                        case SuperStepCompletedEvent stepCompletedEvt:
+                            Console.WriteLine($"*** Step {stepCompletedEvt.StepNumber} completed.");
+                            CheckpointInfo? checkpoint = stepCompletedEvt.CompletionInfo!.Checkpoint;
+                            Console.WriteLine($"*** Checkpoint: {checkpoint}");
+                            if (checkpoint is not null)
+                            {
+                                checkpoints.Add(checkpoint);
+
+                                checkpointedOutputs[checkpoint] = (signal, prompt);
+                            }
+
+                            if (maxStep.HasValue && stepCompletedEvt.StepNumber >= maxStep.Value - 1)
+                            {
+                                // Finish consuming this halt before the caller restores checkpoint state.
+                                stopAtNextHalt = true;
+                            }
+
+                            break;
+
+                        case ExecutorCompletedEvent executorCompleteEvt:
+                            writer.WriteLine($"'{executorCompleteEvt.ExecutorId}: {executorCompleteEvt.Data}");
+                            break;
+                    }
+                    Console.WriteLine($"!!! Completed processing event: {evt.GetType()}");
+                }
+
+                if (stopAtNextHalt)
+                {
+                    Console.WriteLine($"*** Max step {maxStep} reached at a workflow halt.");
+                    return null;
+                }
+
+                if (requests.Count == 0)
+                {
+                    break;
+                }
+
+                Console.WriteLine($"*** Processing {requests.Count} queued requests.");
+                foreach (ExternalRequest request in requests)
+                {
+                    ExternalResponse response = ExecuteExternalRequest(request, userGuessCallback, prompt);
+                    Console.WriteLine($"!!! Sending response: {response}");
+                    await handle.SendResponseAsync(response).ConfigureAwait(false);
+                }
+
+                requests.Clear();
+                Console.WriteLine("*** Completed processing requests.");
+            }
+
+            writer.WriteLine($"Result: {prompt}");
+            return prompt!;
+        }
+    }
+
+    private static ExternalResponse ExecuteExternalRequest(
+        ExternalRequest request,
+        Func<string, int> userGuessCallback,
+        string? runningState)
+    {
+        object result = request.PortInfo.PortId switch
+        {
+            "GuessNumber" => userGuessCallback(runningState ?? "Guess the number."),
+            _ => throw new NotSupportedException($"Request {request.PortInfo.PortId} is not supported")
+        };
+
+        return request.CreateResponse(result);
+    }
+}

@@ -1,0 +1,77 @@
+﻿// Copyright (c) Microsoft. All rights reserved.
+
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Agents.AI.Workflows.Declarative.Extensions;
+using Microsoft.Agents.AI.Workflows.Declarative.Interpreter;
+using Microsoft.Agents.AI.Workflows.Declarative.PowerFx;
+using Microsoft.Agents.ObjectModel;
+using Microsoft.Agents.ObjectModel.Abstractions;
+using Microsoft.Extensions.AI;
+using Microsoft.Shared.Diagnostics;
+
+namespace Microsoft.Agents.AI.Workflows.Declarative.ObjectModel;
+
+internal sealed class AddConversationMessageExecutor(AddConversationMessage model, ResponseAgentProvider agentProvider, WorkflowFormulaState state) :
+    DeclarativeActionExecutor<AddConversationMessage>(model, state)
+{
+    protected override async ValueTask<object?> ExecuteAsync(IWorkflowContext context, CancellationToken cancellationToken = default)
+    {
+        Throw.IfNull(this.Model.Message);
+        Throw.IfNull(this.Model.ConversationId, $"{nameof(this.Model)}.{nameof(this.Model.ConversationId)}");
+
+        string conversationId = this.GetNonSensitiveValue(
+            this.Evaluator.GetValue(this.Model.ConversationId),
+            ConversationIdLocation);
+        bool isWorkflowConversation = context.IsWorkflowConversation(conversationId, out string? _);
+
+        ChatMessage newMessage = new(this.Model.Role.Value.ToChatRole(), [.. this.GetContent()]) { AdditionalProperties = this.GetMetadata() };
+
+        // Capture the created message, which includes the assigned ID.
+        newMessage = await agentProvider.CreateMessageAsync(conversationId, newMessage, cancellationToken).ConfigureAwait(false);
+
+        await this.AssignAsync(this.Model.Message.Path, newMessage.ToRecord(), context).ConfigureAwait(false);
+
+        if (isWorkflowConversation)
+        {
+            await context.AddEventAsync(new AgentResponseEvent(this.Id, new AgentResponse(newMessage)), cancellationToken).ConfigureAwait(false);
+        }
+
+        return default;
+    }
+
+    private IEnumerable<AIContent> GetContent()
+    {
+        foreach (AddConversationMessageContent content in this.Model.Content)
+        {
+            EvaluationResult<string> contentResult = this.Evaluator.Format(content.Value);
+            if (contentResult.Sensitivity == SensitivityLevel.Sensitive)
+            {
+                throw new DeclarativeActionException($"Cannot send sensitive conversation message content: {this.Id}.");
+            }
+
+            AIContent? messageContent = content.Type.Value.ToContent(contentResult.Value, content.MediaType);
+            if (messageContent is not null)
+            {
+                yield return messageContent;
+            }
+        }
+    }
+
+    private AdditionalPropertiesDictionary? GetMetadata()
+    {
+        if (this.Model.Metadata is null)
+        {
+            return null;
+        }
+
+        EvaluationResult<RecordDataValue?> metadataResult = this.Evaluator.GetValue(this.Model.Metadata);
+        if (metadataResult.Sensitivity == SensitivityLevel.Sensitive)
+        {
+            throw new DeclarativeActionException($"Cannot send sensitive conversation message metadata: {this.Id}.");
+        }
+
+        return metadataResult.Value.ToMetadata();
+    }
+}

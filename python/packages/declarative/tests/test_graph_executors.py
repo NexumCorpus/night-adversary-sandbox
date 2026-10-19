@@ -1,0 +1,2341 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Tests for the graph-based declarative workflow executors."""
+
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from agent_framework import WorkflowInvocationKwargs
+from agent_framework._workflows._state import State
+
+try:
+    import powerfx  # noqa: F401
+
+    _powerfx_available = True
+except (ImportError, RuntimeError):
+    _powerfx_available = False
+
+_requires_powerfx = pytest.mark.skipif(not _powerfx_available, reason="PowerFx engine not available")
+
+from agent_framework_declarative import WorkflowFactory, WorkflowState  # noqa: E402
+from agent_framework_declarative._workflows import (  # noqa: E402
+    ALL_ACTION_EXECUTORS,
+    DECLARATIVE_STATE_KEY,
+    ActionComplete,
+    ActionTrigger,
+    DeclarativeActionExecutor,
+    DeclarativeWorkflowBuilder,
+    DeclarativeWorkflowState,
+    ForeachInitExecutor,
+    LoopIterationResult,
+    SendActivityExecutor,
+    SetValueExecutor,
+)
+
+
+class TestFactoryStateMemberRoutes:
+    """Factory-created workflows use modern state for expressions and templates."""
+
+    @_requires_powerfx
+    async def test_factory_uses_modern_member_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class Record:
+            _private = "private-marker"
+
+            def __init__(self) -> None:
+                self.public_value = "public-marker"
+
+        forbidden = MagicMock(side_effect=AssertionError("Standalone state used by factory"))
+        monkeypatch.setattr(WorkflowState, "get", forbidden)
+        monkeypatch.setattr(WorkflowState, "eval", forbidden)
+        seen: list[type[DeclarativeWorkflowState]] = []
+        original = DeclarativeActionExecutor._get_state
+
+        def track(executor: DeclarativeActionExecutor, store: State) -> DeclarativeWorkflowState:
+            state = original(executor, store)
+            seen.append(type(state))
+            return state
+
+        monkeypatch.setattr(DeclarativeActionExecutor, "_get_state", track)
+        workflow = WorkflowFactory().create_workflow_from_yaml("""
+kind: Workflow
+trigger:
+  kind: OnConversationStart
+  id: member_routes
+  actions:
+    - kind: SendActivity
+      id: public_expression
+      activity: =Workflow.Inputs.record.public_value
+    - kind: SendActivity
+      id: private_expression
+      activity: =Workflow.Inputs.record._private
+    - kind: SendActivity
+      id: private_template
+      activity: "template:{Workflow.Inputs.record._private}"
+""")
+
+        result = await workflow.run({"record": Record()})
+
+        assert result.get_outputs() == ["public-marker", "template:"]
+        assert seen and all(kind is DeclarativeWorkflowState for kind in seen)
+        forbidden.assert_not_called()
+
+
+class TestDeclarativeWorkflowState:
+    """Tests for DeclarativeWorkflowState."""
+
+    @pytest.fixture
+    def mock_state(self):
+        """Create a mock shared state with async get/set methods."""
+        mock_state = MagicMock()
+        mock_state._data = {}
+
+        def mock_get(key, default=None):
+            return mock_state._data.get(key, default)
+
+        def mock_set(key, value):
+            mock_state._data[key] = value
+
+        mock_state.get = MagicMock(side_effect=mock_get)
+        mock_state.set = MagicMock(side_effect=mock_set)
+
+        return mock_state
+
+    @pytest.mark.asyncio
+    async def test_initialize_state(self, mock_state):
+        """Test initializing the workflow state."""
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize({"query": "test"})
+
+        # Verify state was set
+        mock_state.set.assert_called_once()
+        call_args = mock_state.set.call_args
+        assert call_args[0][0] == DECLARATIVE_STATE_KEY
+        state_data = call_args[0][1]
+        assert state_data["Inputs"] == {"query": "test"}
+        assert state_data["Outputs"] == {}
+        assert state_data["Local"] == {}
+
+    @pytest.mark.asyncio
+    async def test_get_and_set_values(self, mock_state):
+        """Test getting and setting values."""
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        # Set a turn value
+        state.set("Local.counter", 5)
+
+        # Get the value
+        result = state.get("Local.counter")
+        assert result == 5
+
+    @pytest.mark.asyncio
+    async def test_get_inputs(self, mock_state):
+        """Test getting workflow inputs."""
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize({"name": "Alice", "age": 30})
+
+        # Get via path
+        name = state.get("Workflow.Inputs.name")
+        assert name == "Alice"
+
+        # Get all inputs
+        inputs = state.get("Workflow.Inputs")
+        assert inputs == {"name": "Alice", "age": 30}
+
+    @pytest.mark.asyncio
+    async def test_append_value(self, mock_state):
+        """Test appending values to a list."""
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        # Append to non-existent list creates it
+        state.append("Local.items", "first")
+        result = state.get("Local.items")
+        assert result == ["first"]
+
+        # Append to existing list
+        state.append("Local.items", "second")
+        result = state.get("Local.items")
+        assert result == ["first", "second"]
+
+    @_requires_powerfx
+    @pytest.mark.asyncio
+    async def test_eval_expression(self, mock_state):
+        """Test evaluating expressions."""
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        # Non-expression returns as-is
+        result = state.eval("plain text")
+        assert result == "plain text"
+
+        # Boolean literals
+        result = state.eval("=true")
+        assert result is True
+
+        result = state.eval("=false")
+        assert result is False
+
+        # String literals
+        result = state.eval('="hello"')
+        assert result == "hello"
+
+        # Numeric literals
+        result = state.eval("=42")
+        assert result == 42
+
+
+class TestDeclarativeActionExecutor:
+    """Tests for DeclarativeActionExecutor subclasses."""
+
+    @pytest.fixture
+    def mock_context(self, mock_state):
+        """Create a mock workflow context."""
+        ctx = MagicMock()
+        ctx.state = mock_state
+        ctx.send_message = AsyncMock()
+        ctx.yield_output = AsyncMock()
+        return ctx
+
+    @pytest.fixture
+    def mock_state(self):
+        """Create a mock shared state."""
+        mock_state = MagicMock()
+        mock_state._data = {}
+
+        def mock_get(key, default=None):
+            return mock_state._data.get(key, default)
+
+        def mock_set(key, value):
+            mock_state._data[key] = value
+
+        mock_state.get = MagicMock(side_effect=mock_get)
+        mock_state.set = MagicMock(side_effect=mock_set)
+
+        return mock_state
+
+    @pytest.mark.asyncio
+    async def test_set_value_executor(self, mock_context, mock_state):
+        """Test SetValueExecutor."""
+        # Initialize state
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        action_def = {
+            "kind": "SetValue",
+            "path": "Local.result",
+            "value": "test value",
+        }
+        executor = SetValueExecutor(action_def)
+
+        # Execute
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        # Verify action complete was sent
+        mock_context.send_message.assert_called_once()
+        message = mock_context.send_message.call_args[0][0]
+        assert isinstance(message, ActionComplete)
+
+    @pytest.mark.asyncio
+    async def test_send_activity_executor(self, mock_context, mock_state):
+        """Test SendActivityExecutor."""
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        action_def = {
+            "kind": "SendActivity",
+            "activity": {"text": "Hello, world!"},
+        }
+        executor = SendActivityExecutor(action_def)
+
+        # Execute
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        # Verify output was yielded
+        mock_context.yield_output.assert_called_once_with("Hello, world!")
+
+    # Note: ConditionEvaluatorExecutor tests removed - conditions are now evaluated on edges
+
+    @_requires_powerfx
+    async def test_foreach_init_with_source(self, mock_context, mock_state):
+        """Test ForeachInitExecutor with the 'source' field."""
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.items", ["a", "b", "c"])
+
+        action_def = {
+            "kind": "Foreach",
+            "source": "=Local.items",
+            "itemName": "item",
+        }
+        executor = ForeachInitExecutor(action_def)
+
+        # Execute
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        # Verify result
+        mock_context.send_message.assert_called_once()
+        message = mock_context.send_message.call_args[0][0]
+        assert isinstance(message, LoopIterationResult)
+        assert message.has_next is True
+        assert message.current_index == 0
+        assert message.current_item == "a"
+
+    @pytest.mark.asyncio
+    async def test_foreach_init_empty(self, mock_context, mock_state):
+        """Test ForeachInitExecutor with empty items list."""
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        # Use a literal empty list - no expression evaluation needed
+        action_def = {
+            "kind": "Foreach",
+            "source": [],  # Direct empty list, not an expression
+            "itemName": "item",
+        }
+        executor = ForeachInitExecutor(action_def)
+
+        # Execute
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        # Verify result
+        mock_context.send_message.assert_called_once()
+        message = mock_context.send_message.call_args[0][0]
+        assert isinstance(message, LoopIterationResult)
+        assert message.has_next is False
+
+
+class TestDeclarativeWorkflowBuilder:
+    """Tests for DeclarativeWorkflowBuilder."""
+
+    def test_all_action_executors_available(self):
+        """Test that all expected action types have executors."""
+        expected_actions = [
+            "SetValue",
+            "SetVariable",
+            "SendActivity",
+            "EndWorkflow",
+            "InvokeAzureAgent",
+            "Question",
+        ]
+
+        for action in expected_actions:
+            assert action in ALL_ACTION_EXECUTORS, f"Missing executor for {action}"
+
+    def test_build_empty_workflow(self):
+        """Test building a workflow with no actions raises an error."""
+        yaml_def = {"name": "empty_workflow", "actions": []}
+        builder = DeclarativeWorkflowBuilder(yaml_def)
+
+        with pytest.raises(ValueError, match="Cannot build workflow with no actions"):
+            builder.build()
+
+    def test_build_simple_workflow(self):
+        """Test building a workflow with simple sequential actions."""
+        yaml_def = {
+            "name": "simple_workflow",
+            "actions": [
+                {"kind": "SendActivity", "id": "greet", "activity": {"text": "Hello!"}},
+                {"kind": "SetValue", "id": "set_count", "path": "Local.count", "value": 1},
+            ],
+        }
+        builder = DeclarativeWorkflowBuilder(yaml_def)
+        workflow = builder.build()
+
+        assert workflow is not None
+        # Verify executors were created
+        assert "greet" in builder._executors
+        assert "set_count" in builder._executors
+
+    def test_build_workflow_with_if(self):
+        """Test building a workflow with If control flow."""
+        yaml_def = {
+            "name": "conditional_workflow",
+            "actions": [
+                {
+                    "kind": "If",
+                    "id": "check_flag",
+                    "condition": "=Local.flag",
+                    "then": [
+                        {"kind": "SendActivity", "id": "say_yes", "activity": {"text": "Yes!"}},
+                    ],
+                    "else": [
+                        {"kind": "SendActivity", "id": "say_no", "activity": {"text": "No!"}},
+                    ],
+                },
+            ],
+        }
+        builder = DeclarativeWorkflowBuilder(yaml_def)
+        workflow = builder.build()
+
+        assert workflow is not None
+        # Verify branch executors were created
+        # Note: No join executors - branches wire directly to successor
+        assert "say_yes" in builder._executors
+        assert "say_no" in builder._executors
+        # Entry node is created when If is first action
+        assert "_workflow_entry" in builder._executors
+
+    def test_build_workflow_with_foreach(self):
+        """Test building a workflow with Foreach loop."""
+        yaml_def = {
+            "name": "loop_workflow",
+            "actions": [
+                {
+                    "kind": "Foreach",
+                    "id": "process_items",
+                    "source": "=Local.items",
+                    "itemName": "item",
+                    "actions": [
+                        {"kind": "SendActivity", "id": "show_item", "activity": {"text": "=Local.item"}},
+                    ],
+                },
+            ],
+        }
+        builder = DeclarativeWorkflowBuilder(yaml_def)
+        workflow = builder.build()
+
+        assert workflow is not None
+        # Verify loop executors were created
+        assert "process_items_init" in builder._executors
+        assert "process_items_next" in builder._executors
+        assert "process_items_exit" in builder._executors
+        assert "show_item" in builder._executors
+
+    def test_build_workflow_with_condition_group(self):
+        """Test building a workflow with ConditionGroup control flow."""
+        yaml_def = {
+            "name": "condition_group_workflow",
+            "actions": [
+                {
+                    "kind": "ConditionGroup",
+                    "id": "check_status",
+                    "conditions": [
+                        {
+                            "condition": '=Local.status = "active"',
+                            "actions": [
+                                {"kind": "SendActivity", "id": "say_active", "activity": {"text": "Active"}},
+                            ],
+                        },
+                        {
+                            "condition": '=Local.status = "pending"',
+                            "actions": [
+                                {"kind": "SendActivity", "id": "say_pending", "activity": {"text": "Pending"}},
+                            ],
+                        },
+                    ],
+                    "elseActions": [
+                        {"kind": "SendActivity", "id": "say_unknown", "activity": {"text": "Unknown"}},
+                    ],
+                },
+            ],
+        }
+        builder = DeclarativeWorkflowBuilder(yaml_def)
+        workflow = builder.build()
+
+        assert workflow is not None
+        # Verify ConditionGroup branch executors were created
+        # Note: No join executors - branches wire directly to successor
+        assert "say_active" in builder._executors
+        assert "say_pending" in builder._executors
+        assert "say_unknown" in builder._executors
+        # Entry node is created when ConditionGroup is first action
+        assert "_workflow_entry" in builder._executors
+
+
+class TestAgentExecutors:
+    """Tests for agent-related executors."""
+
+    @pytest.fixture
+    def mock_context(self, mock_state):
+        """Create a mock workflow context."""
+        ctx = MagicMock()
+        ctx.state = mock_state
+        ctx.send_message = AsyncMock()
+        ctx.yield_output = AsyncMock()
+        return ctx
+
+    @pytest.fixture
+    def mock_state(self):
+        """Create a mock shared state."""
+        mock_state = MagicMock()
+        mock_state._data = {}
+
+        def mock_get(key, default=None):
+            return mock_state._data.get(key, default)
+
+        def mock_set(key, value):
+            mock_state._data[key] = value
+
+        mock_state.get = MagicMock(side_effect=mock_get)
+        mock_state.set = MagicMock(side_effect=mock_set)
+
+        return mock_state
+
+    @pytest.mark.asyncio
+    async def test_invoke_agent_not_found(self, mock_context, mock_state):
+        """Test InvokeAzureAgentExecutor raises error when agent not found."""
+        from agent_framework.exceptions import AgentInvalidRequestException
+
+        from agent_framework_declarative._workflows import (
+            InvokeAzureAgentExecutor,
+        )
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        action_def = {
+            "kind": "InvokeAzureAgent",
+            "agent": "non_existent_agent",
+            "input": "test input",
+        }
+        executor = InvokeAzureAgentExecutor(action_def)
+
+        # Execute - should raise AgentInvalidRequestException
+        with pytest.raises(AgentInvalidRequestException) as exc_info:
+            await executor.handle_action(ActionTrigger(), mock_context)
+
+        assert "non_existent_agent" in str(exc_info.value)
+        assert "not found in registry" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_invoke_agent_skips_internal_workflow_kwargs(self, mock_context, mock_state):
+        """Internal underscore keys in the run-kwargs bag must not reach Agent.run.
+
+        Regression for #8413: the workflow state bag carries internal routing
+        copies (e.g. `_raw_function_invocation_kwargs`) next to the public
+        kwargs, and the declarative agent step used to splat the whole bag into
+        `Agent.run`, which takes no `**kwargs` and raised TypeError.
+        """
+        from types import SimpleNamespace
+
+        from agent_framework_declarative._workflows import InvokeAzureAgentExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        class _StrictAgent:
+            """Same public surface as Agent.run: no **kwargs catch-all."""
+
+            def __init__(self) -> None:
+                self.received_options: dict[str, Any] | None = None
+                self.received_public_kwargs: dict[str, Any] = {}
+
+            async def run(
+                self,
+                messages,
+                options=None,
+                function_invocation_kwargs=None,
+                client_kwargs=None,
+                session=None,
+                tools=None,
+                stream=False,
+            ):
+                self.received_options = options
+                self.received_public_kwargs = {
+                    "function_invocation_kwargs": function_invocation_kwargs,
+                    "client_kwargs": client_kwargs,
+                }
+                return SimpleNamespace(text="ok", messages=[], tool_calls=[])
+
+        agent = _StrictAgent()
+        run_kwargs_bag = {
+            "function_invocation_kwargs": {"__global__": {"forwarded_props": {"a": 1}}},
+            "_raw_function_invocation_kwargs": {"forwarded_props": {"a": 1}},
+        }
+        mock_context.get_state = MagicMock(
+            side_effect=lambda key, default=None: run_kwargs_bag if key == "_workflow_run_kwargs" else default
+        )
+
+        executor = InvokeAzureAgentExecutor(
+            {"kind": "InvokeAzureAgent", "agent": "StubAgent", "input": "hello"},
+            agents={"StubAgent": agent},
+        )
+
+        # Before the fix this raises TypeError: Agent.run() got an unexpected
+        # keyword argument '_raw_function_invocation_kwargs'.
+        await executor._invoke_agent_and_store_results(
+            agent,
+            "StubAgent",
+            "hello",
+            state,
+            mock_context,
+            messages_var=None,
+            response_obj_var=None,
+            result_property=None,
+            auto_send=False,
+        )
+
+        assert agent.received_options is None
+        assert agent.received_public_kwargs["function_invocation_kwargs"] == {"forwarded_props": {"a": 1}}
+
+
+class TestHumanInputExecutors:
+    """Tests for human input executors."""
+
+    @pytest.fixture
+    def mock_context(self, mock_state):
+        """Create a mock workflow context."""
+        ctx = MagicMock()
+        ctx.state = mock_state
+        ctx.send_message = AsyncMock()
+        ctx.yield_output = AsyncMock()
+        ctx.request_info = AsyncMock()
+        return ctx
+
+    @pytest.fixture
+    def mock_state(self):
+        """Create a mock shared state."""
+        mock_state = MagicMock()
+        mock_state._data = {}
+
+        def mock_get(key, default=None):
+            return mock_state._data.get(key, default)
+
+        def mock_set(key, value):
+            mock_state._data[key] = value
+
+        mock_state.get = MagicMock(side_effect=mock_get)
+        mock_state.set = MagicMock(side_effect=mock_set)
+
+        return mock_state
+
+    @pytest.mark.asyncio
+    async def test_question_executor(self, mock_context, mock_state):
+        """Test QuestionExecutor."""
+        from agent_framework_declarative._workflows import (
+            ExternalInputRequest,
+            QuestionExecutor,
+        )
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        action_def = {
+            "kind": "Question",
+            "question": {"text": "What is your name?"},
+            "variable": "Local.name",
+            "default": "Anonymous",
+        }
+        executor = QuestionExecutor(action_def)
+
+        # Execute
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        # Verify request_info was called with ExternalInputRequest
+        mock_context.request_info.assert_called_once()
+        request = mock_context.request_info.call_args[0][0]
+        assert isinstance(request, ExternalInputRequest)
+        assert request.request_type == "question"
+        assert "What is your name?" in request.message
+
+
+@_requires_powerfx
+class TestParseValueExecutor:
+    """Tests for the ParseValue action executor."""
+
+    @pytest.fixture
+    def mock_context(self, mock_state):
+        """Create a mock workflow context."""
+        ctx = MagicMock()
+        ctx.state = mock_state
+        ctx.send_message = AsyncMock()
+        ctx.yield_output = AsyncMock()
+        return ctx
+
+    @pytest.fixture
+    def mock_state(self):
+        """Create a mock shared state."""
+        mock_state = MagicMock()
+        mock_state._data = {}
+
+        def mock_get(key, default=None):
+            return mock_state._data.get(key, default)
+
+        def mock_set(key, value):
+            mock_state._data[key] = value
+
+        mock_state.get = MagicMock(side_effect=mock_get)
+        mock_state.set = MagicMock(side_effect=mock_set)
+
+        return mock_state
+
+    @pytest.mark.asyncio
+    async def test_parse_value_string(self, mock_context, mock_state):
+        """Test ParseValue with string type."""
+        from agent_framework_declarative._workflows._executors_basic import ParseValueExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.rawValue", "hello world")
+
+        action_def = {
+            "kind": "ParseValue",
+            "variable": "Local.parsedValue",
+            "value": "=Local.rawValue",
+            "valueType": "string",
+        }
+        executor = ParseValueExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.parsedValue")
+        assert result == "hello world"
+
+    @pytest.mark.asyncio
+    async def test_parse_value_number(self, mock_context, mock_state):
+        """Test ParseValue with number type."""
+        from agent_framework_declarative._workflows._executors_basic import ParseValueExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.rawValue", "123")
+
+        action_def = {
+            "kind": "ParseValue",
+            "variable": "Local.parsedValue",
+            "value": "=Local.rawValue",
+            "valueType": "number",
+        }
+        executor = ParseValueExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.parsedValue")
+        assert result == 123
+
+    @pytest.mark.asyncio
+    async def test_parse_value_float(self, mock_context, mock_state):
+        """Test ParseValue with float number."""
+        from agent_framework_declarative._workflows._executors_basic import ParseValueExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.rawValue", "3.14")
+
+        action_def = {
+            "kind": "ParseValue",
+            "variable": "Local.parsedValue",
+            "value": "=Local.rawValue",
+            "valueType": "number",
+        }
+        executor = ParseValueExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.parsedValue")
+        assert result == 3.14
+
+    @pytest.mark.parametrize("target_type", ["number", "float", "decimal"])
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [
+            ("1e3", 1000.0),
+            ("1E+3", 1000.0),
+            ("-2e-2", -0.02),
+            (" 6e1 ", 60.0),
+            ("3.5e2", 350.0),
+            ("1208925819614629174706177", 1208925819614629174706177),
+            ("123", 123),
+            ("-123", -123),
+            ("3.14", 3.14),
+            ("0", 0),
+            ("", 0),
+            ("not-a-number", 0),
+            ("1e", 0),
+            ("1e309", 0),
+            ("-1e309", 0),
+            ("inf", 0),
+            ("nan", 0),
+        ],
+    )
+    async def test_parse_value_numeric_strings(self, mock_context, mock_state, target_type, raw_value, expected):
+        """Parse scientific notation while retaining integer precision and invalid-input behavior."""
+        from agent_framework_declarative._workflows._executors_basic import ParseValueExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        executor = ParseValueExecutor({
+            "kind": "ParseValue",
+            "variable": "Local.parsedValue",
+            "value": raw_value,
+            "valueType": target_type,
+        })
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.parsedValue")
+        assert result == expected
+        assert type(result) is type(expected)
+
+    @_requires_powerfx
+    @pytest.mark.parametrize(
+        ("raw_value", "expected"),
+        [
+            ("1e3", "1000.0"),
+            ("1E+3", "1000.0"),
+            ("-2e-2", "-0.02"),
+            (" 6e1 ", "60.0"),
+            ("3.5e2", "350.0"),
+            ("1208925819614629174706177", "1208925819614629174706177"),
+            ("", "0"),
+            ("not-a-number", "0"),
+            ("1e309", "0"),
+            ("-1e309", "0"),
+        ],
+    )
+    async def test_factory_parse_value_numeric_input(self, raw_value, expected):
+        """Caller-supplied numeric strings reach workflow output without becoming zero."""
+        workflow = WorkflowFactory().create_workflow_from_definition({
+            "name": "parse_numeric_input",
+            "actions": [
+                {
+                    "kind": "ParseValue",
+                    "id": "parse",
+                    "variable": "Local.parsedValue",
+                    "value": "=Workflow.Inputs.raw",
+                    "valueType": "number",
+                },
+                {"kind": "SendActivity", "id": "send", "activity": "parsed={Local.parsedValue}"},
+            ],
+        })
+
+        result = await workflow.run({"raw": raw_value})
+
+        assert result.get_outputs() == [f"parsed={expected}"]
+
+    @pytest.mark.asyncio
+    async def test_parse_value_boolean_true(self, mock_context, mock_state):
+        """Test ParseValue with boolean type (true)."""
+        from agent_framework_declarative._workflows._executors_basic import ParseValueExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.rawValue", "true")
+
+        action_def = {
+            "kind": "ParseValue",
+            "variable": "Local.parsedValue",
+            "value": "=Local.rawValue",
+            "valueType": "boolean",
+        }
+        executor = ParseValueExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.parsedValue")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_parse_value_boolean_false(self, mock_context, mock_state):
+        """Test ParseValue with boolean type (false)."""
+        from agent_framework_declarative._workflows._executors_basic import ParseValueExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.rawValue", "no")
+
+        action_def = {
+            "kind": "ParseValue",
+            "variable": "Local.parsedValue",
+            "value": "=Local.rawValue",
+            "valueType": "boolean",
+        }
+        executor = ParseValueExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.parsedValue")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_parse_value_object_from_json(self, mock_context, mock_state):
+        """Test ParseValue with object type from JSON string."""
+        from agent_framework_declarative._workflows._executors_basic import ParseValueExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.rawValue", '{"name": "Alice", "age": 30}')
+
+        action_def = {
+            "kind": "ParseValue",
+            "variable": "Local.parsedValue",
+            "value": "=Local.rawValue",
+            "valueType": "object",
+        }
+        executor = ParseValueExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.parsedValue")
+        assert result == {"name": "Alice", "age": 30}
+
+    @pytest.mark.asyncio
+    async def test_parse_value_array_from_json(self, mock_context, mock_state):
+        """Test ParseValue with array type from JSON string."""
+        from agent_framework_declarative._workflows._executors_basic import ParseValueExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.rawValue", '["a", "b", "c"]')
+
+        action_def = {
+            "kind": "ParseValue",
+            "variable": "Local.parsedValue",
+            "value": "=Local.rawValue",
+            "valueType": "array",
+        }
+        executor = ParseValueExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.parsedValue")
+        assert result == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_parse_value_no_type_conversion(self, mock_context, mock_state):
+        """Test ParseValue without type conversion."""
+        from agent_framework_declarative._workflows._executors_basic import ParseValueExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.rawValue", {"status": "active"})
+
+        action_def = {
+            "kind": "ParseValue",
+            "variable": "Local.parsedValue",
+            "value": "=Local.rawValue",
+        }
+        executor = ParseValueExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.parsedValue")
+        assert result == {"status": "active"}
+
+
+class TestEditTableExecutor:
+    """Tests for the EditTable action executor."""
+
+    @pytest.fixture
+    def mock_context(self, mock_state):
+        """Create a mock workflow context."""
+        ctx = MagicMock()
+        ctx.state = mock_state
+        ctx.send_message = AsyncMock()
+        ctx.yield_output = AsyncMock()
+        return ctx
+
+    @pytest.fixture
+    def mock_state(self):
+        """Create a mock shared state."""
+        mock_state = MagicMock()
+        mock_state._data = {}
+
+        def mock_get(key, default=None):
+            return mock_state._data.get(key, default)
+
+        def mock_set(key, value):
+            mock_state._data[key] = value
+
+        mock_state.get = MagicMock(side_effect=mock_get)
+        mock_state.set = MagicMock(side_effect=mock_set)
+
+        return mock_state
+
+    @pytest.mark.asyncio
+    async def test_edit_table_add(self, mock_context, mock_state):
+        """Test EditTable with add operation."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.items", ["a", "b"])
+
+        action_def = {
+            "kind": "EditTable",
+            "table": "Local.items",
+            "operation": "add",
+            "value": "c",
+        }
+        executor = EditTableExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.items")
+        assert result == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_edit_table_insert_at_index(self, mock_context, mock_state):
+        """Test EditTable with insert at specific index."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.items", ["a", "c"])
+
+        action_def = {
+            "kind": "EditTable",
+            "table": "Local.items",
+            "operation": "add",
+            "value": "b",
+            "index": 1,
+        }
+        executor = EditTableExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.items")
+        assert result == ["a", "b", "c"]
+
+    @pytest.mark.asyncio
+    async def test_edit_table_remove_by_value(self, mock_context, mock_state):
+        """Test EditTable with remove by value."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.items", ["a", "b", "c"])
+
+        action_def = {
+            "kind": "EditTable",
+            "table": "Local.items",
+            "operation": "remove",
+            "value": "b",
+        }
+        executor = EditTableExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.items")
+        assert result == ["a", "c"]
+
+    @pytest.mark.asyncio
+    async def test_edit_table_remove_by_index(self, mock_context, mock_state):
+        """Test EditTable with remove by index."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.items", ["a", "b", "c"])
+
+        action_def = {
+            "kind": "EditTable",
+            "table": "Local.items",
+            "operation": "remove",
+            "index": 1,
+        }
+        executor = EditTableExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.items")
+        assert result == ["a", "c"]
+
+    @pytest.mark.asyncio
+    async def test_edit_table_clear(self, mock_context, mock_state):
+        """Test EditTable with clear operation."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.items", ["a", "b", "c"])
+
+        action_def = {
+            "kind": "EditTable",
+            "table": "Local.items",
+            "operation": "clear",
+        }
+        executor = EditTableExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.items")
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_edit_table_update_at_index(self, mock_context, mock_state):
+        """Test EditTable with update at index."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.items", ["a", "b", "c"])
+
+        action_def = {
+            "kind": "EditTable",
+            "table": "Local.items",
+            "operation": "update",
+            "value": "B",
+            "index": 1,
+        }
+        executor = EditTableExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.items")
+        assert result == ["a", "B", "c"]
+
+    @pytest.mark.asyncio
+    async def test_edit_table_creates_new_list(self, mock_context, mock_state):
+        """Test EditTable creates new list if not exists."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        action_def = {
+            "kind": "EditTable",
+            "table": "Local.newItems",
+            "operation": "add",
+            "value": "first",
+        }
+        executor = EditTableExecutor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.newItems")
+        assert result == ["first"]
+
+
+class TestEditTableV2Executor:
+    """Tests for the EditTableV2 action executor."""
+
+    @pytest.fixture
+    def mock_context(self, mock_state):
+        """Create a mock workflow context."""
+        ctx = MagicMock()
+        ctx.state = mock_state
+        ctx.send_message = AsyncMock()
+        ctx.yield_output = AsyncMock()
+        return ctx
+
+    @pytest.fixture
+    def mock_state(self):
+        """Create a mock shared state."""
+        mock_state = MagicMock()
+        mock_state._data = {}
+
+        def mock_get(key, default=None):
+            return mock_state._data.get(key, default)
+
+        def mock_set(key, value):
+            mock_state._data[key] = value
+
+        mock_state.get = MagicMock(side_effect=mock_get)
+        mock_state.set = MagicMock(side_effect=mock_set)
+
+        return mock_state
+
+    @pytest.mark.asyncio
+    async def test_edit_table_v2_add(self, mock_context, mock_state):
+        """Test EditTableV2 with add operation."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableV2Executor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.records", [{"id": 1, "name": "Alice"}])
+
+        action_def = {
+            "kind": "EditTableV2",
+            "table": "Local.records",
+            "operation": "add",
+            "item": {"id": 2, "name": "Bob"},
+        }
+        executor = EditTableV2Executor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.records")
+        assert result == [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+    @pytest.mark.parametrize("item", [False, 0, "", [], {}])
+    async def test_edit_table_v2_add_preserves_falsey_item(self, mock_context, mock_state, item):
+        """Test EditTableV2 preserves a falsey item instead of treating it as missing."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableV2Executor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.items", [True])
+
+        action_def = {
+            "kind": "EditTableV2",
+            "table": "Local.items",
+            "operation": "add",
+            "item": item,
+        }
+        executor = EditTableV2Executor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.items")
+        assert result[:-1] == [True]
+        assert result[-1] == item
+        assert type(result[-1]) is type(item)
+
+    async def test_edit_table_v2_add_uses_legacy_value_when_item_is_none(self, mock_context, mock_state):
+        """Test EditTableV2 retains the legacy value fallback for a missing item."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableV2Executor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        action_def = {
+            "kind": "EditTableV2",
+            "table": "Local.items",
+            "operation": "add",
+            "item": None,
+            "value": "legacy",
+        }
+        executor = EditTableV2Executor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.items")
+        assert result == ["legacy"]
+
+    @pytest.mark.asyncio
+    async def test_edit_table_v2_add_or_update_new(self, mock_context, mock_state):
+        """Test EditTableV2 with addOrUpdate - adding new record."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableV2Executor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.records", [{"id": 1, "name": "Alice"}])
+
+        action_def = {
+            "kind": "EditTableV2",
+            "table": "Local.records",
+            "operation": "addOrUpdate",
+            "item": {"id": 2, "name": "Bob"},
+            "key": "id",
+        }
+        executor = EditTableV2Executor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.records")
+        assert result == [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+
+    @pytest.mark.asyncio
+    async def test_edit_table_v2_add_or_update_existing(self, mock_context, mock_state):
+        """Test EditTableV2 with addOrUpdate - updating existing record."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableV2Executor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.records", [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}])
+
+        action_def = {
+            "kind": "EditTableV2",
+            "table": "Local.records",
+            "operation": "addOrUpdate",
+            "item": {"id": 1, "name": "Alice Updated"},
+            "key": "id",
+        }
+        executor = EditTableV2Executor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.records")
+        assert result == [{"id": 1, "name": "Alice Updated"}, {"id": 2, "name": "Bob"}]
+
+    @pytest.mark.asyncio
+    async def test_edit_table_v2_remove_by_key(self, mock_context, mock_state):
+        """Test EditTableV2 with remove by key."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableV2Executor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.records", [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}])
+
+        action_def = {
+            "kind": "EditTableV2",
+            "table": "Local.records",
+            "operation": "remove",
+            "item": {"id": 1},
+            "key": "id",
+        }
+        executor = EditTableV2Executor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.records")
+        assert result == [{"id": 2, "name": "Bob"}]
+
+    @pytest.mark.asyncio
+    async def test_edit_table_v2_clear(self, mock_context, mock_state):
+        """Test EditTableV2 with clear operation."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableV2Executor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.records", [{"id": 1}, {"id": 2}])
+
+        action_def = {
+            "kind": "EditTableV2",
+            "table": "Local.records",
+            "operation": "clear",
+        }
+        executor = EditTableV2Executor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.records")
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_edit_table_v2_update_by_key(self, mock_context, mock_state):
+        """Test EditTableV2 with update by key."""
+        from agent_framework_declarative._workflows._executors_basic import EditTableV2Executor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+        state.set("Local.records", [{"id": 1, "status": "pending"}, {"id": 2, "status": "pending"}])
+
+        action_def = {
+            "kind": "EditTableV2",
+            "table": "Local.records",
+            "operation": "update",
+            "item": {"id": 1, "status": "complete"},
+            "key": "id",
+        }
+        executor = EditTableV2Executor(action_def)
+        await executor.handle_action(ActionTrigger(), mock_context)
+
+        result = state.get("Local.records")
+        assert result == [{"id": 1, "status": "complete"}, {"id": 2, "status": "pending"}]
+
+
+class TestCancelDialogExecutors:
+    """Tests for CancelDialog and CancelAllDialogs executors."""
+
+    @pytest.fixture
+    def mock_context(self, mock_state):
+        """Create a mock workflow context."""
+        ctx = MagicMock()
+        ctx.state = mock_state
+        ctx.send_message = AsyncMock()
+        ctx.yield_output = AsyncMock()
+        return ctx
+
+    @pytest.fixture
+    def mock_state(self):
+        """Create a mock shared state."""
+        mock_state = MagicMock()
+        mock_state._data = {}
+
+        def mock_get(key, default=None):
+            return mock_state._data.get(key, default)
+
+        def mock_set(key, value):
+            mock_state._data[key] = value
+
+        mock_state.get = MagicMock(side_effect=mock_get)
+        mock_state.set = MagicMock(side_effect=mock_set)
+
+        return mock_state
+
+    @pytest.mark.asyncio
+    async def test_cancel_dialog_executor(self, mock_context, mock_state):
+        """Test CancelDialogExecutor completes without error."""
+        from agent_framework_declarative._workflows._executors_control_flow import CancelDialogExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        action_def = {
+            "kind": "CancelDialog",
+        }
+        executor = CancelDialogExecutor(action_def)
+        # Should complete without raising
+        await executor.handle_action(ActionTrigger(), mock_context)
+        # CancelDialog is a no-op that signals termination
+        # No assertions needed - just verify it doesn't raise
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_dialogs_executor(self, mock_context, mock_state):
+        """Test CancelAllDialogsExecutor completes without error."""
+        from agent_framework_declarative._workflows._executors_control_flow import CancelAllDialogsExecutor
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        action_def = {
+            "kind": "CancelAllDialogs",
+        }
+        executor = CancelAllDialogsExecutor(action_def)
+        # Should complete without raising
+        await executor.handle_action(ActionTrigger(), mock_context)
+        # CancelAllDialogs is a no-op that signals termination
+        # No assertions needed - just verify it doesn't raise
+
+
+class TestExtractJsonFromResponse:
+    """Tests for the _extract_json_from_response helper function."""
+
+    def test_pure_json_object(self):
+        """Test parsing pure JSON object."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = '{"TicketId": "123", "Status": "pending"}'
+        result = _extract_json_from_response(text)
+        assert result == {"TicketId": "123", "Status": "pending"}
+
+    def test_pure_json_array(self):
+        """Test parsing pure JSON array."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = '["item1", "item2", "item3"]'
+        result = _extract_json_from_response(text)
+        assert result == ["item1", "item2", "item3"]
+
+    def test_json_in_markdown_code_block(self):
+        """Test extracting JSON from markdown code block."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = """Here's the response:
+```json
+{"TicketId": "456", "Summary": "Test ticket"}
+```
+"""
+        result = _extract_json_from_response(text)
+        assert result == {"TicketId": "456", "Summary": "Test ticket"}
+
+    def test_json_in_plain_code_block(self):
+        """Test extracting JSON from plain markdown code block."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = """The result:
+```
+{"Status": "complete"}
+```
+"""
+        result = _extract_json_from_response(text)
+        assert result == {"Status": "complete"}
+
+    def test_json_with_leading_text(self):
+        """Test extracting JSON with leading text."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = 'Here is the ticket information: {"TicketId": "789", "Priority": "high"}'
+        result = _extract_json_from_response(text)
+        assert result == {"TicketId": "789", "Priority": "high"}
+
+    def test_json_with_trailing_text(self):
+        """Test extracting JSON with trailing text."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = '{"IsResolved": true, "NeedsTicket": false} That is the status.'
+        result = _extract_json_from_response(text)
+        assert result == {"IsResolved": True, "NeedsTicket": False}
+
+    def test_nested_json_object(self):
+        """Test extracting nested JSON object."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = 'Result: {"outer": {"inner": {"value": 42}}}'
+        result = _extract_json_from_response(text)
+        assert result == {"outer": {"inner": {"value": 42}}}
+
+    def test_json_with_array_inside(self):
+        """Test extracting JSON with arrays inside."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = 'Data: {"items": ["a", "b", "c"], "count": 3}'
+        result = _extract_json_from_response(text)
+        assert result == {"items": ["a", "b", "c"], "count": 3}
+
+    def test_json_with_escaped_quotes(self):
+        """Test extracting JSON with escaped quotes in strings."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = r'Response: {"message": "He said \"hello\"", "valid": true}'
+        result = _extract_json_from_response(text)
+        assert result == {"message": 'He said "hello"', "valid": True}
+
+    def test_empty_string_returns_none(self):
+        """Test that empty string returns None."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response("")
+        assert result is None
+
+    def test_whitespace_only_returns_none(self):
+        """Test that whitespace-only string returns None."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response("   \n\t  ")
+        assert result is None
+
+    def test_no_json_raises_error(self):
+        """Test that text without JSON raises JSONDecodeError."""
+        import json
+
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        with pytest.raises(json.JSONDecodeError):
+            _extract_json_from_response("This is just plain text with no JSON")
+
+    def test_json_with_braces_in_string(self):
+        """Test JSON with braces inside string values."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = 'Info: {"template": "Hello {name}, your id is {id}"}'
+        result = _extract_json_from_response(text)
+        assert result == {"template": "Hello {name}, your id is {id}"}
+
+    def test_multiple_json_objects_returns_last(self):
+        """Test that multiple JSON objects returns the last one (final result)."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        # Simulates streaming agent output with partial then final result
+        text = '{"TicketId":"TBD","TicketSummary":"partial"}{"TicketId":"75178c95","TicketSummary":"final result"}'
+        result = _extract_json_from_response(text)
+        assert result == {"TicketId": "75178c95", "TicketSummary": "final result"}
+
+    def test_multiple_json_objects_with_different_schemas(self):
+        """Test multiple JSON objects with different structures returns the last."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        # First object is from one agent, second is from another
+        text = '{"IsResolved":false,"NeedsTicket":true}{"TicketId":"abc123","Summary":"Issue logged"}'
+        result = _extract_json_from_response(text)
+        assert result == {"TicketId": "abc123", "Summary": "Issue logged"}
+
+    def test_multiple_json_objects_with_text_between(self):
+        """Test multiple JSON objects separated by text."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = 'First: {"status": "pending"} then later: {"status": "complete", "id": 42}'
+        result = _extract_json_from_response(text)
+        assert result == {"status": "complete", "id": 42}
+
+    def test_multiple_qualified_code_blocks_returns_last_valid(self):
+        """Test that the last valid qualified code block is returned."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = """```json
+{"status": "pending"}
+```
+```json
+{"status": "complete"}
+```"""
+        result = _extract_json_from_response(text)
+        assert result == {"status": "complete"}
+
+    def test_invalid_later_qualified_code_block_uses_previous_valid(self):
+        """Test that an invalid later block does not replace an earlier valid block."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = """```json
+{"status": "complete"}
+```
+```json
+not valid JSON
+```"""
+        result = _extract_json_from_response(text)
+        assert result == {"status": "complete"}
+
+    def test_qualified_code_block_takes_precedence_over_plain_block(self):
+        """Test that a qualified block is preferred over a later plain block."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = """```json
+{"source": "qualified"}
+```
+```
+{"source": "plain"}
+```"""
+        result = _extract_json_from_response(text)
+        assert result == {"source": "qualified"}
+
+    def test_invalid_qualified_code_block_falls_through_to_plain_block(self):
+        """Test that plain blocks are considered when qualified blocks are invalid."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = """```json
+not valid JSON
+```
+```
+{"source": "plain"}
+```"""
+        result = _extract_json_from_response(text)
+        assert result == {"source": "plain"}
+
+    @pytest.mark.parametrize(("json_text", "expected"), [("null", None), ("false", False), ("0", 0)])
+    def test_json_scalar_in_qualified_code_block(self, json_text, expected):
+        """Test that valid JSON scalars are not confused with a missing result."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response(f"```json\n{json_text}\n```")
+        assert result == expected
+
+    def test_unrecognized_code_block_qualifier_is_not_removed(self):
+        """Test that the plain-block pass does not consume language qualifiers."""
+        import json
+
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        with pytest.raises(json.JSONDecodeError):
+            _extract_json_from_response("```yaml\nfalse\n```")
+
+    def test_inline_json_code_block(self):
+        """Test extracting JSON from an inline qualified code block."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('Result: ```json{"status": "complete"}```.')
+        assert result == {"status": "complete"}
+
+    def test_inline_json_array_code_block(self):
+        """Test extracting a JSON array from an inline qualified code block."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response("Result: ```json[1, 2]```.")
+        assert result == [1, 2]
+
+    def test_json5_scalar_is_not_treated_as_json_qualified(self):
+        """Test that a JSON5 qualifier prefix is not interpreted as JSON."""
+        import json
+
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        with pytest.raises(json.JSONDecodeError):
+            _extract_json_from_response("```json5```")
+
+    @pytest.mark.parametrize("qualifier", ["json5", "jsonc"])
+    def test_nonstandard_json_qualified_object_uses_general_fallback(self, qualifier):
+        """Test that objects in nonstandard JSON blocks are recovered by fallback."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response(f'```{qualifier}\n{{"status": "complete"}}\n```')
+        assert result == {"status": "complete"}
+
+    def test_nonstandard_json_block_does_not_take_qualified_precedence(self):
+        """Test that JSON5 blocks do not take precedence over plain blocks."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = """```json5
+{"source": "json5"}
+```
+```
+{"source": "plain"}
+```"""
+        result = _extract_json_from_response(text)
+        assert result == {"source": "plain"}
+
+    def test_json_code_block_with_crlf(self):
+        """Test extracting JSON from a code block with CRLF line endings."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('Result:\r\n```json\r\n{"status": "complete"}\r\n```\r\n')
+        assert result == {"status": "complete"}
+
+    def test_array_with_brackets_and_escapes_in_string(self):
+        """Test nested delimiters and escapes inside JSON strings."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = r'Info: [{"message": "Use [x] and {y}", "path": "C:\\temp"}]'
+        result = _extract_json_from_response(text)
+        assert result == [{"message": "Use [x] and {y}", "path": r"C:\temp"}]
+
+    def test_unterminated_code_block_raises_error(self):
+        """Test that an unterminated whitespace-heavy code block fails safely."""
+        import json
+
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = f"```json\n{' ' * 64}X"
+        with pytest.raises(json.JSONDecodeError):
+            _extract_json_from_response(text)
+
+    @pytest.mark.parametrize("text", ["{" * 64 + "X", "[" * 64 + "X"])
+    def test_repeated_unmatched_brackets_raise_error(self, text):
+        """Test that repeated unmatched opening brackets fail safely."""
+        import json
+
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        with pytest.raises(json.JSONDecodeError):
+            _extract_json_from_response(text)
+
+    def test_valid_json_after_unmatched_outer_bracket(self):
+        """Test recovering valid JSON nested after an unmatched outer bracket."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('{{"status": "complete"}')
+        assert result == {"status": "complete"}
+
+    def test_valid_json_after_mismatched_bracket_candidate(self):
+        """Test recovering valid JSON after a malformed mixed-bracket candidate."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = '{"broken": [} then {"status": "complete"} ]}'
+        result = _extract_json_from_response(text)
+        assert result == {"status": "complete"}
+
+    def test_valid_outer_json_is_preferred_over_crossing_reverse_candidate(self):
+        """Test a reverse-indexed crossing candidate does not override valid JSON."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('{"s": "["}"]')
+        assert result == {"s": "["}
+
+    def test_valid_outer_json_is_preferred_over_nested_candidate(self):
+        """Test a malformed wrapper does not cause a nested value to win."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('{"mixed": [} {"final": {"nested": 1}} ]}')
+        assert result == {"final": {"nested": 1}}
+
+    def test_valid_json_after_double_escaped_fragment(self):
+        """Test recovering valid JSON after a double-escaped malformed fragment."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = r'{\"partial\": true} then {"status": "complete"}'
+        result = _extract_json_from_response(text)
+        assert result == {"status": "complete"}
+
+    def test_valid_json_after_double_escaped_fenced_fragment(self):
+        """Test recovering valid JSON after an invalid fenced fragment."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = """```json
+{\\"partial\\": true}
+```
+{"status": "complete"}"""
+        result = _extract_json_from_response(text)
+        assert result == {"status": "complete"}
+
+    def test_valid_json_after_brace_in_quoted_explanation(self):
+        """Test recovering valid JSON after a brace in quoted explanatory text."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = 'The model said "use { as the opener" before {"status": "complete"}'
+        result = _extract_json_from_response(text)
+        assert result == {"status": "complete"}
+
+    def test_valid_json_after_unterminated_quoted_candidate(self):
+        """Test recovering valid JSON after an unterminated quoted candidate."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = '{"partial: true} then {"status": "complete"}'
+        result = _extract_json_from_response(text)
+        assert result == {"status": "complete"}
+
+    def test_latest_json_after_valid_and_unterminated_candidates(self):
+        """Test returning the latest JSON after an earlier valid and poisoned candidate."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = '{"status": "pending"} {"partial: true} then {"status": "complete"}'
+        result = _extract_json_from_response(text)
+        assert result == {"status": "complete"}
+
+    def test_valid_json_after_two_poisoned_candidates(self):
+        """Test recovering valid JSON after two malformed candidates."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = '{"mixed": [} {"partial: true} then {"status": "complete"}'
+        result = _extract_json_from_response(text)
+        assert result == {"status": "complete"}
+
+    def test_valid_json_after_many_malformed_candidates(self):
+        """Test recovery is not limited by the number of malformed candidates."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = "[{}[[" * 50 + '{"final": "value"}'
+        result = _extract_json_from_response(text)
+        assert result == {"final": "value"}
+
+    def test_review_reported_malformed_candidate_sequence(self):
+        """Test the review-reported malformed prefix before final JSON."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('[{}[["{"final": "value"}')
+        assert result == {"final": "value"}
+
+    def test_valid_json_before_nested_malformed_suffix(self):
+        """Test a malformed suffix cannot consume the earlier candidate's decode budget."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('{"good": 1} [[[[[[[[[[x]]]]]]]]]]')
+        assert result == {"good": 1}
+
+    def test_last_sibling_json_inside_malformed_wrapper(self):
+        """Test that the last valid sibling wins inside a malformed wrapper."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('[x {"first": 1} {"last": 2}]')
+        assert result == {"last": 2}
+
+    def test_valid_json_inside_deeply_nested_malformed_wrapper(self):
+        """Test recovery budget is reserved for a deeply nested valid value."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('[[[[x {"final": "value"}]]]]')
+        assert result == {"final": "value"}
+
+    def test_valid_json_between_malformed_prefix_and_suffix(self):
+        """Test recovery prioritizes compact JSON over malformed wrappers."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = ("[" * 4) + 'x {"good": 1} ' + ("[" * 9) + "x" + ("]" * 13)
+        result = _extract_json_from_response(text)
+        assert result == {"good": 1}
+
+    def test_rightmost_recovered_json_wins(self):
+        """Test recovery returns the rightmost valid JSON within its budget."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        text = '[[x {"earlier": 1} {"final": "this is the final longer value"}]]'
+        result = _extract_json_from_response(text)
+        assert result == {"final": "this is the final longer value"}
+
+    def test_recovered_outer_object_wins_over_nested_object(self):
+        """Test recovery prefers a valid outer object over its nested child."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('[[x {"final": {"nested": 1}}]]')
+        assert result == {"final": {"nested": 1}}
+
+    def test_recovered_outer_array_wins_over_nested_object(self):
+        """Test recovery prefers a valid outer array over its nested child."""
+        from agent_framework_declarative._workflows._executors_agents import (
+            _extract_json_from_response,
+        )
+
+        result = _extract_json_from_response('[[x [{"nested": 1}]]]')
+        assert result == [{"nested": 1}]
+
+
+class TestPowerFxConditionalImport:
+    """The _declarative_base module should be importable without dotnet/powerfx."""
+
+    def test_import_guard_exists(self):
+        """The powerfx import must be wrapped in try/except."""
+        import agent_framework_declarative._workflows._declarative_base as base_mod
+
+        assert hasattr(base_mod, "DeclarativeWorkflowState")
+        assert hasattr(base_mod, "Engine")
+
+        # Engine should either be the real class or None — never an ImportError
+        engine = base_mod.Engine
+        assert engine is None or callable(engine)
+
+    def test_eval_raises_when_engine_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """eval() should raise RuntimeError when Engine is None."""
+        import agent_framework_declarative._workflows._declarative_base as base_mod
+
+        mock_state = MagicMock()
+        data: dict[str, Any] = {}
+        mock_state._data = data
+        mock_state.get = MagicMock(side_effect=lambda k, d=None: data.get(k, d))
+        mock_state.set = MagicMock(side_effect=lambda k, v: data.__setitem__(k, v))
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize({"name": "test"})
+
+        monkeypatch.setattr(base_mod, "Engine", None)
+        with pytest.raises(RuntimeError, match="PowerFx is not available"):
+            state.eval("=Local.counter + 1")
+
+    def test_eval_passes_through_plain_strings_without_engine(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Non-PowerFx strings (no leading '=') should work without Engine."""
+        import agent_framework_declarative._workflows._declarative_base as base_mod
+
+        mock_state = MagicMock()
+        data: dict[str, Any] = {}
+        mock_state._data = data
+        mock_state.get = MagicMock(side_effect=lambda k, d=None: data.get(k, d))
+        mock_state.set = MagicMock(side_effect=lambda k, v: data.__setitem__(k, v))
+
+        state = DeclarativeWorkflowState(mock_state)
+        state.initialize()
+
+        monkeypatch.setattr(base_mod, "Engine", None)
+        assert state.eval("hello world") == "hello world"
+        assert state.eval("") == ""
+        assert state.eval(cast("str", 42)) == 42
+
+
+class TestExecutorKwargsForwarding:
+    """Workflow run kwargs should be forwarded through executor agent invocations."""
+
+    @pytest.mark.parametrize("legacy_state", [False, True])
+    async def test_client_runtime_buckets_never_reach_functions_or_mcp(self, legacy_state: bool) -> None:
+        from agent_framework import (
+            Agent,
+            BaseChatClient,
+            ChatResponse,
+            Content,
+            FunctionInvocationContext,
+            FunctionInvocationLayer,
+            MCPStreamableHTTPTool,
+            Message,
+            tool,
+        )
+        from agent_framework._workflows._const import RESOLVED_WORKFLOW_RUN_KWARGS_KEY
+        from mcp import types
+        from mcp.client.session import ClientSession
+
+        from agent_framework_declarative._workflows import ExternalInputResponse
+
+        class RecordingClient(FunctionInvocationLayer, BaseChatClient):
+            def __init__(self):
+                super().__init__()
+                self.calls: list[dict[str, Any]] = []
+
+            async def _inner_get_response(self, *, messages, stream, options, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    return ChatResponse(
+                        messages=Message(
+                            "assistant",
+                            contents=[
+                                Content.from_function_call(call_id="local", name="capture", arguments={}),
+                                Content.from_function_call(call_id="remote", name="record", arguments={}),
+                            ],
+                        )
+                    )
+                return ChatResponse(messages=Message("assistant", "done"))
+
+        contexts: list[dict[str, Any]] = []
+
+        @tool
+        def capture(ctx: FunctionInvocationContext) -> str:
+            """Record runtime context."""
+            contexts.append(dict(ctx.kwargs))
+            return "ok"
+
+        session = MagicMock(spec=ClientSession)
+        session.list_tools = AsyncMock(
+            return_value=types.ListToolsResult(
+                tools=[
+                    types.Tool(
+                        name="record",
+                        inputSchema={
+                            "type": "object",
+                            "properties": {"client_kwargs": {"type": "object"}, "tool_marker": {"type": "string"}},
+                        },
+                    )
+                ]
+            )
+        )
+        session.call_tool = AsyncMock(
+            return_value=types.CallToolResult(content=[types.TextContent(type="text", text="ok")])
+        )
+        mcp = MCPStreamableHTTPTool(name="records", url="https://mcp.example/api", session=session, load_prompts=False)
+        mcp.is_connected = True
+        await mcp.load_tools()
+        clients = [RecordingClient(), RecordingClient()]
+        agents = {
+            name: Agent(client=client, tools=[capture, mcp])
+            for name, client in zip(("first", "second"), clients, strict=True)
+        }
+        workflow = DeclarativeWorkflowBuilder(
+            {
+                "name": "runtime_buckets",
+                "actions": [
+                    {
+                        "kind": "RequestExternalInput",
+                        "id": "pause",
+                        "prompt": "Continue?",
+                        "variable": "Local.answer",
+                    },
+                    *[{"kind": "InvokeAzureAgent", "id": name, "agent": name, "input": "hello"} for name in agents],
+                ],
+            },
+            agents=agents,
+        ).build()
+        paused = await workflow.run(
+            ActionTrigger(),
+            client_kwargs={name: {"extra_headers": {"X-Client-Context": name}} for name in agents},
+            function_invocation_kwargs={name: {"tool_marker": name} for name in agents},
+        )
+        if legacy_state:
+            workflow._runner.state.delete(RESOLVED_WORKFLOW_RUN_KWARGS_KEY)
+            workflow._runner.state.commit()
+        [request] = paused.get_request_info_events()
+        await workflow.run(responses={request.request_id: ExternalInputResponse(user_input="yes")})
+
+        for name, client in zip(agents, clients, strict=True):
+            assert client.calls
+            assert all(call["extra_headers"] == {"X-Client-Context": name} for call in client.calls)
+        assert [ctx["tool_marker"] for ctx in contexts] == ["first", "second"]
+        assert all("client_kwargs" not in ctx and "_raw_client_kwargs" not in ctx for ctx in contexts)
+        assert [call.kwargs["arguments"] for call in session.call_tool.call_args_list] == [
+            {"tool_marker": "first"},
+            {"tool_marker": "second"},
+        ]
+
+    @pytest.mark.parametrize("kwargs_channel", ["function_invocation_kwargs", "client_kwargs"])
+    @pytest.mark.parametrize(
+        ("executor_ids", "invocation_kwargs", "expected"),
+        [
+            (
+                ("agent1", "sibling"),
+                {
+                    "__global__": {"shared": "G", "overridden": "global"},
+                    "agent1": {"specific": "A", "overridden": "specific"},
+                },
+                (
+                    {"shared": "G", "specific": "A", "overridden": "specific"},
+                    {"shared": "G", "overridden": "global"},
+                ),
+            ),
+            (
+                ("__global__", "sibling"),
+                WorkflowInvocationKwargs(
+                    global_kwargs={"shared": "G", "overridden": "global"},
+                    executor_kwargs={"__global__": {"specific": "A", "overridden": "specific"}},
+                ),
+                (
+                    {"shared": "G", "specific": "A", "overridden": "specific"},
+                    {"shared": "G", "overridden": "global"},
+                ),
+            ),
+        ],
+        ids=["legacy-mixed", "global-executor-collision"],
+    )
+    async def test_workflow_run_resolves_executor_kwargs(
+        self,
+        kwargs_channel: str,
+        executor_ids: tuple[str, str],
+        invocation_kwargs: dict[str, Any] | WorkflowInvocationKwargs,
+        expected: tuple[dict[str, Any], dict[str, Any]],
+    ) -> None:
+        """The public declarative path resolves legacy mixed and collision-free state."""
+        agents: dict[str, Any] = {}
+        actions: list[dict[str, Any]] = []
+        for index, executor_id in enumerate(executor_ids):
+            agent_name = f"agent_{index}"
+            response = MagicMock(text="response", messages=[], tool_calls=[])
+            agent = MagicMock(name=agent_name)
+            agent.run = AsyncMock(return_value=response)
+            agents[agent_name] = agent
+            actions.append({"kind": "InvokeAzureAgent", "id": executor_id, "agent": agent_name, "input": "hello"})
+
+        workflow = DeclarativeWorkflowBuilder(
+            {"name": "kwargs_workflow", "actions": actions},
+            agents=agents,
+        ).build()
+        if kwargs_channel == "function_invocation_kwargs":
+            await workflow.run(ActionTrigger(), function_invocation_kwargs=invocation_kwargs)
+        else:
+            await workflow.run(ActionTrigger(), client_kwargs=invocation_kwargs)
+
+        for agent, expected_kwargs in zip(agents.values(), expected, strict=True):
+            call_kwargs = agent.run.call_args.kwargs
+            assert call_kwargs[kwargs_channel] == expected_kwargs
+            assert call_kwargs["options"] is None
+            assert "_raw_function_invocation_kwargs" not in call_kwargs
+            assert "_raw_client_kwargs" not in call_kwargs
+
+    @pytest.mark.parametrize("kwargs_channel", ["function_invocation_kwargs", "client_kwargs"])
+    @pytest.mark.parametrize("legacy_checkpoint", [False, True], ids=["new-state", "legacy-state"])
+    async def test_workflow_run_kwargs_survive_file_checkpoint_restore(
+        self,
+        tmp_path: Any,
+        kwargs_channel: str,
+        legacy_checkpoint: bool,
+    ) -> None:
+        """Both current and legacy checkpoints resolve kwargs for the receiving executor."""
+        from agent_framework import FileCheckpointStorage
+        from agent_framework._workflows._const import (
+            RESOLVED_WORKFLOW_RUN_KWARGS_KEY,
+            WORKFLOW_RUN_KWARGS_KEY,
+        )
+
+        from agent_framework_declarative._workflows._executors_external_input import ExternalInputResponse
+
+        storage = FileCheckpointStorage(
+            tmp_path,
+            allowed_checkpoint_types=[
+                "agent_framework_declarative._workflows._declarative_base:ActionComplete",
+                "agent_framework_declarative._workflows._declarative_base:ActionTrigger",
+                "agent_framework_declarative._workflows._executors_external_input:ExternalInputRequest",
+                "agent_framework_declarative._workflows._executors_external_input:ExternalInputResponse",
+            ],
+        )
+        executor_id = "sibling" if legacy_checkpoint else "__global__"
+
+        def build_workflow() -> tuple[Any, Any]:
+            response = MagicMock(text="response", messages=[], tool_calls=[])
+            agent = MagicMock(name="checkpoint_agent")
+            agent.run = AsyncMock(return_value=response)
+            workflow = DeclarativeWorkflowBuilder(
+                {
+                    "name": "declarative_kwargs_checkpoint",
+                    "actions": [
+                        {
+                            "kind": "RequestExternalInput",
+                            "id": "pause",
+                            "prompt": "Continue?",
+                            "variable": "Local.answer",
+                        },
+                        {
+                            "kind": "InvokeAzureAgent",
+                            "id": executor_id,
+                            "agent": "checkpoint_agent",
+                            "input": "hello",
+                        },
+                    ],
+                },
+                agents={"checkpoint_agent": agent},
+                checkpoint_storage=storage,
+            ).build()
+            return workflow, agent
+
+        if legacy_checkpoint:
+            invocation_kwargs: dict[str, Any] | WorkflowInvocationKwargs = {
+                "__global__": {"shared": "G"},
+                "sibling": {"specific": "S"},
+            }
+        else:
+            invocation_kwargs = WorkflowInvocationKwargs(
+                global_kwargs={"shared": "G"},
+                executor_kwargs={"__global__": {"specific": "S"}},
+            )
+
+        workflow, _ = build_workflow()
+        if kwargs_channel == "function_invocation_kwargs":
+            paused = await workflow.run(ActionTrigger(), function_invocation_kwargs=invocation_kwargs)
+        else:
+            paused = await workflow.run(ActionTrigger(), client_kwargs=invocation_kwargs)
+        [request] = paused.get_request_info_events()
+        checkpoints = await storage.list_checkpoints(workflow_name=workflow.name)
+        checkpoint = max(
+            (item for item in checkpoints if item.pending_request_info_events),
+            key=lambda item: item.timestamp,
+        )
+        if legacy_checkpoint:
+            checkpoint.state.pop(RESOLVED_WORKFLOW_RUN_KWARGS_KEY, None)
+            await storage.save(checkpoint)
+        else:
+            assert checkpoint.state[RESOLVED_WORKFLOW_RUN_KWARGS_KEY][kwargs_channel]
+            assert isinstance(checkpoint.state[WORKFLOW_RUN_KWARGS_KEY][kwargs_channel], dict)
+
+        resumed_workflow, resumed_agent = build_workflow()
+        resumed = await resumed_workflow.run(checkpoint_id=checkpoint.checkpoint_id)
+        [resumed_request] = resumed.get_request_info_events()
+        assert resumed_request.request_id == request.request_id
+        await resumed_workflow.run(
+            responses={resumed_request.request_id: ExternalInputResponse(user_input="yes")},
+        )
+
+        call_kwargs = resumed_agent.run.call_args.kwargs
+        assert call_kwargs[kwargs_channel] == {"shared": "G", "specific": "S"}
+        assert "_raw_function_invocation_kwargs" not in call_kwargs
+        assert "_raw_client_kwargs" not in call_kwargs
+        assert call_kwargs["options"] is None
+
+    @pytest.mark.asyncio
+    async def test_invoke_agent_forwards_kwargs(self):
+        """InvokeAzureAgentExecutor should forward run_kwargs to agent.run()."""
+        from agent_framework._workflows._const import WORKFLOW_RUN_KWARGS_KEY
+        from agent_framework._workflows._state import State
+
+        from agent_framework_declarative._workflows._executors_agents import (
+            InvokeAzureAgentExecutor,
+        )
+
+        # Create a mock State with kwargs stored
+        mock_state = MagicMock(spec=State)
+        state_data: dict[str, Any] = {}
+
+        def mock_get(key, default=None):
+            return state_data.get(key, default)
+
+        def mock_set(key, value):
+            state_data[key] = value
+
+        mock_state.get = MagicMock(side_effect=mock_get)
+        mock_state.set = MagicMock(side_effect=mock_set)
+
+        # Store kwargs in state like Workflow.run() does
+        test_kwargs = {"user_token": "abc123", "service_config": {"endpoint": "http://test"}}
+        state_data[WORKFLOW_RUN_KWARGS_KEY] = {"function_invocation_kwargs": {"__global__": test_kwargs}}
+
+        # Initialize declarative state
+        dws = DeclarativeWorkflowState(mock_state)
+        dws.initialize({"input": "hello"})
+
+        # Create a mock agent
+        mock_response = MagicMock()
+        mock_response.text = "response text"
+        mock_response.messages = []
+        mock_response.tool_calls = []
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=mock_response)
+
+        # Create a mock workflow context
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = MagicMock(side_effect=mock_get)
+        mock_ctx.yield_output = AsyncMock()
+
+        executor = InvokeAzureAgentExecutor.__new__(InvokeAzureAgentExecutor)
+        executor.id = "test_agent"
+        executor._agents = {"test_agent": mock_agent}
+
+        await executor._invoke_agent_and_store_results(
+            agent=mock_agent,
+            agent_name="test_agent",
+            input_text="hello",
+            state=dws,
+            ctx=mock_ctx,
+            messages_var=None,
+            response_obj_var=None,
+            result_property=None,
+            auto_send=True,
+        )
+
+        # Verify agent.run was called with kwargs
+        mock_agent.run.assert_called_once()
+        call_kwargs = mock_agent.run.call_args
+
+        assert call_kwargs.kwargs["options"] is None
+        assert call_kwargs.kwargs["function_invocation_kwargs"] == test_kwargs
+
+    @pytest.mark.asyncio
+    async def test_invoke_agent_merges_caller_options(self):
+        """Caller-provided options in run_kwargs should be merged, not cause TypeError."""
+        from agent_framework._workflows._const import WORKFLOW_RUN_KWARGS_KEY
+        from agent_framework._workflows._state import State
+
+        from agent_framework_declarative._workflows._executors_agents import (
+            InvokeAzureAgentExecutor,
+        )
+
+        mock_state = MagicMock(spec=State)
+        state_data: dict[str, Any] = {}
+
+        def mock_get(key, default=None):
+            return state_data.get(key, default)
+
+        def mock_set(key, value):
+            state_data[key] = value
+
+        mock_state.get = MagicMock(side_effect=mock_get)
+        mock_state.set = MagicMock(side_effect=mock_set)
+
+        # Include 'options' in run_kwargs to test merge behavior
+        test_kwargs = {
+            "function_invocation_kwargs": {"__global__": {"user_token": "abc123"}},
+            "options": {"temperature": 0.5, "additional_function_arguments": {"caller_value": "preserved"}},
+        }
+        state_data[WORKFLOW_RUN_KWARGS_KEY] = test_kwargs
+
+        dws = DeclarativeWorkflowState(mock_state)
+        dws.initialize({"input": "hello"})
+
+        mock_response = MagicMock()
+        mock_response.text = "response text"
+        mock_response.messages = []
+        mock_response.tool_calls = []
+        mock_agent = AsyncMock()
+        mock_agent.run = AsyncMock(return_value=mock_response)
+
+        mock_ctx = MagicMock()
+        mock_ctx.get_state = MagicMock(side_effect=mock_get)
+        mock_ctx.yield_output = AsyncMock()
+
+        executor = InvokeAzureAgentExecutor.__new__(InvokeAzureAgentExecutor)
+        executor.id = "test_agent"
+        executor._agents = {"test_agent": mock_agent}
+
+        await executor._invoke_agent_and_store_results(
+            agent=mock_agent,
+            agent_name="test_agent",
+            input_text="hello",
+            state=dws,
+            ctx=mock_ctx,
+            messages_var=None,
+            response_obj_var=None,
+            result_property=None,
+            auto_send=True,
+        )
+
+        mock_agent.run.assert_called_once()
+        call_kwargs = mock_agent.run.call_args
+
+        assert call_kwargs.kwargs["options"] == {
+            "temperature": 0.5,
+            "additional_function_arguments": {"caller_value": "preserved"},
+        }
+        assert call_kwargs.kwargs["function_invocation_kwargs"] == {"user_token": "abc123"}

@@ -1,0 +1,174 @@
+﻿// Copyright (c) Microsoft. All rights reserved.
+
+using System;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Agents.AI.Workflows.Declarative.Extensions;
+using Microsoft.Agents.AI.Workflows.Declarative.Kit;
+using Microsoft.Agents.AI.Workflows.Declarative.PowerFx;
+using Microsoft.Agents.ObjectModel;
+using Microsoft.Agents.ObjectModel.Abstractions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.PowerFx;
+using Microsoft.PowerFx.Types;
+
+namespace Microsoft.Agents.AI.Workflows.Declarative.Interpreter;
+
+internal abstract class DeclarativeActionExecutor<TAction>(TAction model, WorkflowFormulaState state) :
+    DeclarativeActionExecutor(model, state)
+    where TAction : DialogAction
+{
+    public new TAction Model => (TAction)base.Model;
+}
+
+internal abstract class DeclarativeActionExecutor : Executor<ActionExecutorResult>, IResettableExecutor, IModeledAction
+{
+    protected const string ConnectionNameLocation = "connection name";
+    protected const string ConversationIdLocation = "conversation ID";
+    protected const string MessageAfterLocation = "message-after cursor";
+    protected const string MessageBeforeLocation = "message-before cursor";
+    protected const string MessageIdLocation = "message ID";
+
+    protected DeclarativeActionExecutor(DialogAction model, WorkflowFormulaState state)
+        : base(model.Id.Value)
+    {
+        if (!model.HasRequiredProperties)
+        {
+            throw new DeclarativeModelException($"Missing required properties for element: {model.GetId()} ({model.GetType().Name}).");
+        }
+
+        this.State = state;
+
+        this.Model = model;
+    }
+
+    protected override ProtocolBuilder ConfigureProtocol(ProtocolBuilder protocolBuilder)
+    {
+        return base.ConfigureProtocol(protocolBuilder)
+                   // We chain to HandleAsync, so let the protocol know we have additional Send/Yield types that may not be
+                   // available on the HandleAsync override.
+                   .AddDelegateAttributeTypes(this.ExecuteAsync);
+    }
+
+    public DialogAction Model { get; }
+
+    public string ParentId { get => field ??= this.Model.GetParentId() ?? WorkflowActionVisitor.Steps.Root(); }
+
+    public RecalcEngine Engine => this.State.Engine;
+
+    public WorkflowExpressionEngine Evaluator => this.State.Evaluator;
+
+    protected WorkflowFormulaState State { get; }
+
+    internal ILogger Logger { get; set; } = NullLogger<DeclarativeActionExecutor>.Instance;
+
+    protected virtual bool IsDiscreteAction => true;
+
+    protected virtual bool EmitResultEvent => true;
+
+    /// <inheritdoc/>
+    public virtual ValueTask ResetAsync()
+    {
+        this.State.Reset();
+        return default;
+    }
+
+    /// <inheritdoc/>
+    [SendsMessage(typeof(ActionExecutorResult))]
+    public override async ValueTask HandleAsync(ActionExecutorResult message, IWorkflowContext context, CancellationToken cancellationToken = default)
+    {
+        // Establish the Foundry ProductContext on the current async logical context before
+        // running any code that reads PropertyPath.VariableName / NamespaceAlias. ObjectModel
+        // resolves those lazily against AsyncLocal<ProductContext>; when the workflow is
+        // hosted (AsAIAgent + AddFoundryResponses) each HTTP request runs on a fresh logical
+        // context where the build-thread setting does not flow.
+        WorkflowDiagnostics.SetFoundryProduct();
+
+        if (this.Model.Disabled)
+        {
+            Debug.WriteLine($"DISABLED {this.GetType().Name} [{this.Id}]");
+            return;
+        }
+
+        await context.RaiseInvocationEventAsync(this.Model, message.ExecutorId, cancellationToken).ConfigureAwait(false);
+
+        try
+        {
+            object? result = await this.ExecuteAsync(new DeclarativeWorkflowContext(context, this.State), cancellationToken).ConfigureAwait(false);
+            Debug.WriteLine($"RESULT #{this.Id} - {result ?? "(null)"}");
+
+            if (this.EmitResultEvent)
+            {
+                await context.SendResultMessageAsync(this.Id, result, cancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (DeclarativeActionException exception)
+        {
+            Debug.WriteLine($"ERROR [{this.Id}] {exception.GetType().Name}\n{exception.Message}");
+            throw;
+        }
+        catch (Exception exception)
+        {
+            Debug.WriteLine($"ERROR [{this.Id}] {exception.GetType().Name}\n{exception.Message}");
+            throw new DeclarativeActionException($"Unhandled workflow failure - #{this.Id} ({this.Model.GetType().Name})", exception);
+        }
+        finally
+        {
+            if (this.IsDiscreteAction)
+            {
+                await context.RaiseCompletionEventAsync(this.Model, cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    protected abstract ValueTask<object?> ExecuteAsync(IWorkflowContext context, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Restore the state of the executor from a checkpoint.
+    /// This must be overridden to restore any state that was saved during checkpointing.
+    /// </summary>
+    protected override ValueTask OnCheckpointRestoredAsync(IWorkflowContext context, CancellationToken cancellationToken = default) =>
+        this.State.RestoreAsync(context, cancellationToken);
+
+    protected async ValueTask AssignAsync(PropertyPath? targetPath, FormulaValue result, IWorkflowContext context, SensitivityLevel sensitivity = SensitivityLevel.None)
+    {
+        if (targetPath is null)
+        {
+            return;
+        }
+
+        await context.QueueStateUpdateAsync(targetPath, result, sensitivity).ConfigureAwait(false);
+        string variableName = targetPath.VariableName ?? throw new DeclarativeActionException($"Invalid variable reference: '{targetPath}'.");
+        this.State.SetSensitivity(variableName, targetPath.NamespaceAlias, sensitivity);
+
+#if DEBUG
+        string? resultValue = sensitivity == SensitivityLevel.Sensitive ? "<redacted>" : result.Format();
+        string valuePosition = (resultValue?.IndexOf('\n') ?? -1) >= 0 ? Environment.NewLine : " ";
+        Debug.WriteLine(
+            $"""
+            STATE: {this.GetType().Name} [{this.Id}]
+             NAME: {targetPath}
+            VALUE:{valuePosition}{resultValue} ({result.GetType().Name})
+            """);
+#endif
+    }
+
+    protected T GetNonSensitiveValue<T>(EvaluationResult<T> result, string location)
+    {
+        if (result.Sensitivity == SensitivityLevel.Sensitive)
+        {
+            throw new DeclarativeActionException(
+                $"Cannot use a sensitive value for {location} in {this.Model.GetType().Name} [{this.Id}].");
+        }
+
+        return result.Value;
+    }
+
+    protected DeclarativeActionException Exception(string text, Exception? exception = null)
+    {
+        string message = $"Unexpected workflow failure during {this.Model.GetType().Name} [{this.Id}]: {text}";
+        return exception is null ? new(message) : new(message, exception);
+    }
+}

@@ -1,0 +1,112 @@
+﻿// Copyright (c) Microsoft. All rights reserved.
+
+using System;
+using Microsoft.Agents.AI;
+using Microsoft.Agents.AI.Hosting;
+using Microsoft.Agents.AI.Hosting.OpenAI;
+using Microsoft.Agents.AI.Hosting.OpenAI.ChatCompletions;
+using Microsoft.Agents.AI.Hosting.OpenAI.Conversations;
+using Microsoft.Agents.AI.Hosting.OpenAI.Responses;
+using Microsoft.AspNetCore.Http.Json;
+using Microsoft.Extensions.AI;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+
+namespace Microsoft.Extensions.DependencyInjection;
+
+/// <summary>
+/// Extension methods for <see cref="IServiceCollection"/> to configure OpenAI support.
+/// </summary>
+public static class MicrosoftAgentAIHostingOpenAIServiceCollectionExtensions
+{
+    /// <summary>
+    /// Adds support for exposing <see cref="AIAgent"/> instances via OpenAI ChatCompletions.
+    /// </summary>
+    /// <param name="services">The <see cref="IServiceCollection"/> to configure.</param>
+    /// <returns>The <see cref="IServiceCollection"/> for method chaining.</returns>
+    /// <remarks>
+    /// This configures protocol serialization, not caller authentication or endpoint authorization.
+    /// Protect mapped Chat Completions endpoints, for example with <c>RequireAuthorization()</c>.
+    /// The adapter does not itself persist conversations; isolate any application-owned state separately.
+    /// </remarks>
+    public static IServiceCollection AddOpenAIChatCompletions(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        services.Configure<JsonOptions>(options => options.SerializerOptions.TypeInfoResolverChain.Add(ChatCompletionsJsonSerializerOptions.Default.TypeInfoResolver!));
+
+        return services;
+    }
+
+    /// <summary>
+    /// Adds support for exposing <see cref="AIAgent"/> instances via OpenAI Responses.
+    /// Uses the in-memory responses service implementation.
+    /// </summary>
+    /// <param name="services">The <see cref="IServiceCollection"/> to configure.</param>
+    /// <returns>The <see cref="IServiceCollection"/> for method chaining.</returns>
+    /// <remarks>
+    /// Response and conversation identifiers are scoped by the registered
+    /// <see cref="AgentIsolationKeyProvider"/>. Hosts serving multiple callers should register a provider,
+    /// require authentication on the mapped endpoints, and use a stable claim that uniquely identifies the caller.
+    /// Without a provider, all callers share the same in-memory namespace.
+    /// <para>
+    /// This method does not configure authentication or endpoint authorization. For claims-based
+    /// isolation, also register <c>AddHttpContextAccessor()</c> and <c>UseClaimsBasedAgentIsolation(...)</c>
+    /// from <c>Microsoft.Agents.AI.Hosting.AspNetCore</c>. Protect each mapped Responses and Conversations
+    /// route group. Their storage needs caller isolation even without an <see cref="AgentSessionStore"/>.
+    /// A configured agent session store is used as registered; use an isolation-enabled helper such as
+    /// <c>WithSessionStore(...)</c> or wrap it in <see cref="IsolationKeyScopedAgentSessionStore"/> to scope it to the caller.
+    /// </para>
+    /// <para>
+    /// Agents that expose <see cref="ApprovalRequiredAIFunction"/> tools must also
+    /// configure an <see cref="AgentSessionStore"/>. The store preserves the server-recorded approval request
+    /// across HTTP requests so an incoming decision can be matched to the exact function call shown to the user.
+    /// A <c>function_approval_response</c> request is rejected when no session store is configured.
+    /// </para>
+    /// </remarks>
+    public static IServiceCollection AddOpenAIResponses(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        services.Configure<JsonOptions>(options
+            => options.SerializerOptions.TypeInfoResolverChain.Add(
+                OpenAIHostingJsonContext.Default.Options.TypeInfoResolver!));
+
+        services.TryAddSingleton<IConversationStorage, InMemoryConversationStorage>();
+        services.TryAddSingleton<IAgentConversationIndex, InMemoryAgentConversationIndex>();
+        services.TryAddSingleton<InMemoryStorageOptions>();
+        services.TryAddSingleton<IResponsesService>(sp =>
+        {
+            var executor = sp.GetRequiredService<IResponseExecutor>();
+            var options = sp.GetRequiredService<InMemoryStorageOptions>();
+            var conversationStorage = sp.GetService<IConversationStorage>();
+            var isolationKeyProvider = sp.GetService<AgentIsolationKeyProvider>();
+            var isolationKeyResolver = new IsolationKeyResolver(isolationKeyProvider, strict: isolationKeyProvider is not null);
+            return new InMemoryResponsesService(executor, options, conversationStorage, isolationKeyResolver);
+        });
+        services.TryAddSingleton<IResponseExecutor, HostedAgentResponseExecutor>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Adds in-memory conversation storage and indexing services to the service collection.
+    /// This is suitable only for development and testing scenarios.
+    /// </summary>
+    /// <param name="services">The service collection to add services to.</param>
+    /// <returns>The service collection for chaining.</returns>
+    /// <remarks>
+    /// This registers storage, not authentication or endpoint authorization. Multi-user hosts must
+    /// register an <see cref="AgentIsolationKeyProvider"/> and protect the mapped Conversations endpoints.
+    /// An agent session store is not required for this conversation storage to retain caller data.
+    /// </remarks>
+    public static IServiceCollection AddOpenAIConversations(this IServiceCollection services)
+    {
+        ArgumentNullException.ThrowIfNull(services);
+
+        // Register storage options
+        services.TryAddSingleton<InMemoryStorageOptions>();
+        services.TryAddSingleton<IConversationStorage, InMemoryConversationStorage>();
+        services.TryAddSingleton<IAgentConversationIndex, InMemoryAgentConversationIndex>();
+        return services;
+    }
+}

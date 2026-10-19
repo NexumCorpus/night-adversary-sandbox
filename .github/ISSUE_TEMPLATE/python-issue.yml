@@ -1,0 +1,124 @@
+name: Python Bug Report
+description: Report a reproducible bug in the Agent Framework Python SDK
+title: "Python: [Bug]: "
+labels: ["Python"]
+type: bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for reproducible defects. Ask usage questions in
+        [Discussions](https://github.com/microsoft/agent-framework/discussions).
+
+  - type: textarea
+    id: observed-behavior
+    attributes:
+      label: Observed Behavior
+      description: What happened?
+      placeholder: Describe the incorrect behavior and its impact.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected Behavior
+      description: What did you expect to happen?
+      placeholder: Describe the expected result.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction-steps
+    attributes:
+      label: Steps to Reproduce
+      description: Provide the smallest reliable sequence that reproduces the problem.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: minimal-reproduction
+    attributes:
+      label: Minimal Reproduction
+      description: Provide minimal code or a repository link. If unavailable, explain why.
+      placeholder: |
+        ```python
+        # Minimal code that reproduces the problem
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: error-messages
+    attributes:
+      label: Error Messages and Stack Traces
+      description: Include the complete relevant error output after removing credentials, authorization headers, signed URLs, personal data, internal endpoints, and other sensitive values.
+      render: text
+    validations:
+      required: false
+
+  - type: input
+    id: python-packages
+    attributes:
+      label: Package Versions
+      description: List the agent-framework-* packages and exact versions you are using.
+      placeholder: "agent-framework-core: 1.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python Version
+      description: What version of Python are you using?
+      placeholder: "Python 3.13"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: operating-system
+    attributes:
+      label: Operating System
+      options:
+        - Windows
+        - macOS
+        - Linux
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: regression
+    attributes:
+      label: Regression
+      description: Did this work in an earlier Agent Framework version?
+      options:
+        - "Yes"
+        - "No"
+        - Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional Context
+      description: Add any other relevant context, logs, or screenshots.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: acknowledgements
+    attributes:
+      label: Acknowledgements
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
+        - label: I personally verified this behavior and the reproduction details are authentic.
+          required: true
+        - label: I will wait for explicit maintainer agreement before starting implementation of a non-trivial change.
+          required: true
