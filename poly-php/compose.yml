@@ -1,0 +1,260 @@
+# php56.${HOMELAB_DOMAIN}
+# php74.${HOMELAB_DOMAIN}
+# php85.${HOMELAB_DOMAIN}
+# phpmyadmin.${HOMELAB_DOMAIN}
+#
+# Multi-PHP LAMP development stack for testing applications across PHP 5.6, 7.4,
+# and 8.5 simultaneously.  All PHP containers share the same ./html volume so a
+# single code base can be exercised against every PHP version without copying files.
+#
+# Documentation : poly-php/README.md
+# Network setup : docs/network-architecture.md
+# Helper scripts : docs/scripts.md
+
+services:
+
+  # php56 — Apache/PHP 5.6 web server (End of Life; for migration testing only).
+  #
+  # Exposes:
+  #   ${PHP56_PORT}:80  — HTTP access to the PHP 5.6 application
+  #
+  # Volumes:
+  #   ./html               — shared document root (all PHP containers mount this)
+  #   ./php-config/php.ini — shared php.ini applied to this container
+  #   ./php-config/xdebug-php56.ini — Xdebug configuration for PHP 5.6
+  #   ./logs/php56         — Apache access and error logs
+  #
+  # Depends on: db (waits until MariaDB is healthy)
+  # Healthcheck: curl http://localhost/health.php every 30 s.
+  php56:
+    build: ./php56
+    container_name: lamp-php56
+    ports:
+      - "${PHP56_PORT}:80"
+    volumes:
+      - ./html:/var/www/html
+      - ./php-config/php.ini:/usr/local/etc/php/php.ini
+      - ./php-config/xdebug-php56.ini:/usr/local/etc/php/conf.d/xdebug.ini
+      - ./logs/php56:/var/log/apache2
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      homelab_macvlan:
+        ipv4_address: ${POLYPHP56_IP}  # fixe IP
+      poly_internal:
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLED}"
+      - "traefik.http.routers.php56.rule=Host(`php56.${HOMELAB_DOMAIN}`)"
+      - "traefik.http.routers.php56.entrypoints=websecure"
+      - "traefik.http.routers.php56.tls=${TRAEFIK_TLS_ENABLED}"
+      - "traefik.http.services.php56.loadbalancer.server.port=80"
+      - "traefik.docker.network=${NETWORK_NAME}"
+      - "homelab.name=PHP 5.6"
+      - "homelab.icon=PHP"
+      - "homelab.category=Development"
+      - "homelab.description=PHP 5.6 Entwicklungsumgebung"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health.php"]
+      interval: 30s
+      timeout: 12s
+      retries: 5
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # php74 — Apache/PHP 7.4 web server (Security fixes only; migrate to 8.x).
+  #
+  # Exposes:
+  #   ${PHP74_PORT}:80  — HTTP access to the PHP 7.4 application
+  #
+  # Volumes:
+  #   ./html               — shared document root (all PHP containers mount this)
+  #   ./php-config/php.ini — shared php.ini applied to this container
+  #   ./logs/php74         — Apache access and error logs
+  #
+  # Depends on: db (waits until MariaDB is healthy)
+  # Healthcheck: curl http://localhost/health.php every 30 s.
+  php74:
+    build: ./php74
+    container_name: lamp-php74
+    ports:
+      - "${PHP74_PORT}:80"
+    volumes:
+      - ./html:/var/www/html
+      - ./php-config/php.ini:/usr/local/etc/php/php.ini
+      - ./logs/php74:/var/log/apache2
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      homelab_macvlan:
+        ipv4_address: ${POLYPHP74_IP}  # fixe IP
+      poly_internal:
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLED}"
+      - "traefik.http.routers.php74.rule=Host(`php74.${HOMELAB_DOMAIN}`)"
+      - "traefik.http.routers.php74.entrypoints=websecure"
+      - "traefik.http.routers.php74.tls=${TRAEFIK_TLS_ENABLED}"
+      - "traefik.http.services.php74.loadbalancer.server.port=80"
+      - "traefik.docker.network=${NETWORK_NAME}"
+      - "homelab.name=PHP 7.4"
+      - "homelab.icon=PHP"
+      - "homelab.category=Development"
+      - "homelab.description=PHP 7.4 Entwicklungsumgebung"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health.php"]
+      interval: 30s
+      timeout: 12s
+      retries: 5
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # php85 — Apache/PHP 8.5 web server (current, recommended for production targets).
+  #
+  # Exposes:
+  #   ${PHP85_PORT}:80  — HTTP access to the PHP 8.5 application
+  #
+  # Volumes:
+  #   ./html               — shared document root (all PHP containers mount this)
+  #   ./php-config/php.ini — shared php.ini applied to this container
+  #   ./logs/php85         — Apache access and error logs
+  #
+  # Depends on: db (waits until MariaDB is healthy)
+  # Healthcheck: curl http://localhost/health.php every 30 s.
+  php85:
+    build: ./php85
+    container_name: lamp-php85
+    ports:
+      - "${PHP85_PORT}:80"
+    volumes:
+      - ./html:/var/www/html
+      - ./php-config/php.ini:/usr/local/etc/php/php.ini
+      - ./logs/php85:/var/log/apache2
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      homelab_macvlan:
+        ipv4_address: ${POLYPHP85_IP}  # fixe IP
+      poly_internal:
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLED}"
+      - "traefik.http.routers.php85.rule=Host(`php85.${HOMELAB_DOMAIN}`)"
+      - "traefik.http.routers.php85.entrypoints=websecure"
+      - "traefik.http.routers.php85.tls=${TRAEFIK_TLS_ENABLED}"
+      - "traefik.http.services.php85.loadbalancer.server.port=80"
+      - "traefik.docker.network=${NETWORK_NAME}"
+      - "homelab.name=PHP 8.5"
+      - "homelab.icon=PHP"
+      - "homelab.category=Development"
+      - "homelab.description=PHP 8.5 Entwicklungsumgebung"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/health.php"]
+      interval: 30s
+      timeout: 12s
+      retries: 5
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # db — MariaDB 10.11 relational database shared by all PHP containers.
+  #
+  # Volumes:
+  #   ./mysql_data  — persistent database files (survives container re-creation)
+  #
+  # Environment (set via .env):
+  #   MYSQL_ROOT_PASSWORD — root user password
+  #   MYSQL_DATABASE      — default schema created on first start
+  #   MYSQL_USER          — application user
+  #   MYSQL_PASSWORD      — application user password
+  #
+  # Healthcheck: healthcheck.sh --connect --innodb_initialized every 10 s.
+  db:
+    image: mariadb:10.11
+    container_name: lamp-db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - ./mysql_data:/var/lib/mysql
+      - ./db-init:/docker-entrypoint-initdb.d
+    networks:
+      - poly_internal
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # phpmyadmin — web-based database management UI connected to the db service.
+  #
+  # Exposes:
+  #   ${PHPMYADMIN_PORT}:80  — phpMyAdmin web interface
+  #
+  # Environment:
+  #   PMA_HOST  — hostname of the database service (db)
+  #   PMA_PORT  — database port (3306)
+  #
+  # Depends on: db (waits until MariaDB is healthy)
+  # Healthcheck: curl http://localhost/ every 10 s.
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: lamp-phpmyadmin
+    ports:
+      - "${PHPMYADMIN_PORT}:80"
+    environment:
+      PMA_HOST: db
+      PMA_PORT: 3306
+      PMA_USER: root
+      PMA_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      homelab_macvlan:
+        ipv4_address: ${POLYPHPADM_IP}  # fixe IP
+      poly_internal:
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLED}"
+      - "traefik.http.routers.phpmyadmin.rule=Host(`phpmyadmin.${HOMELAB_DOMAIN}`)"
+      - "traefik.http.routers.phpmyadmin.entrypoints=websecure"
+      - "traefik.http.routers.phpmyadmin.tls=${TRAEFIK_TLS_ENABLED}"
+      - "traefik.http.services.phpmyadmin.loadbalancer.server.port=80"
+      - "traefik.docker.network=${NETWORK_NAME}"
+      - "homelab.name=phpMyAdmin"
+      - "homelab.icon=DB"
+      - "homelab.category=Infrastructure"
+      - "homelab.description=Weboberflaeche fuer die PHP-Datenbank"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+networks:
+  homelab_macvlan:
+    external: true
+    name: ${NETWORK_NAME}
+  poly_internal:
+    driver: bridge
+    internal: true

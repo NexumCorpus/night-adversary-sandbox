@@ -1,0 +1,77 @@
+# ${GITEA_HOST}.${HOMELAB_DOMAIN}
+# docker compose file for gitea
+#
+# Gitea — lightweight self-hosted Git service with web UI, SSH, and issue tracking.
+# The container receives a static macvlan LAN-IP (${GITEA_IP}) and also publishes
+# its web and SSH ports on the host for direct access without a reverse proxy.
+#
+# Documentation : gitea/README.md
+# Network setup : docs/network-architecture.md
+# Helper scripts : docs/scripts.md
+
+services:
+  # gitea — self-hosted Git service (web UI + SSH).
+  #
+  # Exposes (via published host ports):
+  #   ${GITEA_PORT}:3000   — web interface
+  #   ${GITEA_SSH_PORT}:22 — SSH access for git clone/push/pull
+  #
+  # Volumes:
+  #   ./data          — repositories, Gitea configuration, and SQLite database
+  #   /etc/timezone   — timezone file from the host (Synology NAS path used)
+  #   /etc/localtime  — localtime from the host
+  #
+  # Database: SQLite3 (default); path /data/gitea/gitea.db inside the container.
+  # Healthcheck: polls the web root every 30 s via wget.
+  gitea:
+    container_name: gitea-homelab
+    # https://hub.docker.com/r/gitea/gitea/tags
+    image:  gitea/gitea:1
+    restart: unless-stopped
+    networks:
+      homelab_macvlan:
+        ipv4_address: ${GITEA_IP}  # fixe IP
+    volumes:
+      - ./data:/data
+#      - /etc/timezone:/etc/timezone:ro # use for linux systems
+      - /etc/TZ:/etc/timezone:ro       # use for synology NAS systems
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "${GITEA_PORT}:3000"  # web-ui
+      - "${GITEA_SSH_PORT}:2222"  # ssh
+
+    environment:
+      - USER_UID=${PUID}
+      - USER_GID=${PGID}
+      - TZ=${TZ}
+      - GITEA__database__DB_TYPE=sqlite3
+      - GITEA__database__PATH=/data/gitea/gitea.db
+      - GITEA__server__DOMAIN=${GITEA_HOST}.${HOMELAB_DOMAIN}
+      - GITEA__server__SSH_DOMAIN=${GITEA_HOST}.${HOMELAB_DOMAIN}
+      - GITEA__server__ROOT_URL=https://${GITEA_HOST}.${HOMELAB_DOMAIN}
+      - GITEA__server__HTTP_PORT=3000
+      - GITEA__server__SSH_PORT=${GITEA_SSH_PORT}
+
+    labels:
+      - "traefik.enable=${TRAEFIK_ENABLED}"
+      - "traefik.http.routers.gitea.tls=${TRAEFIK_TLS_ENABLED}"
+      - "traefik.http.routers.gitea.entrypoints=websecure"
+      - "traefik.http.routers.gitea.rule=Host(`${GITEA_HOST}.${HOMELAB_DOMAIN}`)"
+      - "traefik.http.services.gitea.loadbalancer.server.port=3000"
+      - "traefik.docker.network=${NETWORK_NAME}"
+      - "homelab.name=Gitea"
+      - "homelab.icon=Git"
+      - "homelab.category=Development"
+      - "homelab.description=Self-hosted Git-Service mit Issue-Tracking"
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/ >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+networks:
+  homelab_macvlan:
+    external: true
+    name: ${NETWORK_NAME}

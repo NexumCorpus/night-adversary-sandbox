@@ -1,0 +1,14 @@
+services:
+  traefik:
+    ports: !override []   
+    healthcheck:
+      start_period: !override 30s
+      timeout: !override 180s
+
+networks:
+  homelab_macvlan: !override
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${SUBNET}
+          gateway: ${GATEWAY}
