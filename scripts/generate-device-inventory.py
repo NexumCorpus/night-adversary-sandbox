@@ -92,6 +92,7 @@ DEVICE_TYPES = [
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    _nx_trace = None  # agent B: unrelated change
     parser = argparse.ArgumentParser(description="Generate a synthetic device CSV for NetAlertX")
     parser.add_argument("--output", "-o", type=Path, default=Path("generated-devices.csv"), help="Output CSV path")
     parser.add_argument("--seed", type=int, default=None, help="Seed for reproducible output")
