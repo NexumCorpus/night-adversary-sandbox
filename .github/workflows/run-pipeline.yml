@@ -1,0 +1,153 @@
+name: "🎬 Content Pipeline"
+
+on:
+  schedule:
+    # Jeden Tag 3-mal: 08:00, 12:00 und 17:00 Uhr deutscher Zeit (06:00, 10:00, 15:00 UTC)
+    - cron: "0 6,10,15 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Pipeline-Modus"
+        required: false
+        default: "default"
+        type: choice
+        options:
+          - default
+          - book
+          - artikel
+
+# Erlaubt dem GITHUB_TOKEN, Änderungen zu pushen und OIDC-Tokens für GCP Workload Identity abzurufen
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+  ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+  FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+  FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+  GOOGLE_APPLICATION_CREDENTIALS: credentials.json
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: ⏱️ Startzeit merken
+        id: start_time
+        run: echo "time=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: 📦 Dependencies installieren
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🎭 Playwright Browsers installieren
+        run: playwright install --with-deps chromium
+
+      - name: 🔑 Google Credentials einrichten
+        run: |
+          echo '${{ secrets.GOOGLE_CREDENTIALS_JSON }}' > credentials.json
+          echo '${{ secrets.DRIVE_TOKEN_JSON }}' > drive_token.json
+          echo '${{ secrets.TOKEN_JSON }}' > token.json
+
+      - name: 🚀 Pipeline starten
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          
+          # Wenn automatisch über Schedule gestartet, ermittle Modus basierend auf Wochentag
+          if [ -z "$MODE" ]; then
+            DAY_OF_WEEK=$(date +%u)
+            if [ "$DAY_OF_WEEK" = "2" ]; then
+              MODE="book"
+            else
+              MODE="default"
+            fi
+          fi
+          
+          if [ "$MODE" = "book" ]; then
+            echo "📚 Starte Pipeline im Buch-Modus..."
+            python run_pipeline.py --channel betheo --book
+          elif [ "$MODE" = "artikel" ]; then
+            echo "📝 Starte Pipeline im Artikel-Modus..."
+            python run_pipeline.py --channel betheo --artikel
+          else
+            echo "🔍 Starte Pipeline im Standard-Modus (Trend-Scout)..."
+            python run_pipeline.py --channel betheo
+          fi
+
+      - name: 💾 Historie-Dateien zurück ins Repo committen
+        if: success()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Historie-Dateien aus .gitignore herausnehmen (Force-Add)
+          git add -f output/historie_shorts.json || true
+          git add -f output/historie_long.json || true
+          
+          # Nur committen wenn sich etwas geändert hat
+          if git diff --cached --quiet; then
+            echo "📋 Keine Änderungen an Historie-Dateien – nichts zu committen."
+          else
+            git commit -m "🤖 Historie aktualisiert [skip ci]"
+            git push
+            echo "✅ Historie-Dateien erfolgreich committed und gepusht!"
+          fi
+
+      - name: 📤 Output als Artefakt hochladen
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-output-${{ github.run_number }}
+          path: output/
+          retention-days: 7
+
+      - name: 🔐 GCP Auth
+        if: always()
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: ☁️ Setup gcloud
+        if: always()
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: 📊 Metriken an Cloud Monitoring & Prometheus Pushgateway senden
+        if: always()
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+          PUSHGATEWAY_URL: ${{ secrets.PUSHGATEWAY_URL }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          JOB_STATUS: ${{ job.status }}
+          REPOSITORY: ${{ github.repository }}
+          START_TIME: ${{ steps.start_time.outputs.time }}
+        run: |
+          START="${{ steps.start_time.outputs.time }}"
+          END=$(date -u +%s)
+          if [ -n "$START" ]; then
+            export DURATION=$(( END - START ))
+          fi
+
+          # Status in eine Zahl umwandeln (1 für success, 0 für alles andere)
+          if [ "${{ job.status }}" = "success" ]; then
+            export STATUS_VAL=1
+          else
+            export STATUS_VAL=0
+          fi
+
+          python .github/scripts/send_monitoring_metrics.py
