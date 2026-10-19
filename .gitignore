@@ -1,0 +1,38 @@
+# Large external datasets (keep out of git)
+data/archive/remind/
+
+# Python bytecode
+__pycache__/
+
+# Python
+.venv/
+*.pyc
+
+# Secrets
+.env
+license.txt
+
+# Derived training data (ReMIND guides, pilot QC); regenerate with scripts/synthseg
+data/guides/
+
+# Local segmentation outputs (may contain patient-derived pixels)
+data/out/
+
+# Model weights / training output
+*.safetensors
+*.ckpt
+output/
+
+# Local LoRA training (scripts/lora, docs/lora-local.md): model weights, trainer checkout, venv, work dir
+models/
+third_party/
+.venv-lora/
+lora_work/
+
+# Render cache (illustrations of demo cases)
+data/render_cache/
+
+# Outside test set (UPENN-GBM, TCIA); regenerate with scripts/analysis/download_upenn.py
+data/archive/upenn-gbm/
+# Source scans for the bundled samples (regenerate with scripts/samples/build_samples.py)
+data/archive/samples_src/
