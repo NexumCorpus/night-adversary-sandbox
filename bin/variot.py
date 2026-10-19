@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+
+import logging.config
+
+from vulnerabilitylookup.default import AbstractManager, get_config
+from vulnerabilitylookup.feeders.variot import VARIoTDB
+
+logging.config.dictConfig(get_config('logging'))
+
+
+class VARIoTDBImporter(AbstractManager):
+
+    def __init__(self, loglevel: int | None=None, *, reimport: bool=False) -> None:
+        self.script_name = 'variot_importer'
+        super().__init__(loglevel)
+        self.variotdb = VARIoTDB(reimport=reimport)
+
+    def _to_run_forever(self) -> None:
+        self.variotdb.update(self.shutdown_requested)
+
+
+def main() -> None:
+    argparser = argparse.ArgumentParser(description='VARIoTDB Importer')
+    argparser.add_argument('--reimport', default=False, action='store_true', help='Reimport all data')
+    args = argparser.parse_args()
+    vdb = VARIoTDBImporter(reimport=args.reimport)
+    vdb.run(sleep_in_sec=3600)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,163 @@
+import json
+import uuid
+from typing import Any
+
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import validates
+
+from website.lib.sanitizers import sanitize_text
+from website.web.bootstrap import db
+
+# Association Table for n-n relationship between Organization and Product
+organization_product_association = db.Table(
+    "organization_product_association",
+    db.Column(
+        "organization_id",
+        db.Integer,
+        db.ForeignKey("organization.id"),
+        primary_key=True,
+    ),
+    db.Column("product_id", db.Integer, db.ForeignKey("product.id"), primary_key=True),
+)
+
+
+class Organization(db.Model):  # type: ignore[name-defined, misc]
+    """Represents an organization."""
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    uuid = db.Column(UUID(as_uuid=True), unique=True, default=uuid.uuid4)
+    name = db.Column(db.String(), nullable=False)
+    short_name = db.Column(db.String(), default="")
+    description = db.Column(db.String(), default="")
+    short_description = db.Column(db.String())
+    organization_type = db.Column(db.String(), default="")
+    website = db.Column(db.String(), default="")
+    email = db.Column(db.String(), default="")
+    country_code = db.Column(db.String(3), default="")  # ISO Alpha-3
+    is_membership_restricted = db.Column(db.Boolean(), default=True)
+    gna_id = db.Column(db.Integer, unique=True, nullable=True)
+    gcve_pull = db.Column(db.Boolean(), default=False)
+    creation_timestamp = db.Column(
+        db.DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_timestamp = db.Column(
+        db.DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # Foreign keys
+    icon_id = db.Column(
+        db.Integer, db.ForeignKey("icon.id"), nullable=True, default=None
+    )
+    owner_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False)
+
+    # Many-to-Many Relationship with Product
+    products = db.relationship(
+        "Product",
+        secondary=organization_product_association,
+        back_populates="organizations",
+    )
+
+    @validates("name")
+    def validates_name(self, key: str, value: str) -> str:
+        assert len(value) <= 100, "maximum length for name: 100"
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        return cleaned
+
+    @validates("short_name")
+    def validates_short_name(self, key: str, value: str) -> str:
+        assert len(value) <= 50, "maximum length for short name: 50"
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        return cleaned
+
+    @validates("description")
+    def validates_description(self, key: str, value: str) -> str:
+        assert len(value) <= 500, "maximum length for description: 500"
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        return cleaned
+
+    @validates("short_description")
+    def validates_short_description(self, key: str, value: str) -> str:
+        assert len(value) <= 250, "maximum length for short description: 250"
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        return cleaned
+
+    def get_cpe_vendors(self) -> list[Any]:
+        """Returns the list of CPE vendor names (synonyms) related to the vendor."""
+        return [alias for alias in self.cpe_vendors]
+
+    def __repr__(self) -> str:
+        return self.name
+
+    def __str__(self) -> str:
+        return self.name
+
+    def as_json(self) -> str:
+        return json.dumps(
+            {
+                "uuid": str(self.uuid),
+                "name": self.name,
+                "description": self.description,
+                "website": self.website,
+                "creation_timestamp": self.creation_timestamp.strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                ),
+                "updated_timestamp": self.updated_timestamp.strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                ),
+                "vendor_synonyms": [
+                    vendor_name.to_dict() for vendor_name in self.get_cpe_vendors()
+                ],
+                "products": [product.to_dict() for product in list(self.products)],
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self.as_json())
+
+
+class CPEVendor(db.Model):  # type: ignore[name-defined, misc]
+    """Stores alternative CPE vendor names related to an Organization."""
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    name = db.Column(db.String(), nullable=False, unique=True)
+    creation_timestamp = db.Column(
+        db.DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Foreign keys
+    organization_id = db.Column(
+        db.Integer, db.ForeignKey("organization.id"), nullable=False
+    )
+
+    # Relationships
+    vendor = db.relationship("Organization", backref="cpe_vendors")
+
+    @validates("name")
+    def validates_name(self, key: str, value: str) -> str:
+        assert len(value) <= 100, "maximum length for name: 100"
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        if not cleaned:
+            raise ValueError("Invalid name.")
+        return cleaned
+
+    def as_json(self) -> str:
+        return json.dumps(
+            {
+                "name": self.name,
+                "creation_timestamp": self.creation_timestamp.strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                ),
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self.as_json())

@@ -1,0 +1,66 @@
+"""Add new sighting object.
+
+Revision ID: 1647f317d44b
+Revises: 756de632f85b
+Create Date: 2024-10-15 12:06:00.525723
+
+"""
+
+import uuid
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision = "1647f317d44b"
+down_revision = "756de632f85b"
+branch_labels = None
+depends_on = None
+
+
+def upgrade():
+    # Creation if the sighting table
+    op.create_table(
+        "sighting",
+        sa.Column("uuid", sa.UUID(as_uuid=True), nullable=False),
+        sa.Column("vulnerability_lookup_origin", sa.UUID(), nullable=False),
+        sa.Column("vulnerability", sa.String(), nullable=True),
+        sa.Column("type", sa.String(), nullable=False),
+        sa.Column(
+            "creation_timestamp",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column("author_id", sa.Integer(), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["author_id"],
+            ["user.id"],
+        ),
+        sa.PrimaryKeyConstraint("uuid"),
+    )
+
+    # Add uuid column to the user table
+    op.add_column("user", sa.Column("uuid", sa.UUID(as_uuid=True), nullable=True))
+
+    # Set UUIDs for each user
+    conn = op.get_bind()
+    users = conn.execute(sa.text('SELECT "id" FROM public.user')).fetchall()
+    for user in users:
+        conn.execute(
+            sa.text("UPDATE public.user SET uuid = :uuid WHERE id = :id"),
+            {"uuid": str(uuid.uuid4()), "id": user.id},
+        )
+
+    # Alter column to make it non-nullable after populating existing data
+    op.alter_column("user", "uuid", nullable=False)
+    with op.batch_alter_table("user", schema=None) as batch_op:
+        batch_op.create_unique_constraint(None, ["uuid"])
+
+
+def downgrade():
+    with op.batch_alter_table("user", schema=None) as batch_op:
+        batch_op.drop_constraint(None, type_="unique")
+        batch_op.drop_column("uuid")
+
+    op.drop_table("sighting")

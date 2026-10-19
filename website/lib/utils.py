@@ -1,0 +1,173 @@
+import re
+import shlex
+import subprocess
+from threading import Thread
+from typing import Any, Callable, List
+
+import requests
+from sqlalchemy import desc, func
+
+from vulnerabilitylookup.default import get_homedir
+from website.models import Bundle, Comment, User
+from website.web.bootstrap import db
+
+ALLOWED_EXTENSIONS = ["xml", "opml", "json"]
+
+
+def async_maker(f: Callable[..., Any]) -> Callable[..., None]:
+    """
+    This decorator enables to launch a task (for example sending an email or
+    indexing the database) in background. This prevent the server to freeze.
+    """
+
+    def wrapper(*args: Any, **kwargs: Any) -> None:
+        thr = Thread(target=f, args=args, kwargs=kwargs)
+        thr.start()
+
+    return wrapper
+
+
+def allowed_file(filename: str) -> bool:
+    """
+    Check if the uploaded file is allowed.
+    """
+    return "." in filename and filename.rsplit(".", 1)[1] in ALLOWED_EXTENSIONS
+
+
+def exec_cmd(command: str) -> str:
+    """Execute a command in a sub process and wait for the result."""
+    bash_string = r"""#!/bin/bash
+    set -e
+    {}
+    """.format(
+        command
+    )
+    result = subprocess.check_output(
+        bash_string, shell=True, executable="/bin/bash", text=True, cwd=get_homedir()
+    )
+    return result.strip()
+
+
+def exec_cmd_no_wait(command: str, cwd: str = "") -> None:
+    """Execute a command in a sub process."""
+    args = shlex.split(command)
+    if cwd == "":
+        cwd = get_homedir().absolute().as_posix()
+    subprocess.Popen(args, stdout=subprocess.PIPE, cwd=cwd)
+
+
+def find_cve_ids(text: str) -> List[str]:
+    """Find CVE IDs in a text. Returns a list of string."""
+    # Regex pattern to match CVE IDs (e.g., CVE-2021-34527 or cve-2021-34527)
+    cve_pattern = r"CVE-\d{4}-\d{4,7}"
+
+    # Find all matches in the text (case-insensitive search)
+    cve_ids = re.findall(cve_pattern, text, re.IGNORECASE)
+
+    cve_ids = [item.upper() for item in cve_ids]
+    cve_ids = list(set(cve_ids))
+
+    return cve_ids
+
+
+def find_ghsa_ids(text: str) -> List[str]:
+    """Find GHSA IDs in a text. Returns a list of string."""
+    # Regex pattern to match GHSA IDs (e.g., GHSA-xxxx-xxxx-xxxx or ghsa-xxxx-xxxx-xxxx)
+    ghsa_pattern = r"GHSA-[a-zA-Z0-9]{4}-[a-zA-Z0-9]{4}-[a-zA-Z0-9]{4}"
+
+    # Find all matches in the text (case-insensitive search)
+    ghsa_ids = re.findall(ghsa_pattern, text, re.IGNORECASE)
+
+    ghsa_ids = [item.lower() for item in ghsa_ids]
+    ghsa_ids = [item.replace("ghsa-", "GHSA-") for item in ghsa_ids]
+    ghsa_ids = list(set(ghsa_ids))
+
+    return ghsa_ids
+
+
+def find_pysec_ids(text: str) -> List[str]:
+    """Find PyPI Security Advisory (PySec) IDs in a text. Returns a list of string."""
+    # Regex pattern to match PySec IDs (e.g., PYSEC-YYYY-NNN or pysec-yyyy-nnn)
+    pysec_pattern = r"PYSEC-\d{4}-\d{2,5}"
+
+    # Find all matches in the text (case-insensitive search)
+    pysec_ids = re.findall(pysec_pattern, text, re.IGNORECASE)
+    pysec_ids = [item.upper() for item in pysec_ids]
+    pysec_ids = list(set(pysec_ids))
+
+    return pysec_ids
+
+
+def query_country_code_mmdb(ip_address: str) -> str:
+    """Query the MMDB server from CIRCL in order to get the Aplha-3 code from an IP address."""
+    url = f"https://ip.circl.lu/geolookup/{ip_address}"
+    try:
+        response = requests.get(url)
+    except Exception:
+        return ""
+    if response.status_code == 200:
+        try:
+            return response.json()[0]["country_info"]["Alpha-3 code"]
+        except Exception:
+            return ""
+    else:
+        return ""
+
+
+def top_contributors(limit: int = 3) -> List[Any]:
+    """Return the list of the top 3 (by default) contributors (creation of comments and bundles)."""
+    # Subquery to count comments for each user
+    comment_count_subquery = (
+        db.session.query(
+            Comment.author_id, func.count(Comment.uuid).label("comment_count")
+        )
+        .group_by(Comment.author_id)
+        .subquery()
+    )
+
+    # Subquery to count bundles for each user
+    bundle_count_subquery = (
+        db.session.query(
+            Bundle.author_id, func.count(Bundle.uuid).label("bundle_count")
+        )
+        .group_by(Bundle.author_id)
+        .subquery()
+    )
+
+    # Main query to sum the counts of comments and bundles for each user
+    top_contributors = (
+        db.session.query(
+            User.id,
+            User.login,
+            (
+                func.coalesce(comment_count_subquery.c.comment_count, 0)
+                + func.coalesce(bundle_count_subquery.c.bundle_count, 0)
+            ).label("total_contributions"),
+        )
+        .outerjoin(
+            comment_count_subquery, User.id == comment_count_subquery.c.author_id
+        )
+        .outerjoin(bundle_count_subquery, User.id == bundle_count_subquery.c.author_id)
+        .order_by(desc("total_contributions"))
+    )
+    if limit != -1:
+        top_contributors = top_contributors.limit(
+            limit
+        )  # Limit to the top 3 (by default) contributors
+    return top_contributors.all()
+
+
+def inject_xslt(xml_bytes: bytes) -> bytes:
+    xslt_line = '<?xml-stylesheet href="/static/style.xsl" type="text/xsl"?>'
+    xml_str = xml_bytes.decode("utf-8")
+    if xml_str.startswith("<?xml"):
+        return xml_str.replace("?>", "?>\n" + xslt_line, 1).encode("utf-8")
+    else:
+        return (
+            '<?xml version="1.0" encoding="utf-8"?>\n' + xslt_line + xml_str
+        ).encode("utf-8")
+
+
+def escape_ilike(value: str) -> str:
+    """Escape % and _ for ILIKE queries."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

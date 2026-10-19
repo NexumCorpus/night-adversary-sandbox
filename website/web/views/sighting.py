@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+
+import html
+import json
+import re
+from datetime import datetime, timezone
+from io import BytesIO
+from urllib.parse import quote
+from uuid import UUID
+
+from dateutil.relativedelta import relativedelta  # type: ignore[import-untyped]
+from feedgen.feed import FeedGenerator  # type: ignore[import-untyped]
+from flask import (
+    Blueprint,
+    Response,
+    abort,
+    make_response,
+    render_template,
+    request,
+    send_file,
+    url_for,
+)
+from flask_paginate import (  # type: ignore[import-untyped]
+    Pagination,
+    get_page_args,
+    get_parameter,
+)
+from sqlalchemy import func, or_
+from werkzeug import Response as WerkzeugResponse
+
+from vulnerabilitylookup.default import get_config
+from website.lib.utils import escape_ilike, inject_xslt
+from website.models import Sighting
+from website.web.bootstrap import application, vulnerabilitylookup
+
+sightings_bp = Blueprint(
+    "sightings_bp", __name__, url_prefix="/sightings", template_folder="sightings"
+)
+
+sighting_bp = Blueprint(
+    "sighting_bp", __name__, url_prefix="/sighting", template_folder="sightings"
+)
+
+
+@sightings_bp.route("/", methods=["GET"])
+def list_sightings() -> str:
+    sighting_query = request.args.get("query", "").strip()
+    sightings = Sighting.query
+    if sighting_query:
+        escaped_query = escape_ilike(sighting_query)
+        try:
+            uuid_obj = UUID(sighting_query)
+        except Exception:
+            uuid_obj = None
+        if uuid_obj:
+            sightings = sightings.filter(
+                or_(
+                    Sighting.uuid == uuid_obj,
+                    Sighting.type == sighting_query,
+                    Sighting.source.ilike(f"%{escaped_query}%", escape="\\"),
+                    Sighting.vulnerability.ilike(f"%{escaped_query}%", escape="\\"),
+                    Sighting.author.has(login=sighting_query),
+                )
+            )
+        else:
+            sightings = sightings.filter(
+                or_(
+                    Sighting.type == sighting_query,
+                    Sighting.source.ilike(f"%{escaped_query}%", escape="\\"),
+                    Sighting.vulnerability.ilike(f"%{escaped_query}%", escape="\\"),
+                    Sighting.author.has(login=sighting_query),
+                )
+            )
+    sightings = sightings.order_by(Sighting.creation_timestamp.desc())
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=sightings.count(),
+        record_name="sightings",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    sightings = sightings.offset(offset).limit(per_page)
+
+    return render_template(
+        "sightings/sightings.html",
+        sightings=sightings,
+        pagination=pagination,
+    )
+
+
+@sighting_bp.route("/<uuid:sighting_uuid>/correlations", methods=["GET"])
+def correlations(sighting_uuid: str = "") -> str:
+    """Return the sighting as a JSON file."""
+    elem = Sighting.query.filter(Sighting.uuid == sighting_uuid).first()
+    if elem is None:
+        abort(404)
+
+    return render_template(
+        "sightings/correlations.html",
+        sighting=elem.to_dict(),
+    )
+
+
+@sighting_bp.route("/<uuid:sighting_uuid>/export", methods=["GET"])
+def export(sighting_uuid: str = "") -> WerkzeugResponse:
+    """Return the sighting as a JSON file."""
+    elem = Sighting.query.filter(Sighting.uuid == sighting_uuid).first()
+    if elem is None:
+        abort(404)
+    buffer = BytesIO()
+    buffer.write(elem.as_json().encode("utf-8"))
+    buffer.seek(0)  # Move to the beginning of the file-like object
+
+    # Use send_file to return the file-like object as an attachment
+    return send_file(
+        buffer,
+        as_attachment=True,
+        download_name=f"{sighting_uuid}.json",
+        mimetype="application/json",
+    )
+
+
+@sightings_bp.route("/misp_export", methods=["GET"])
+def export_sightings_vuln() -> WerkzeugResponse:
+    """Return the sightings related to a vulnerability in a JSON file."""
+    vulnerability = request.args.get("vulnerability", "").strip()
+    escaped_vulnerability = html.escape(vulnerability)
+    escaped_query = escape_ilike(escaped_vulnerability)
+    elems = Sighting.query.filter(
+        Sighting.vulnerability.ilike(f"%{escaped_query}%", escape="\\")
+    ).all()
+
+    if not elems:  # Check if the list is empty
+        abort(404, description="No results found")
+
+    sightings = [elem.to_dict() for elem in elems]
+
+    # Convert the Python dictionary to a JSON string
+    json_data = json.dumps(
+        {"vulnerability": escaped_vulnerability, "sightings": sightings}
+    )
+
+    # Create a response with the raw JSON data
+    response = make_response(json_data)
+
+    # Set headers for file download and proper content type
+    response.headers["Content-Disposition"] = (
+        f"attachment; filename=sightings-{escaped_vulnerability}.json"
+    )
+    response.headers["Content-Type"] = "application/json"
+
+    return response
+
+
+@sightings_bp.route("/feed.<string:format>", defaults={"per_page": 10}, methods=["GET"])
+def feed_sightings(per_page: int = 10, format: str = "atom") -> Response:
+    """RSS/ATOM feed for the recent sightings."""
+    vulnerability = request.args.get("vulnerability", "")
+    source = request.args.get("source", "")
+    user = request.args.get("user", "")
+    public_domain = get_config("generic", "public_domain")
+    _, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    feed_max_per_page = application.config.get("FEED_MAX_PER_PAGE", 50)
+    if per_page > feed_max_per_page:
+        per_page = feed_max_per_page
+    fg = FeedGenerator()
+    fg.id(f"https://{public_domain}/sightings/feed")
+    fg.title("Most recent sightings.")
+    fg.author(
+        {
+            "name": "Vulnerability-Lookup",
+            "email": application.config.get("ADMIN_EMAIL", ""),
+        }
+    )
+    fg.link(href=f"https://{public_domain}", rel="alternate")
+    fg.subtitle(f"Contains only the most {per_page} recent sightings.")
+    fg.language("en")
+
+    query = Sighting.query
+    if vulnerability:
+        escaped_query = escape_ilike(vulnerability)
+        query = query.filter(
+            Sighting.vulnerability.ilike(f"%{escaped_query}%", escape="\\")
+        )
+    if source:
+        query = query.filter(Sighting.source.like("%" + source + "%"))
+    if user:
+        query = query.filter(Sighting.author.has(login=user))
+    query = query.order_by(Sighting.creation_timestamp.desc())
+
+    sightings = query.offset(offset).limit(per_page)
+
+    for sighting in sightings:
+        fe = fg.add_entry()
+        fe.author(
+            [
+                {
+                    "name": sighting.author.name,
+                    "uri": url_for(
+                        "user_bp.profile", login=sighting.author.login, _external=True
+                    ),
+                }
+            ]
+        )
+        fe.id(f"https://{public_domain}/sighting/{sighting.uuid}/export")
+        fe.title(str(sighting.uuid))
+        fe.link(href=f"https://{public_domain}/sighting/{sighting.uuid}/export")
+        fe.content(sighting.as_json())
+        fe.description(sighting.as_json())
+        fe.published(sighting.creation_timestamp.replace(tzinfo=timezone.utc))
+
+    # Generate feed with XSLT
+    feed_bytes = inject_xslt(
+        fg.atom_str(pretty=True) if format == "atom" else fg.rss_str(pretty=True)
+    )
+    return Response(feed_bytes, mimetype="application/xml")
+
+
+@sightings_bp.route("/cpesearch/<string:cpe>/feed.<string:format>", methods=["GET"])
+def feed_cpe_search(cpe: str, format: str = "atom") -> Response:
+    """RSS/ATOM feed for the recent sightings related to a CPE."""
+    public_domain = get_config("generic", "public_domain")
+
+    # Extract vendor and product from CPE
+    pattern = r"^cpe:\d+\.\d+:[aho]:(.*?):(.*?)(:|$)"
+    match = re.match(pattern, cpe)
+    if not match:
+        abort(404, description="No results found")
+    vendor, product = match.group(1), match.group(2)
+
+    # Look back 3 months
+    some_times_ago = datetime.now() - relativedelta(months=3)
+
+    # Get vulnerabilities
+    vulns = vulnerabilitylookup.get_vendor_product_vulnerabilities_since(
+        vendor, product, [], some_times_ago
+    )
+
+    fg = FeedGenerator()
+    fg.id(f"https://{public_domain}/sightings/cpesearch/{quote(cpe)}")  # Unique feed ID
+    fg.title(f"Most recent sightings for CPE {cpe}")
+    fg.subtitle(f"Most recent sightings for CPE {cpe}")
+    fg.author(
+        {
+            "name": "Vulnerability-Lookup",
+            "email": application.config.get("ADMIN_EMAIL", ""),
+        }
+    )
+    fg.link(href=f"https://{public_domain}", rel="alternate")
+    fg.language("en")
+
+    for source in vulns:
+        for vuln in vulns[source]:
+            for sighting in Sighting.query.filter(
+                Sighting.vulnerability.ilike(vuln[0]),
+                func.date(Sighting.creation_timestamp) >= some_times_ago,
+            ).order_by(Sighting.creation_timestamp.desc()):
+                entry_url = f"https://{public_domain}/sighting/{sighting.uuid}"
+                fe = fg.add_entry()
+                fe.id(entry_url)  # Stable unique ID
+                fe.link(href=entry_url)
+                fe.title(str(sighting.uuid))
+                fe.author(
+                    [
+                        {
+                            "name": sighting.author.name,
+                            "uri": url_for(
+                                "user_bp.profile",
+                                login=sighting.author.login,
+                                _external=True,
+                            ),
+                        }
+                    ]
+                )
+                fe.content(sighting.as_json())
+                fe.description(sighting.as_json())
+                fe.published(sighting.creation_timestamp.replace(tzinfo=timezone.utc))
+
+    if format.lower() == "atom":
+        response = make_response(fg.atom_str(pretty=True))
+        response.mimetype = "application/atom+xml"
+    else:
+        response = make_response(fg.rss_str(pretty=True))
+        response.mimetype = "application/rss+xml"
+
+    return response

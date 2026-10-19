@@ -1,0 +1,165 @@
+# Local exclude
+scraped/
+*.swp
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# dotenv
+.env
+
+# virtualenv
+.venv
+venv/
+ENV/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+
+
+# Secret keys and cache
+secret_key
+security_password_salt
+cache.pid
+dump.rdb
+
+# Local config files
+config/*.json
+config/*.json.bkp
+config/*.cfg
+config/*.cfg.bkp
+config/*.py
+config/*.py.bkp
+
+# Feeders
+vulnerabilitylookup/feeders/cvelistv5/
+vulnerabilitylookup/feeders/fkie_nvd/
+vulnerabilitylookup/feeders/github/
+vulnerabilitylookup/feeders/ossf_malicious_packages/
+vulnerabilitylookup/feeders/pysec/
+vulnerabilitylookup/feeders/csaf_certbund/
+vulnerabilitylookup/feeders/csaf_cisa/
+vulnerabilitylookup/feeders/csaf_cisco/
+vulnerabilitylookup/feeders/csaf_nozominetworks/
+vulnerabilitylookup/feeders/csaf_ox/
+vulnerabilitylookup/feeders/csaf_redhat/
+vulnerabilitylookup/feeders/csaf_sick/
+vulnerabilitylookup/feeders/csaf_siemens/
+vulnerabilitylookup/feeders/csaf_microsoft/
+vulnerabilitylookup/feeders/csaf_ncscnl/
+vulnerabilitylookup/feeders/csaf_opensuse/
+vulnerabilitylookup/feeders/csaf_suse/
+vulnerabilitylookup/feeders/jvndb/
+vulnerabilitylookup/feeders/vulnrichment/
+csaf_distribution/
+
+# CVE dumps
+output/
+dumps/
+
+# KVrocks
+storage/db
+storage/*.log.*
+storage/*.pid
+storage/kvrocks.INFO
+storage/kvrocks.WARNING
+storage/kvrocks.ERROR
+storage/kvrocks.FATAL
+
+# Data (MISP warning lists, etc.)
+data/
+
+# Emails
+sent-emails/
+
+# Uploaded assets
+website/web/public/
+website/web/public/pictures/
+.idea

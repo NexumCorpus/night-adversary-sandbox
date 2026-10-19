@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging.config
+from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
+from typing import Any
+
+from vulnerabilitylookup import VulnerabilityLookup
+from vulnerabilitylookup.default import get_config, get_homedir, safe_create_dir
+from website.models import Bundle, Comment, Sighting
+from website.web.bootstrap import application
+
+logging.config.dictConfig(get_config("logging"))
+
+dumps_dir = "dumps"
+excluded_sources = ["cisa_known_exploited"]
+
+
+class Dump:
+    def __init__(self) -> None:
+        self.vl = VulnerabilityLookup()
+        self.root_dumps = get_homedir() / dumps_dir
+        safe_create_dir(self.root_dumps)
+
+    def _dump_iterable(self, filename: str, iterable: Iterable[dict[str, Any]]) -> None:
+        """Write iterable of dicts/objects as NDJSON."""
+        dest_file = self.root_dumps / filename
+        dest_file.unlink(missing_ok=True)
+        with dest_file.open("w", encoding="utf-8") as f:
+            for item in iterable:
+                json.dump(item, f, ensure_ascii=False)
+                f.write("\n")
+
+    def dump(self, feed: str, /) -> None:
+        self._dump_iterable(f"{feed}.ndjson", self.vl.get_all(feed, with_meta=True))
+
+    def dump_comments(self) -> None:
+        with application.app_context():
+            self._dump_iterable(
+                "comments.ndjson",
+                (c.to_dict() for c in Comment.query.filter(Comment.is_published)),
+            )
+
+    def dump_bundles(self) -> None:
+        with application.app_context():
+            self._dump_iterable("bundles.ndjson", (b.to_dict() for b in Bundle.query))
+
+    def dump_sightings(self) -> None:
+        with application.app_context():
+            self._dump_iterable(
+                "sightings.ndjson", (s.to_dict() for s in Sighting.query)
+            )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Dump vulnerability-lookup storage in NDJSON."
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--feed",
+        help="Feed to dump.",
+        choices=[
+            "nvd",
+            "cvelistv5",
+            "pysec",
+            "github",
+            "gsd",
+            "ossf_malicious_packages",
+            "csaf_certbund",
+            "csaf_siemens",
+            "csaf_redhat",
+            "csaf_cisa",
+            "csaf_cisco",
+            "csaf_sick",
+            "csaf_nozominetworks",
+            "csaf_ox",
+            "variot",
+            "jvndb",
+            "tailscale",
+        ],
+    )
+    group.add_argument("--all", help="Dump all feeds.", action="store_true")
+    parser.add_argument("--index", action="store_true")
+    parser.add_argument("--comments", action="store_true")
+    parser.add_argument("--bundles", action="store_true")
+    parser.add_argument("--sightings", action="store_true")
+    args = parser.parse_args()
+
+    d = Dump()
+    index_items = []
+
+    # Determine feeds to dump
+    if args.all:
+        vl = VulnerabilityLookup()
+        sources_to_dump = [
+            s for s in sorted(vl.get_sources()) if s not in excluded_sources
+        ]
+    elif args.feed:
+        sources_to_dump = [args.feed]
+    else:
+        sources_to_dump = []
+
+    # Function to dump a single feed
+    def dump_feed(source: str) -> str:
+        print(f"Dumping {source} in {dumps_dir}…")
+        d.dump(source)
+        return source  # for index building
+
+    # Parallel feed dumping
+    if sources_to_dump:
+        with ThreadPoolExecutor() as executor:
+            future_to_source = {
+                executor.submit(dump_feed, src): src for src in sources_to_dump
+            }
+            for future in as_completed(future_to_source):
+                src = future.result()
+                if args.index:
+                    index_items.append(
+                        f'<li><a href="./{src}.ndjson" download="{src}.ndjson">{src}</a></li>'
+                    )
+
+    # Dump comments, bundles, sightings sequentially
+    dump_tasks = [
+        ("comments", d.dump_comments),
+        ("bundles", d.dump_bundles),
+        ("sightings", d.dump_sightings),
+    ]
+
+    for name, func in dump_tasks:
+        if getattr(args, name) or args.all:
+            print(f"Dumping {name}…")
+            func()
+            if args.index:
+                index_items.append(
+                    f'<li><a href="{name}.ndjson" download="{name}.ndjson">{name}</a></li>'
+                )
+
+    # Generate index if needed
+    if args.index and index_items:
+        current_time = datetime.now(timezone.utc)
+        index_html = f"""<!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="UTF-8">
+        <title>Vulnerability-Lookup JSON dumps</title>
+        <style>
+        body {{
+            font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f5f5;
+            color: #333;
+            margin: 0;
+            padding: 20px;
+        }}
+        h1 {{
+            color: #446d80;
+        }}
+        ul {{
+            list-style: none;
+            padding: 0;
+        }}
+        li {{
+            margin: 8px 0;
+        }}
+        a {{
+            text-decoration: none;
+            color: #446d80;
+            transition: color 0.2s;
+        }}
+        a:hover {{
+            color: #2a4f63;
+        }}
+        footer {{
+            margin-top: 30px;
+            font-size: 0.9em;
+            color: #666;
+            border-top: 1px solid #ccc;
+            padding-top: 10px;
+        }}
+        </style>
+        </head>
+        <body>
+        <h1>Vulnerability-Lookup JSON dumps</h1>
+        <ul>
+        {chr(10).join(index_items)}
+        </ul>
+        <footer>Generated on {current_time} UTC</footer>
+        </body>
+        </html>
+        """
+
+        dest_file = get_homedir() / dumps_dir / "index.html"
+        dest_file.unlink(missing_ok=True)
+        dest_file.write_text(index_html)
+
+
+if __name__ == "__main__":
+    main()

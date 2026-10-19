@@ -1,0 +1,135 @@
+html {
+    position: relative;
+    min-height: 100%;
+}
+
+body {
+  /* Margin bottom by footer height + 5px */
+  margin-bottom: 65px;
+  padding-top: 0px;
+}
+
+.content-wrapper {
+  margin-top: 70px; /* Assuming the navbar is 70px tall */
+}
+
+body[data-theme="light"] {
+  background-color: rgb(246, 248, 250);
+}
+
+img {
+  padding: 5px;
+}
+
+.fading-line {
+  display: block;
+  border: none;
+  height: 1px;
+  padding: 0;
+  background-image: linear-gradient(to right, rgba(0, 0, 0, 0), rgba(68, 109, 128, 0.75), rgba(0, 0, 0, 0));
+  background-repeat: no-repeat;
+  background-size: 100% 1px;
+  margin: 0 0 1rem 0;
+}
+
+.logo {
+  max-width: 300px;
+}
+
+.choices__list {
+  color: black;
+}
+
+.input-inline {
+  min-width: 0;
+  width: 200px;
+  display: block;
+}
+
+
+/* Scroll to top button */
+#scrollToTopBtn {
+  width: 60px;
+  height: 60px;
+  bottom: 30px;
+  right: 30px;
+  z-index: 1030;
+
+  background-color: white;
+  color: #446d80;
+  border: 2px solid #d0d9df;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity .25s ease, transform .25s ease, box-shadow .15s ease;
+}
+
+#scrollToTopBtn.show {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+#scrollToTopBtn:hover {
+  transform: translateY(-2px) scale(1.08);
+  box-shadow: 0 4px 10px rgba(0,0,0,0.25);
+}
+
+
+/* Sticky footer */
+.footer {
+  position: absolute;
+  bottom: 0;
+  width: 100%;
+  /* Set the fixed height of the footer here */
+  height: 60px;
+  line-height: 60px; /* Vertically center the text there */
+  /* background-color: #343a40; */
+  background-color: #446d80 !important;
+}
+.footer a {
+  color: rgb(255, 255, 255);
+  /* text-decoration: none; */
+}
+
+.truncate-cell {
+    max-width: 250px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.truncate-cell-sighting-table {
+    max-width: 200px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Button colors */
+.btn-primary {
+  background-color: #446d80;
+  color: white;
+}
+.btn-outline-primary {
+  border-color: #006FBA;
+  color: #006FBA;
+}
+.btn-secondary {
+  background-color: #006FBA;
+  color: white;
+}
+.btn-default {
+  background-color: #006FBA;
+  color: white;
+}
+
+.alert-primary {
+  background-color: #446d80;
+  color: white;
+}
+
+.bg-primary {
+  background-color: #446d80 !important;
+  color: white;
+}

@@ -1,0 +1,176 @@
+#! /usr/bin/env python3
+
+import datetime
+import logging
+import random
+from datetime import timezone
+
+from flask import render_template
+
+from website.lib.user_utils import generate_confirmation_token
+from website.models import Comment, User, VulnerabilityDisclosure
+from website.notifications import emails
+from website.web.bootstrap import application
+
+logger = logging.getLogger(__name__)
+
+
+def get_random_email_signoff() -> str:
+    closings = [
+        "Kind regards,\n\nThe Vulnerability-Lookup team",
+        "Best wishes,\n\nThe Vulnerability-Lookup team",
+        "Sincerely,\n\nThe Vulnerability-Lookup team",
+        "Warm regards,\n\nThe Vulnerability-Lookup team",
+        "Thanks and stay safe,\n\nThe Vulnerability-Lookup team",
+        "All the best,\n\nThe Vulnerability-Lookup team",
+        "With appreciation,\n\nThe Vulnerability-Lookup team",
+        "Until next time,\n\nThe Vulnerability-Lookup team",
+        "Thanks and stay hydrated,\n\nThe Vulnerability-Lookup team",
+    ]
+    return random.choice(closings)
+
+
+#
+# Account
+#
+
+
+def account_recovery(user: User) -> None:
+    """Account recovery."""
+    token = generate_confirmation_token(user.login)
+    expire_time = datetime.datetime.now(timezone.utc) + datetime.timedelta(
+        seconds=application.config["TOKEN_VALIDITY_PERIOD"]
+    )
+
+    plaintext = render_template(
+        "emails/account_recovery.txt",
+        user=user,
+        platform_url=application.config["PLATFORM_URL"],
+        admin_email=application.config["ADMIN_EMAIL"],
+        signoff=get_random_email_signoff(),
+        token=token,
+        expire_time=expire_time,
+    )
+
+    emails.send(
+        to=user.email,
+        subject="[Vulnerability-Lookup] Account recovery",
+        plaintext=plaintext,
+        x_category="Account Notification",
+    )
+
+
+def confirm_account(user: User) -> None:
+    """
+    Account creation notification.
+    """
+    token = generate_confirmation_token(user.login)
+    expire_time = datetime.datetime.now(timezone.utc) + datetime.timedelta(
+        seconds=application.config["TOKEN_VALIDITY_PERIOD"]
+    )
+
+    plaintext = render_template(
+        "emails/account_activation.txt",
+        user=user,
+        platform_url=application.config["PLATFORM_URL"],
+        admin_email=application.config["ADMIN_EMAIL"],
+        signoff=get_random_email_signoff(),
+        token=token,
+        expire_time=expire_time,
+    )
+
+    emails.send(
+        to=user.email,
+        subject="[Vulnerability-Lookup] Account creation",
+        plaintext=plaintext,
+        x_category="Account Notification",
+    )
+
+
+#
+# Comment
+#
+
+
+def new_comment_to_moderate(user: User) -> None:
+    """
+    Notify the admin when a comment is awaiting moderation.
+    """
+    plaintext = render_template(
+        "emails/comment_moderation.txt",
+        signoff=get_random_email_signoff(),
+        user=user,
+        platform_url=application.config["PLATFORM_URL"],
+    )
+
+    emails.send(
+        to=application.config.get("ADMIN_EMAIL", ""),
+        subject="[Vulnerability-Lookup] New comment awaiting moderation",
+        plaintext=plaintext,
+        x_category="Admin Notification",
+    )
+
+
+def new_comment_automatically_published(comment: Comment) -> None:
+    """
+    Notify the admin when a comment from a trusted user has been automatically published.
+    """
+    plaintext = render_template(
+        "emails/comment_automatically_published.txt",
+        signoff=get_random_email_signoff(),
+        comment=comment,
+        platform_url=application.config["PLATFORM_URL"],
+    )
+
+    emails.send(
+        to=application.config.get("ADMIN_EMAIL", ""),
+        subject="[Vulnerability-Lookup] New comment automatically published",
+        plaintext=plaintext,
+        x_category="Admin Notification",
+    )
+
+
+#
+# Vulnerability disclosure
+#
+
+
+def new_vulnerability_disclosure(disclosure: VulnerabilityDisclosure) -> None:
+    """
+    Notify the admin when a new vulnerability disclosure has been created.
+    """
+    plaintext = render_template(
+        "emails/new_vulnerability_disclosure.txt",
+        disclosure=disclosure,
+        signoff=get_random_email_signoff(),
+        platform_url=application.config["PLATFORM_URL"],
+    )
+
+    emails.send(
+        to=application.config.get("ADMIN_EMAIL", ""),
+        subject="[Vulnerability-Lookup] New vulnerability disclosure available",
+        plaintext=plaintext,
+        x_category="Admin Notification",
+    )
+
+
+def new_comment_on_disclosure(
+    disclosure: VulnerabilityDisclosure, recipient: dict[str, str]
+) -> None:
+    """
+    Notify the reporter about a new comment on a vulnerability disclosure.
+    """
+    plaintext = render_template(
+        "emails/comment_disclosure.txt",
+        recipient_name=recipient["name"],
+        disclosure=disclosure,
+        signoff=get_random_email_signoff(),
+        platform_url=application.config["PLATFORM_URL"],
+    )
+
+    emails.send(
+        to=recipient["email"],
+        subject="[Vulnerability-Lookup] New comment on your vulnerability disclosure",
+        plaintext=plaintext,
+        x_category="Disclosure Notification",
+    )

@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+
+import logging
+from datetime import datetime, timezone
+
+import sqlalchemy
+from flask import (
+    abort,
+    current_app,
+    flash,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from flask_login import (  # type: ignore[import-untyped]
+    LoginManager,
+    current_user,
+    login_required,
+    logout_user,
+)
+from flask_principal import (  # type: ignore[import-untyped]
+    AnonymousIdentity,
+    Principal,
+    UserNeed,
+    identity_changed,
+    identity_loaded,
+    session_identity_loader,
+)
+from sqlalchemy import func
+from werkzeug import Response as WerkzeugResponse
+
+from website.lib.user_utils import get_b64encoded_qr_image
+from website.lib.utils import query_country_code_mmdb
+from website.models import Notification, User
+from website.notifications import notifications
+from website.web.bootstrap import application, db
+from website.web.forms import LoginForm, SignupForm, TwoFactorForm
+from website.web.helpers import src_request_ip
+from website.web.permissions import (
+    admin_role,
+    commenter_role,
+    login_user_bundle,
+    reporter_role,
+)
+from website.web.views.user import user_bp
+
+logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# Basic configuration for Flask login and Flask-Principal authorization.
+# -----------------------------------------------------------------------------
+
+Principal(current_app)
+# Create a permission with a single Need, in this case a RoleNeed.
+
+login_manager = LoginManager()
+login_manager.init_app(current_app)
+login_manager.login_view = "user_bp.login"
+login_manager.login_message = "Please log in to access this page."
+login_manager.login_message_category = "info"
+
+
+@identity_loaded.connect_via(current_app._get_current_object())  # type: ignore
+def on_identity_loaded(sender, identity) -> None:  # type: ignore[no-untyped-def]
+    # Set the identity user object
+    identity.user = current_user
+
+    # Add the UserNeed to the identity
+    if current_user.is_authenticated:
+        identity.provides.add(UserNeed(current_user.id))
+        if current_user.is_admin:
+            identity.provides.add(admin_role)
+        if current_user.is_commenter:
+            identity.provides.add(commenter_role)
+        if current_user.is_reporter:
+            identity.provides.add(reporter_role)
+            identity.provides.add(commenter_role)
+
+
+@login_manager.user_loader  # type: ignore[untyped-decorator]
+def load_user(user_id: int) -> bool:
+    return User.query.filter(
+        User.id == user_id,
+        User.is_active == True,  # noqa: E712
+        User.is_confirmed == True,  # noqa: E712
+    ).first()
+
+
+@current_app.before_request
+def before_request() -> None:
+    if current_user.is_authenticated:
+        # Handle unconfirmed users
+        if not current_user.is_confirmed:
+            flash("You have been logged out.")
+            session.clear()
+            logout_user()
+
+
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
+
+
+def two_factor_required(user: User) -> bool:
+    """Return True if 2FA verification is required for the user."""
+    return (
+        application.config["ENFORCE_2FA"] and user.is_two_factor_authentication_enabled
+    ) or (
+        not application.config["ENFORCE_2FA"]
+        and user.is_two_factor_authentication_enabled
+    )
+
+
+def must_setup_two_factor(user: User) -> bool:
+    """Return True if 2FA is enforced but not yet enabled."""
+    return (
+        application.config["ENFORCE_2FA"]
+        and not user.is_two_factor_authentication_enabled
+    )
+
+
+def update_last_seen(user: User) -> None:
+    """Update the last_seen property of the user.
+    Called after a successful authentication."""
+    user.last_seen = datetime.now(timezone.utc)
+    try:
+        db.session.commit()
+    except Exception as e:
+        current_app.logger.error(f"Error updating last_seen: {e}")
+
+
+# -----------------------------------------------------------------------------
+# 2FA workflow
+# -----------------------------------------------------------------------------
+
+
+@user_bp.route("/login", methods=["GET", "POST"])
+def login() -> str | tuple[str, int] | WerkzeugResponse:
+    """
+    Login page for unauthenticated users.
+    """
+    if current_user.is_authenticated:
+        if (
+            application.config["ENFORCE_2FA"]
+            and not current_user.is_two_factor_authentication_enabled
+        ):
+            flash(
+                "You have not enabled 2-Factor Authentication. Please enable it.",
+                "info",
+            )
+            return redirect(url_for("user_bp.setup_two_factor_auth"))
+        flash("You are logged in.", "info")
+        return redirect(url_for("home_bp.index"))
+
+    form = LoginForm()
+    if request.method == "POST" and form.validate():
+        user = User.query.filter(
+            func.lower(User.login) == func.lower(form.login.data),
+            User.is_active.is_(True),
+            User.is_confirmed.is_(True),
+        ).first()
+
+        if not user:
+            flash("Invalid credentials or inactive account.", "danger")
+            return render_template("user/login.html", form=form), 401
+
+        session["username"] = user.login
+
+        if must_setup_two_factor(user):
+            flash(
+                "You have not enabled 2-Factor Authentication. Please enable it first to login.",
+                "info",
+            )
+            return redirect(url_for("user_bp.setup_two_factor_auth"))
+
+        if two_factor_required(user):
+            return redirect(url_for("user_bp.verify_two_factor_auth"))
+
+        # No 2FA required → login directly
+        session.pop("username", None)
+        login_user_bundle(user)
+        update_last_seen(user)
+        return redirect(url_for("home_bp.index"))
+
+    return (
+        render_template("user/login.html", form=form),
+        form.validation_error_code or 400,
+    )
+
+
+@user_bp.route("/setup-2fa", methods=["GET"])
+def setup_two_factor_auth() -> tuple[str, int, dict[str, str]] | WerkzeugResponse:
+    """Display the 2FA setup page for the user stored in session.
+
+    Generates a QR code and secret key for the user to configure
+    their authenticator app (Google Authenticator, Authy, etc.).
+    """
+    username = session.get("username")
+    if username is None:
+        abort(403)  # No username in session → forbidden
+
+    user = User.query.filter(
+        User.login == username,
+        User.is_confirmed.is_(True),
+    ).first()
+
+    if user is None:
+        session.pop("username", None)
+        abort(403)  # User not found or not confirmed
+
+    if user.is_two_factor_authentication_enabled:
+        flash("2FA is already enabled for your account.", "info")
+        return redirect(url_for("user_bp.verify_two_factor_auth"))
+
+    # Prepare the 2FA setup data
+    try:
+        secret = user.secret_token
+        uri = user.get_authentication_setup_uri()
+        base64_qr_image = get_b64encoded_qr_image(uri)
+    except Exception as e:
+        current_app.logger.error(f"Error generating 2FA setup data: {e}")
+        flash(
+            "Error generating your 2FA setup information. Please try again later.",
+            "danger",
+        )
+        return redirect(url_for("user_bp.login"))
+
+    # Prevent browser caching of the QR code
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+
+    form = TwoFactorForm(request.form)
+
+    return (
+        render_template(
+            "user/setup-2fa.html",
+            secret=secret,
+            qr_image=base64_qr_image,
+            form=form,
+        ),
+        200,
+        headers,
+    )
+
+
+@user_bp.route("/verify-2fa", methods=["GET", "POST"])
+def verify_two_factor_auth() -> str | tuple[str, int] | WerkzeugResponse:
+    """Verify or set up Two-Factor Authentication (2FA) for the current session user."""
+
+    MAX_FAILED_OTP_ATTEMPTS = 5
+
+    username = session.get("username")
+    if username is None:
+        abort(403)  # No user in session
+
+    user = User.query.filter(
+        User.login == username,
+        User.is_confirmed.is_(True),
+    ).first()
+
+    if user is None:
+        session.pop("username", None)
+        abort(403)  # User not found or not confirmed
+
+    form = TwoFactorForm(request.form)
+    # Handle POST
+    if form.validate_on_submit():
+        # Check if user is already locked out due to too many invalid OTP attempts
+        if user.failed_otp_attempts >= MAX_FAILED_OTP_ATTEMPTS:
+            user.is_active = False
+            try:
+                db.session.commit()
+                flash(
+                    "Too many invalid OTP attempts. Your account is locked.", "danger"
+                )
+            except Exception:
+                db.session.rollback()
+            return redirect(url_for("home_bp.index"))
+
+        # Validate submitted OTP
+        if not user.is_otp_valid(form.otp.data):
+            user.failed_otp_attempts += 1
+            try:
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                current_app.logger.error(f"Failed to update OTP attempts: {e}")
+
+            flash("Invalid OTP. Please try again.", "danger")
+            return render_template("user/verify-2fa.html", form=form), 401
+
+        # OTP is valid → reset failed attempts
+        user.failed_otp_attempts = 0
+
+        is_setting_up = not user.is_two_factor_authentication_enabled
+
+        if is_setting_up:
+            # Completing 2FA setup
+            try:
+                user.is_two_factor_authentication_enabled = True
+                db.session.commit()
+                flash("2FA setup successful. You are logged in!", "success")
+            except Exception as e:
+                db.session.rollback()
+                current_app.logger.error(f"2FA setup failed: {e}")
+                flash("2FA setup failed. Please try again.", "danger")
+                return redirect(url_for("user_bp.setup_two_factor_auth"))
+        else:
+            # Standard 2FA verification
+            try:
+                db.session.commit()
+            except Exception as e:
+                db.session.rollback()
+                current_app.logger.error(f"2FA verification commit failed: {e}")
+            flash("2FA verification successful. You are logged in!", "success")
+
+        # Common post-verification actions
+        session.pop("username", None)
+        login_user_bundle(user)
+        update_last_seen(user)
+
+        # Choose destination based on context
+        if is_setting_up:
+            return redirect(url_for("user_bp.form"))
+        elif Notification.query.filter(Notification.user_id == user.id).count():
+            return redirect(url_for("user_bp.watchlist"))
+        return redirect(url_for("home_bp.index"))
+
+    # Handle GET or invalid form
+    if not user.is_two_factor_authentication_enabled:
+        flash(
+            "You have not enabled 2-Factor Authentication. Please enable it first.",
+            "info",
+        )
+
+    return render_template("user/verify-2fa.html", form=form)
+
+
+# -----------------------------------------------------------------------------
+# Simple signup (resitration) and logout.
+# -----------------------------------------------------------------------------
+
+
+@user_bp.route("/signup", methods=["GET", "POST"])
+def signup() -> str | WerkzeugResponse:
+    """
+    Returns a page dedicated to the signup for the new users.
+    Account must be confirmed with a token sent by email to the user.
+    """
+    if not application.config["SELF_REGISTRATION"]:
+        flash("Self-registration is disabled.", "warning")
+        return redirect(url_for("home_bp.index"))
+
+    if current_user.is_authenticated:
+        return redirect(url_for("home_bp.index"))
+
+    form = SignupForm()
+    if request.method == "POST" and form.validate():
+        # Detect the country of the user based on the IP
+        try:
+            remote_addr = src_request_ip(request) or ""
+            country_alpha_3_code = query_country_code_mmdb(remote_addr)
+        except Exception:
+            country_alpha_3_code = ""
+
+        # Create the User object
+        try:
+            new_user = User(
+                login=form.login.data,
+                name=form.name.data,
+                organisation=form.organisation.data,
+                country_code=country_alpha_3_code,
+                email=form.email.data,
+                pwdhash="",
+                is_active=True,
+                is_confirmed=False,
+                is_admin=False,
+                is_commenter=True,
+                last_seen=None,
+            )
+            db.session.add(new_user)
+            db.session.commit()
+        except AssertionError as e:
+            db.session.rollback()
+            flash(f"{e}", "danger")
+            return render_template("user/signup.html", form=form)
+        except sqlalchemy.exc.IntegrityError:
+            db.session.rollback()
+            flash("Problem while creating the account.", "danger")
+            return render_template("user/signup.html", form=form)
+
+        # Send the confirmation email
+        try:
+            notifications.confirm_account(new_user)
+        except Exception as error:
+            flash(
+                f"Problem while sending activation email: {error}",
+                "danger",
+            )
+
+        flash(
+            "Your account has been created. Check your mail to confirm it.",
+            "success",
+        )
+
+        return redirect(url_for("home_bp.index"))
+
+    return render_template("user/signup.html", form=form)
+
+
+@user_bp.route("/logout")
+@login_required  # type: ignore[untyped-decorator]
+def logout() -> WerkzeugResponse:
+    """Logout the authenticated user.
+    Remove the session keys."""
+    # Remove the user information from the session
+    logout_user()
+
+    session.pop("username", None)
+
+    # Remove session keys set by Flask-Principal
+    for key in ("identity.name", "identity.auth_type"):
+        session.pop(key, None)
+
+    session.clear()
+
+    # Tell Flask-Principal the user is anonymous
+    identity_changed.send(current_app, identity=AnonymousIdentity())
+    session_identity_loader()
+
+    return redirect(url_for("user_bp.login"))

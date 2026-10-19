@@ -1,0 +1,419 @@
+{% from 'bootstrap5/utils.html' import render_messages %}
+{% from 'bootstrap5/utils.html' import render_icon %}
+<!doctype html>
+<html lang="en" data-bs-theme="light">
+  <head>
+    {% block head %}
+    <!-- Required meta tags -->
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+    <meta name="description" content="Vulnerability-Lookup - Fast vulnerability lookup correlation from different sources." />
+
+    <meta property="og:type" content="article">
+    <meta property="og:url" content="{{ request.url }}">
+    <meta property="og:title" content="Vulnerability-Lookup">
+    <meta property="og:description" content="Vulnerability-Lookup - Fast vulnerability lookup correlation from different sources.">
+    <meta property="og:image" content="{{ url_for('static', filename='img/VL-hori-coul.png', _external=True) }}">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+
+    <link rel="author" type="text/plain"  href="{{ url_for('home_bp.humans')  }}" />
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='all') }}" rel="alternate" title="Recent vulnerabilities." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='cvelistv5') }}" rel="alternate" title="Recent vulnerabilities from cvelistv5." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='fkie_nvd') }}" rel="alternate" title="Recent vulnerabilities from FKIE NVD." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='github') }}" rel="alternate" title="Recent vulnerabilities from github." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='pysec') }}" rel="alternate" title="Recent vulnerabilities from pysec." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='emb3d') }}" rel="alternate" title="TID threats from from Emb3d." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='ossf_malicious_packages') }}" rel="alternate" title="Recent vulnerabilities from ossf_malicious_packages." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='bitnami_vulndb') }}" rel="alternate" title="Recent vulnerabilities from bitnami_vulndb." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='cleanstart') }}" rel="alternate" title="Recent vulnerabilities from cleanstart." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='drupal') }}" rel="alternate" title="Recent vulnerabilities from drupal." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_certbund') }}" rel="alternate" title="Recent vulnerabilities from csaf_certbund." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_siemens') }}" rel="alternate" title="Recent vulnerabilities from csaf_siemens." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_redhat') }}" rel="alternate" title="Recent vulnerabilities from csaf_redhat." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_cisa') }}" rel="alternate" title="Recent vulnerabilities from csaf_cisa." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_cisco') }}" rel="alternate" title="Recent vulnerabilities from csaf_cisco." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_sick') }}" rel="alternate" title="Recent vulnerabilities from csaf_sick." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_ox') }}" rel="alternate" title="Recent vulnerabilities from csaf_ox." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_nozominetworks') }}" rel="alternate" title="Recent vulnerabilities from csaf_nozominetworks." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_microsoft') }}" rel="alternate" title="Recent vulnerabilities from csaf_microsoft." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_abb') }}" rel="alternate" title="Recent vulnerabilities from csaf_abb." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='gsd') }}" rel="alternate" title="Recent vulnerabilities from gsd." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='jvndb') }}" rel="alternate" title="Recent vulnerabilities from jvndb." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='tailscale') }}" rel="alternate" title="Recent vulnerabilities from tailscale." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_ncscnl') }}" rel="alternate" title="Recent vulnerabilities from csaf_ncscnl." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_suse') }}" rel="alternate" title="Recent vulnerabilities from csaf_suse." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_opensuse') }}" rel="alternate" title="Recent vulnerabilities from csaf_opensuse." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_trustsource') }}" rel="alternate" title="Recent vulnerabilities from csaf_trustsource." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='csaf_se') }}" rel="alternate" title="Recent vulnerabilities from csaf_se." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='cnvd') }}" rel="alternate" title="Recent vulnerabilities from cnvd." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='fstec') }}" rel="alternate" title="Recent vulnerabilities from fstec." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='osv_ossfuzz') }}" rel="alternate" title="Recent vulnerabilities from osv_ossfuzz." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='osv_rustsec') }}" rel="alternate" title="Recent vulnerabilities from osv_rustsec." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='certfr_avis') }}" rel="alternate" title="Recent vulnerabilities from CERT FR (avis)." type="application/atom+xml">
+    <link href="{{ url_for('home_bp.feed_recent', format='atom', source='certfr_alerte') }}" rel="alternate" title="Recent vulnerabilities from CERT FR (alerte)." type="application/atom+xml">
+
+    <!-- Standard favicon -->
+    <link rel="icon" type="image/x-icon" href="{{ url_for('static', filename='img/favicon.ico') }}">
+
+    <!-- PNG favicon (modern browsers) -->
+    <link rel="icon" type="image/png" sizes="48x48" href="{{ url_for('static', filename='img/favicon-48x48.png') }}">
+    <link rel="icon" type="image/png" sizes="32x32" href="{{ url_for('static', filename='img/favicon-32x32.png') }}">
+    <link rel="icon" type="image/png" sizes="16x16" href="{{ url_for('static', filename='img/favicon-16x16.png') }}">
+
+    <!-- Apple Touch Icons -->
+    <link rel="apple-touch-icon" sizes="57x57" href="{{ url_for('static', filename='img/apple-touch-icon-57x57.png') }}">
+    <link rel="apple-touch-icon" sizes="72x72" href="{{ url_for('static', filename='img/apple-touch-icon-72x72.png') }}">
+    <link rel="apple-touch-icon" sizes="114x114" href="{{ url_for('static', filename='img/apple-touch-icon-114x114.png') }}">
+    <link rel="apple-touch-icon" sizes="120x120" href="{{ url_for('static', filename='img/apple-touch-icon-120x120.png') }}">
+    <link rel="apple-touch-icon" sizes="144x144" href="{{ url_for('static', filename='img/apple-touch-icon-144x144.png') }}">
+    <link rel="apple-touch-icon" sizes="152x152" href="{{ url_for('static', filename='img/apple-touch-icon-152x152.png') }}">
+    <link rel="apple-touch-icon" sizes="180x180" href="{{ url_for('static', filename='img/apple-touch-icon-180x180.png') }}">
+    <link rel="apple-touch-icon" sizes="1200x630" href="{{ url_for('static', filename='img/VL-verti-white-bg-1200x630.png') }}">
+
+    <script>
+      function getCookie(name) {
+        var nameEQ = name + "=";
+        var ca = document.cookie.split(';');
+        for(var i=0;i < ca.length;i++) {
+            var c = ca[i];
+            while (c.charAt(0)==' ') c = c.substring(1,c.length);
+            if (c.indexOf(nameEQ) == 0) return c.substring(nameEQ.length,c.length);
+        }
+        return null;
+      }
+
+      if (getCookie("theme") == null) {
+        document.cookie = "theme=light; path=/; SameSite=Strict";
+      }
+      document.documentElement.setAttribute('data-bs-theme', getCookie("theme"));
+    </script>
+    <script src="{{ url_for('static', filename='js/utils.js') }}"></script>
+
+    {% block styles %}
+    <!-- Bootstrap CSS -->
+    {{ bootstrap.load_css() }}
+    <style>
+      #freetext_search {
+        max-width: 100%;  /* Prevent overflow */
+      }
+    </style>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/theme.css') }}" />
+    {% endblock %}
+
+    <title>{% block title %}{% endblock%}</title>
+
+    {% block card %}{% endblock %}
+
+    {% endblock %}
+  </head>
+  <body>
+    <header>
+      <div class="container">
+        {% block navigation %}
+        <nav class="navbar navbar-expand-lg">
+          <div class="container-fluid">
+            <a class="navbar-brand " href="/">
+              <img
+                id="vulnerability-lookup-logo"
+                src="{{ url_for('static', filename='img/VL-hori-coul.png') }}"
+                alt="Vulnerability-Lookup"
+                title="Vulnerability-Lookup"
+                height="50px"
+              />
+            </a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav" aria-controls="navbarNav" aria-expanded="false" aria-label="Toggle navigation">
+              <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+              <ul class="navbar-nav mr-auto w-100 justify-content-end">
+                {%block navbar_links%}
+                <li class="nav-item">
+                  <a class="nav-link" href="{{url_for('home_bp.recent')}}" title="Statistics">Vulnerabilities</a>
+                </li>
+
+                 <li class="nav-item dropdown">
+                  <a class="nav-link dropdown-toggle" href="#" id="navbarDropdownRecent" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+                    KEV Catalogs
+                  </a>
+                  <ul class="dropdown-menu" aria-labelledby="navbarDropdownRecent">
+                    {% for catalog in kev_catalogs_menu %}
+                      {% if catalog.is_local %}
+                        <a class="dropdown-item" href="{{url_for('kev_catalog_bp.list_kev_catalog')}}">{{ catalog.short_name }}</a>
+                      {% else %}
+                        <a class="dropdown-item" href="{{url_for('kev_catalog_bp.list_kev_catalog', catalog_uuid=catalog.uuid)}}">{{ catalog.short_name }}</a>
+                      {% endif %}
+                    {% endfor %}
+                  </ul>
+                </li>
+
+                <li class="nav-item dropdown">
+                  <a class="nav-link dropdown-toggle" href="#" id="navbarDropdownRecent" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+                    Community
+                  </a>
+                  <ul class="dropdown-menu" aria-labelledby="navbarDropdownRecent">
+                    {% if config.user_accounts  %}
+                    <a class="dropdown-item" href="{{url_for('sightings_bp.list_sightings')}}">Sightings</a>
+                    <a class="dropdown-item" href="{{url_for('comments_bp.list_comments')}}">Comments</a>
+                    <a class="dropdown-item" href="{{url_for('bundles_bp.list_bundles')}}">Bundles</a>
+                    <a class="dropdown-item" href="{{url_for('organizations_bp.list_organizations')}}">Organizations</a>
+                    <a class="dropdown-item" href="{{ url_for('users_bp.list_users') }}">Contributors</a>
+                    {% endif %}
+                  </ul>
+                </li>
+
+                <li class="nav-item">
+                  <a class="nav-link" href="{{url_for('stats_bp.index')}}" title="Statistics">Statistics</a>
+                </li>
+                {% endblock%}
+
+                {% if config.user_accounts  %}
+                  {% if current_user.is_authenticated %}
+                  {% if current_user.is_admin %}
+                  <li class="nav-item dropdown">
+                    <a class="nav-link dropdown-toggle" href="#" id="navbarDropdownAdmin" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+                      Admin
+                    </a>
+                    <ul class="dropdown-menu" aria-labelledby="navbarDropdownAdmin">
+                      <a class="dropdown-item" href="{{ url_for('admin_bp.dashboard') }}" title="Dashboard">Dashboard</a>
+                      <div class="dropdown-divider"></div>
+                      <a class="dropdown-item" href="{{ url_for('admin_users_bp.list_users') }}" title="Users">Users</a>
+                      <a class="dropdown-item" href="{{ url_for('admin_comments_bp.list_comments') }}" title="Comments moderation">Comments</a>
+                      <a class="dropdown-item" href="{{ url_for('admin_bundles_bp.list_bundles') }}" title="Bundles">Bundles</a>
+                      <a class="dropdown-item" href="{{ url_for('admin_sightings_bp.list_sightings') }}" title="Sightings">Sightings</a>
+                      <a class="dropdown-item" href="{{ url_for('admin_kevs_bp.list_kevs') }}" title="KEV Catalog">KEV Catalog</a>
+                      {% if config["WEB_MODULES"].get("vulnerability_disclosure", True) %}
+                      <a class="dropdown-item" href="{{ url_for('admin_vulnerability_disclosures_bp.list_vulnerability_disclosures') }}" title="Vulnerability disclosures">Vulnerability disclosures</a>
+                      {% endif %}
+                      <div class="dropdown-divider"></div>
+                      <div class="dropdown-item text-muted" style="max-width: 200px;">
+                        <p>Organizations and CPE</p>
+                      </div>
+                      <a class="dropdown-item" href="{{ url_for('admin_organizations_bp.list_organizations') }}" title="Organizations">Organizations</a>
+                      <a class="dropdown-item" href="{{ url_for('admin_products_bp.list_products') }}" title="Products">Products</a>
+                      <div class="dropdown-divider"></div>
+                      <div class="dropdown-item text-muted" style="max-width: 200px;">
+                        <p>Monitoring</p>
+                      </div>
+                      <a class="dropdown-item" href="{{ url_for('admin_notifications_bp.list_notifications') }}" title="Email notifications">Email notifications</a>
+                      <a class="dropdown-item" href="{{ url_for('admin_monitoring_bp.processes') }}" title="Process Monitoring">Process</a>
+                      <a class="dropdown-item" href="{{ url_for('admin_monitoring_bp.feeders') }}" title="Feeders Monitoring">Feeders</a>
+                    </ul>
+                  </li>
+                  {% endif %}
+                  <li class="nav-item dropdown">
+                    <a class="nav-link dropdown-toggle" href="#" id="navbarDropdownProfile" role="button" data-bs-toggle="dropdown" aria-expanded="false">
+                      Profile
+                    </a>
+                    <ul class="dropdown-menu" aria-labelledby="navbarDropdownProfile">
+                      <span class="dropdown-item"><div class="text-muted">Signed in as</div><div class="font-weight-bold">{{ current_user.login }}</div></span>
+                      <div class="dropdown-divider"></div>
+                      <a class="dropdown-item" href="{{ url_for('user_bp.profile', login=current_user.login) }}" title="Profile">Your profile</a>
+                      <a class="dropdown-item" href="{{ url_for('user_bp.list_comments') }}" title="Your comments">Your comments</a>
+                      {% if current_user.is_admin %}<a class="dropdown-item" href="{{ url_for('user_bp.list_bundles') }}" title="Your bundles">Your bundles</a>{% endif %}
+                      <a class="dropdown-item" href="{{ url_for('user_bp.list_sightings') }}" title="Your sightings">Your sightings</a>
+                      <a class="dropdown-item" href="{{ url_for('user_bp.list_notifications') }}" title="Your notifications">Your notifications</a>
+                      <a class="dropdown-item" href="{{ url_for('user_bp.list_organizations') }}" title="Your organizations">Your organizations</a>
+                      {% if config["WEB_MODULES"].get("vulnerability_disclosure", True) %}
+                      <a class="dropdown-item" href="{{ url_for('user_bp.list_vulnerability_disclosures') }}" title="Your vulnerability disclosures">Your vulnerability disclosures</a>
+                      <div class="dropdown-divider"></div>
+                      <a class="dropdown-item" href="{{ url_for('vulnerability_disclosure_bp.form') }}" title="New vulnerability disclosure">New vulnerability disclosure</a>
+                      {% endif %}
+                      {% if current_user.is_reporter %}<a class="dropdown-item" href="{{ url_for('user_bp.vulnogram') }}" title="New vulnerability advisory">New vulnerability advisory</a>{% endif %}
+                      <div class="dropdown-divider"></div>
+                      <a class="dropdown-item" href="https://www.vulnerability-lookup.org/user-manual/" title="User manual" rel="noreferrer" target="_blank">User manual</a>
+                      <a class="dropdown-item" href="{{ url_for('documentation_bp.serve_index') }}" title="Documentation">Documentation</a>
+                      <a class="dropdown-item" href="{{ url_for('home_bp.about') }}" title="About">About</a>
+                      <div class="dropdown-divider"></div>
+                      <a class="dropdown-item" href="{{ url_for('user_bp.logout') }}" title="Log out">Log out</a>
+                    </ul>
+                  </li>
+                  {% else %}
+                  <li class="nav-item">
+                    <a class="nav-link" href="{{url_for('user_bp.login')}}" title="Login">Log in</a>
+                  </li>
+                  <li class="nav-item">
+                    <a class="nav-link" href="{{ url_for('home_bp.about') }}" title="About">About</a>
+                  </li>
+                  {% endif %}
+                {% endif %}
+
+                <li class="nav-item dropdown">
+                  <a class="nav-link dropdown-toggle" href="#" id="navbarDropdownSearch" role="button" data-bs-toggle="dropdown" aria-expanded="false">{{ render_icon('search') }}</a>
+                  <div class="dropdown-menu dropdown-menu-end p-3 shadow" aria-labelledby="navbarDropdownSearch" style="width: 340px;">
+                    <form class="d-flex" role="form" method="GET" action="/search">
+                      <label for="freetext_search" class="visually-hidden">Search term</label>
+                      <div class="input-group w-100">
+                        <input id="freetext_search" type="text" class="form-control" name="q"
+                          placeholder="Vulnerability ID or CPE vendor"
+                          list="vendors_list"
+                          autofocus
+                        >
+                        <button type="submit" class="btn btn-primary">{{ render_icon('search') }}</button>
+                      </div>
+                      <datalist id="vendors_list"></datalist>
+                    </form>
+                  </div>
+                </li>
+
+                <li class="nav-item">
+                  <a class="nav-link" id="btnThemeSwitch" href="#" title="Switch to dark theme">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-moon-stars-fill" viewBox="0 0 16 16">
+                      <path d="M6 .278a.77.77 0 0 1 .08.858 7.2 7.2 0 0 0-.878 3.46c0 4.021 3.278 7.277 7.318 7.277q.792-.001 1.533-.16a.79.79 0 0 1 .81.316.73.73 0 0 1-.031.893A8.35 8.35 0 0 1 8.344 16C3.734 16 0 12.286 0 7.71 0 4.266 2.114 1.312 5.124.06A.75.75 0 0 1 6 .278"/>
+                      <path d="M10.794 3.148a.217.217 0 0 1 .412 0l.387 1.162c.173.518.579.924 1.097 1.097l1.162.387a.217.217 0 0 1 0 .412l-1.162.387a1.73 1.73 0 0 0-1.097 1.097l-.387 1.162a.217.217 0 0 1-.412 0l-.387-1.162A1.73 1.73 0 0 0 9.31 6.593l-1.162-.387a.217.217 0 0 1 0-.412l1.162-.387a1.73 1.73 0 0 0 1.097-1.097zM13.863.099a.145.145 0 0 1 .274 0l.258.774c.115.346.386.617.732.732l.774.258a.145.145 0 0 1 0 .274l-.774.258a1.16 1.16 0 0 0-.732.732l-.258.774a.145.145 0 0 1-.274 0l-.258-.774a1.16 1.16 0 0 0-.732-.732l-.774-.258a.145.145 0 0 1 0-.274l.774-.258c.346-.115.617-.386.732-.732z"/>
+                    </svg>
+                  </a>
+                </li>
+              </ul>
+            </div>
+          </div>
+        </nav>
+        <hr class="fading-line">
+        {% endblock%}
+        {{ render_messages(container=True, dismissible=True) }}
+
+        {% block reusablemodals %}
+        <!-- Reusable Modal Structure -->
+        <div class="modal fade" id="dynamicConfirmModal" tabindex="-1" aria-labelledby="dynamicConfirmModalLabel" aria-hidden="true">
+          <div class="modal-dialog">
+            <div class="modal-content">
+              <!-- Modal Header -->
+              <div class="modal-header">
+                <h5 class="modal-title" id="dynamicConfirmModalLabel"></h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+              </div>
+
+              <!-- Modal Body -->
+              <div class="modal-body" id="dynamicModalMessage">
+              </div>
+
+              <!-- Modal Footer (OK and Cancel buttons) -->
+              <div class="modal-footer">
+                <button type="button" class="btn btn-primary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-success" id="dynamicConfirmBtn">OK</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Toast Container -->
+        <div class="toast-container position-fixed bottom-0 end-0 p-3">
+          <div id="actionToast" class="toast" role="alert" aria-live="assertive" aria-atomic="true" data-bs-delay="5000">
+            <div class="toast-header">
+              <strong class="me-auto" id="toastTitle">Success</strong>
+              <button type="button" class="btn-close" data-bs-dismiss="toast" aria-label="Close"></button>
+            </div>
+            <div class="toast-body" id="toastMessage">
+            </div>
+          </div>
+        </div>
+        {% endblock%}
+      </div>
+    </header>
+
+    <main>
+      <div class="container">
+        {% block content %}{% endblock%}
+      </div>
+    </main>
+
+    <!-- Scroll to Top Button -->
+    <button id="scrollToTopBtn" class="btn btn-primary rounded-circle shadow position-fixed d-none" title="Scroll to top.">{{ render_icon('chevron-up') }}</button>
+
+    <footer class="footer bg-light">
+      <div class="container">
+        <div class="row">
+          <div class="col d-none d-md-block">
+            <div class="d-flex justify-content-start">
+              <span class="text-muted"><a href="{{ config.ADMIN_WEBSITE }}" rel="noreferrer" target="_blank">{{ config.ADMIN_NAME }}</a></span>
+            </div>
+          </div>
+          <div class="col">
+            <div class="d-flex justify-content-end">
+              <a class="text-end d-none d-md-block" href="https://vulnerability.circl.lu/dumps/">Dumps</a>&nbsp;&nbsp;
+              {% if config.user_accounts  %}
+              <a class="text-end" href="{{ url_for('users_bp.list_users') }}">Contributors</a>&nbsp;&nbsp;
+              {% endif %}
+              <a class="text-end" href="{{ url_for('documentation_bp.serve_index') }}">Documentation</a>&nbsp;&nbsp;
+              <a class="text-end" href="{{ url_for('apiv1.doc') }}">API</a>&nbsp;&nbsp;
+              <a class="text-end" href="{{ url_for('home_bp.about') }}">About</a>&nbsp;&nbsp;
+              <a class="text-end" href="https://github.com/vulnerability-lookup/vulnerability-lookup" title="Source code of Vulnerability-Lookup" target="_blank">{{ render_icon('github') }}</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </footer>
+
+{% block scripts %}
+<!-- Optional JavaScript -->
+{{ bootstrap.load_js() }}
+{% endblock %}
+    <script>
+      if (getCookie("theme") == 'light') {
+        document.getElementById('btnThemeSwitch').innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-moon-stars-fill" viewBox="0 0 16 16"><path d="M6 .278a.77.77 0 0 1 .08.858 7.2 7.2 0 0 0-.878 3.46c0 4.021 3.278 7.277 7.318 7.277q.792-.001 1.533-.16a.79.79 0 0 1 .81.316.73.73 0 0 1-.031.893A8.35 8.35 0 0 1 8.344 16C3.734 16 0 12.286 0 7.71 0 4.266 2.114 1.312 5.124.06A.75.75 0 0 1 6 .278"/><path d="M10.794 3.148a.217.217 0 0 1 .412 0l.387 1.162c.173.518.579.924 1.097 1.097l1.162.387a.217.217 0 0 1 0 .412l-1.162.387a1.73 1.73 0 0 0-1.097 1.097l-.387 1.162a.217.217 0 0 1-.412 0l-.387-1.162A1.73 1.73 0 0 0 9.31 6.593l-1.162-.387a.217.217 0 0 1 0-.412l1.162-.387a1.73 1.73 0 0 0 1.097-1.097zM13.863.099a.145.145 0 0 1 .274 0l.258.774c.115.346.386.617.732.732l.774.258a.145.145 0 0 1 0 .274l-.774.258a1.16 1.16 0 0 0-.732.732l-.258.774a.145.145 0 0 1-.274 0l-.258-.774a1.16 1.16 0 0 0-.732-.732l-.774-.258a.145.145 0 0 1 0-.274l.774-.258c.346-.115.617-.386.732-.732z"/></svg>';
+        document.getElementById('vulnerability-lookup-logo').src = '/static/img/VL-hori-coul.png';
+        document.getElementById('btnThemeSwitch').setAttribute('title', 'Switch to dark theme');
+      } else {
+        document.getElementById('btnThemeSwitch').innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-sun-fill" viewBox="0 0 16 16"><path d="M8 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8M8 0a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 0m0 13a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 13m8-5a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1 0-1h2a.5.5 0 0 1 .5.5M3 8a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1 0-1h2A.5.5 0 0 1 3 8m10.657-5.657a.5.5 0 0 1 0 .707l-1.414 1.415a.5.5 0 1 1-.707-.708l1.414-1.414a.5.5 0 0 1 .707 0m-9.193 9.193a.5.5 0 0 1 0 .707L3.05 13.657a.5.5 0 0 1-.707-.707l1.414-1.414a.5.5 0 0 1 .707 0m9.193 2.121a.5.5 0 0 1-.707 0l-1.414-1.414a.5.5 0 0 1 .707-.707l1.414 1.414a.5.5 0 0 1 0 .707M4.464 4.465a.5.5 0 0 1-.707 0L2.343 3.05a.5.5 0 1 1 .707-.707l1.414 1.414a.5.5 0 0 1 0 .708"/></svg>';
+        document.getElementById('vulnerability-lookup-logo').src = '/static/img/VL-hori-white-coul.png';
+        document.getElementById('btnThemeSwitch').setAttribute('title', 'Switch to light theme');
+      }
+
+
+      document.addEventListener("DOMContentLoaded", function() {
+        document.getElementById('btnThemeSwitch').addEventListener('click',()=>{
+          if (document.documentElement.getAttribute('data-bs-theme') == 'dark') {
+            document.documentElement.setAttribute('data-bs-theme','light')
+            document.getElementById('btnThemeSwitch').innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-moon-stars-fill" viewBox="0 0 16 16"><path d="M6 .278a.77.77 0 0 1 .08.858 7.2 7.2 0 0 0-.878 3.46c0 4.021 3.278 7.277 7.318 7.277q.792-.001 1.533-.16a.79.79 0 0 1 .81.316.73.73 0 0 1-.031.893A8.35 8.35 0 0 1 8.344 16C3.734 16 0 12.286 0 7.71 0 4.266 2.114 1.312 5.124.06A.75.75 0 0 1 6 .278"/><path d="M10.794 3.148a.217.217 0 0 1 .412 0l.387 1.162c.173.518.579.924 1.097 1.097l1.162.387a.217.217 0 0 1 0 .412l-1.162.387a1.73 1.73 0 0 0-1.097 1.097l-.387 1.162a.217.217 0 0 1-.412 0l-.387-1.162A1.73 1.73 0 0 0 9.31 6.593l-1.162-.387a.217.217 0 0 1 0-.412l1.162-.387a1.73 1.73 0 0 0 1.097-1.097zM13.863.099a.145.145 0 0 1 .274 0l.258.774c.115.346.386.617.732.732l.774.258a.145.145 0 0 1 0 .274l-.774.258a1.16 1.16 0 0 0-.732.732l-.258.774a.145.145 0 0 1-.274 0l-.258-.774a1.16 1.16 0 0 0-.732-.732l-.774-.258a.145.145 0 0 1 0-.274l.774-.258c.346-.115.617-.386.732-.732z"/></svg>';
+            document.getElementById('vulnerability-lookup-logo').src = '/static/img/VL-hori-coul.png';
+            document.getElementById('btnThemeSwitch').setAttribute('title', 'Switch to dark theme');
+            document.cookie = "theme=light; path=/; SameSite=Strict";
+          }
+          else {
+            document.documentElement.setAttribute('data-bs-theme','dark');
+            document.getElementById('btnThemeSwitch').innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-sun-fill" viewBox="0 0 16 16"><path d="M8 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8M8 0a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 0m0 13a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 13m8-5a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1 0-1h2a.5.5 0 0 1 .5.5M3 8a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1 0-1h2A.5.5 0 0 1 3 8m10.657-5.657a.5.5 0 0 1 0 .707l-1.414 1.415a.5.5 0 1 1-.707-.708l1.414-1.414a.5.5 0 0 1 .707 0m-9.193 9.193a.5.5 0 0 1 0 .707L3.05 13.657a.5.5 0 0 1-.707-.707l1.414-1.414a.5.5 0 0 1 .707 0m9.193 2.121a.5.5 0 0 1-.707 0l-1.414-1.414a.5.5 0 0 1 .707-.707l1.414 1.414a.5.5 0 0 1 0 .707M4.464 4.465a.5.5 0 0 1-.707 0L2.343 3.05a.5.5 0 1 1 .707-.707l1.414 1.414a.5.5 0 0 1 0 .708"/></svg>';
+            document.getElementById('vulnerability-lookup-logo').src = '/static/img/VL-hori-white-coul.png';
+            document.getElementById('btnThemeSwitch').setAttribute('title', 'Switch to light theme');
+            document.cookie = "theme=dark; path=/; SameSite=Strict";
+          }
+        })
+
+        document.getElementById("freetext_search").addEventListener("input", debounce(function(event) {
+            const text = this.value;
+
+            if (text.length >= 3) {
+                fetch("{{ url_for('apiv1.browse_vendors') }}?vendor=" + encodeURIComponent(text))
+                    .then(response => response.json())
+                    .then(vendors => {
+                        const datalist = document.getElementById('vendors_list');
+                        datalist.innerHTML = ''; // Clear previous options
+
+                        vendors.forEach(vendor => {
+                            const option = document.createElement('option');
+                            option.value = vendor; // Safe insertion
+                            datalist.appendChild(option);
+                        });
+                    })
+                    .catch(err => console.error("Error fetching vendors:", err));
+            }
+        }, 300)); // 300ms debounce
+
+
+        // Show the button when scrolled down
+        const scrollToTopBtn = document.getElementById("scrollToTopBtn");
+
+        function toggleScrollBtn() {
+          const show = document.documentElement.scrollTop > 500;
+          scrollToTopBtn.classList.toggle("show", show);
+          scrollToTopBtn.classList.toggle("d-none", !show);
+        }
+
+        window.addEventListener("scroll", () => requestAnimationFrame(toggleScrollBtn));
+
+        scrollToTopBtn.addEventListener("click", () => {
+          window.scrollTo({ top: 0, behavior: "smooth" });
+        });
+      });
+    </script>
+  </body>
+</html>

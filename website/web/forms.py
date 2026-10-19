@@ -1,0 +1,1101 @@
+#!/usr/bin/env python3
+
+from typing import Optional
+from urllib.parse import urlparse
+
+import pycountry
+from flask import current_app, request
+from flask_login import current_user  # type: ignore[import-untyped]
+from flask_wtf import FlaskForm  # type: ignore[import-untyped]
+from the_big_username_blacklist import validate  # type: ignore[import-untyped]
+from werkzeug.exceptions import HTTPException, NotFound
+from wtforms import (  # type: ignore[import-untyped]
+    BooleanField,
+    FileField,
+    HiddenField,
+    IntegerField,
+    PasswordField,
+    SelectField,
+    SelectMultipleField,
+    StringField,
+    SubmitField,
+    TextAreaField,
+    validators,
+)
+from wtforms.fields import (  # type: ignore[import-untyped]
+    DateTimeLocalField,
+    EmailField,
+    URLField,
+)
+from wtforms.validators import (  # type: ignore[import-untyped]
+    Email,
+    InputRequired,
+)
+
+from website.lib.constants import RESERVED_USERNAMES
+from website.lib.email_utils import (
+    has_mx_record,
+    is_email_in_allow_list,
+    is_email_in_block_list,
+    is_email_in_misp_disposable_list,
+)
+from website.models import Language, License, Organization, User
+from website.web.bootstrap import db, vulnerabilitylookup
+
+
+class RedirectForm(FlaskForm):  # type: ignore[misc]
+    """Redirect form used for the redirection after the sign in."""
+
+    next = HiddenField()
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        if not self.next.data:
+            # self.next.data = request.args.get("next") or request.referrer
+            self.next.data = request.args.get("next") or "/user/profile"
+        try:
+            ref_url = urlparse(self.next.data)
+            if ref_url.path == "/":
+                self.next.data = "/user/profile"
+            else:
+                # Will raise an exception if no endpoint exists for the url
+                adapter = current_app.create_url_adapter(request)
+                adapter.match(ref_url.path)  # type: ignore
+        except NotFound:
+            self.next.data = "/user/profile"
+        except HTTPException:
+            # Any other exceptions
+            pass
+
+    @property
+    def redirect_target(self) -> str:
+        return self.next.data
+
+
+class SignupForm(FlaskForm):  # type: ignore[misc]
+    """
+    Sign up form (registration).
+    """
+
+    login = StringField(
+        "Login",
+        [
+            validators.Length(min=3, max=50),
+            validators.InputRequired("Please enter your login."),
+        ],
+        description="Username desired.",
+    )
+    name = StringField(
+        "Name",
+        [validators.InputRequired("Your display name (firstname, lastname).")],
+    )
+    organisation = StringField("Organisation")
+    email = EmailField(
+        "Email",
+        [
+            validators.Length(min=6, max=256),
+            validators.InputRequired("Please enter your email address."),
+        ],
+        description="You will receive an email in order to confirm your account.",
+    )
+    submit = SubmitField("Sign up", render_kw={"class": "form-control"})
+
+    def validate(self) -> bool:
+        validated = super().validate()
+
+        # --- Email validation ---
+        email = (self.email.data or "").strip()
+        try:
+            email_domain = email.split("@", 1)[1].lower()
+        except IndexError:
+            self.email.errors.append("Invalid email address format.")
+            return False
+
+        # Only perform expensive checks if email changed or is new
+        user = getattr(self, "user", None)  # optionally set in the form init
+        if not user or email.lower() != (user.email or "").lower():
+            if is_email_in_misp_disposable_list(email_domain):
+                self.email.errors.append(
+                    "Email address detected in MISP warning list of disposable email."
+                )
+                validated = False
+            if not is_email_in_allow_list(email_domain):
+                self.email.errors.append("The email domain is not allowed.")
+                validated = False
+            if is_email_in_block_list(email_domain):
+                self.email.errors.append("The email domain is blocked.")
+                validated = False
+            if not has_mx_record(email_domain):
+                self.email.errors.append("The email domain is not deliverable.")
+                validated = False
+
+        # --- Login validation ---
+        login = (self.login.data or "").strip()
+        cleaned_login = User.make_valid_login(login)
+
+        # Uniqueness check - use cleaned_login for accurate comparison
+        existing = User.query.filter(
+            db.func.lower(User.login) == cleaned_login.lower()
+        ).first()
+
+        # Exclude current user from duplicate check
+        if existing and (not user or existing.id != user.id):
+            self.login.errors.append("Login already taken.")
+            validated = False
+
+        # Character validity
+        if login != cleaned_login:
+            self.login.errors.append(
+                "This login has invalid characters. Please use letters, numbers, hyphens and underscores only."
+            )
+            validated = False
+
+        # Reserved username check - prevent route collisions
+        if cleaned_login.lower() in RESERVED_USERNAMES:
+            self.login.errors.append(
+                "This username is reserved and cannot be used. Please choose a different username."
+            )
+            validated = False
+
+        # Username blacklist check - use cleaned login for consistency
+        if cleaned_login != "admin" and not validate(cleaned_login):
+            self.login.errors.append("Username not allowed.")
+            validated = False
+
+        return validated
+
+
+class LoginForm(RedirectForm):
+    """Sign in form."""
+
+    login = StringField(
+        "Login",
+        [
+            validators.Length(min=3, max=50),
+            validators.InputRequired("Please enter your login."),
+        ],
+        description="Your username.",
+        render_kw={"autofocus": True},
+    )
+    password = PasswordField(
+        "Password",
+        [
+            validators.InputRequired("Please enter your password."),
+            validators.Length(min=3, max=500),
+        ],
+    )
+    submit = SubmitField("Log In", render_kw={"class": "form-control"})
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.user = None
+        self.validation_error_code: Optional[int] = None
+
+    def validate(self) -> bool:
+        validated = super().validate()
+        user = User.query.filter(
+            db.func.lower(User.login) == db.func.lower(self.login.data)
+        ).first()
+
+        if not user:
+            self.validation_error_code = 401  # Unauthorized (bad login)
+            validated = False
+        else:
+            if not user.is_active:
+                self.validation_error_code = 403  # Forbidden (inactive user)
+                validated = False
+            if not user.is_confirmed:
+                self.validation_error_code = 403  # Forbidden (unconfirmed user)
+                validated = False
+            if not user.check_password(self.password.data):
+                validated = False
+            self.user = user
+
+        if not validated:
+            self.validation_error_code = 401  # Unauthorized (bad password)
+            self.login.errors.append("Impossible to login.")
+
+        return validated
+
+
+class AccountConfirmationForm(RedirectForm):
+    """Account confirmation and recovery form."""
+
+    password1 = PasswordField(
+        "Password",
+        [
+            validators.InputRequired("Please enter your password."),
+            validators.Length(min=20, max=500),
+            validators.InputRequired(),
+            validators.EqualTo("password2", message="Passwords must match."),
+        ],
+    )
+    password2 = PasswordField(
+        "Password confirmation",
+        [
+            validators.InputRequired("Please confirm your password."),
+            validators.Length(min=20, max=500),
+        ],
+        description="Please confirm your password.",
+    )
+    submit = SubmitField("Confirm", render_kw={"class": "form-control"})
+
+
+class AccountRecoveryForm(RedirectForm):
+    login = StringField(
+        "Login",
+        validators=[
+            validators.Length(min=3, max=30),
+            validators.InputRequired("Please enter your login."),
+        ],
+        filters=[lambda x: x.strip() if x else x],
+    )
+    submit = SubmitField("Recover your account", render_kw={"class": "form-control"})
+
+
+class TwoFactorForm(FlaskForm):  # type: ignore[misc]
+    otp = StringField(
+        "Enter OTP",
+        validators=[
+            InputRequired("Please enter the OTP from your device."),
+            validators.Length(min=6, max=6),
+        ],
+        description="Please enter the OTP from your device.",
+    )
+    submit = SubmitField("Verify", render_kw={"class": "form-control"})
+
+
+class ProfileForm(FlaskForm):  # type: ignore[misc]
+    """Edit the current user profile."""
+
+    login = StringField(
+        "Login",
+        [
+            validators.Length(min=3, max=30),
+            validators.InputRequired("Please enter your login."),
+        ],
+        render_kw={"autofocus": True},
+    )
+    name = StringField(
+        "Name",
+        [validators.InputRequired("Your display name (firstname, lastname).")],
+    )
+    password = PasswordField(
+        "New password (leave blank to keep current)",
+        [
+            validators.Optional(),
+            validators.Length(min=20, max=500),
+        ],
+    )
+    current_password = PasswordField(
+        "Current Password",
+        [
+            validators.Optional(),
+        ],
+        render_kw={"disabled": True},  # initially disabled
+    )
+    email = EmailField(
+        "Email",
+        [
+            InputRequired("Please enter your email address."),
+            Email("Please enter a valid email address."),
+        ],
+    )
+    organisation = StringField(
+        "Organisation", default="", validators=[validators.Length(min=0, max=50)]
+    )
+    country_code = SelectField("Country")
+    bio = TextAreaField(
+        "Bio (links to external websites and images will be automatically removed)",
+        default="",
+        validators=[validators.Length(min=0, max=5000)],
+    )
+    webpage = URLField(
+        "Webpage", default="", validators=[validators.Length(min=0, max=100)]
+    )
+    mastodon = URLField(
+        "Mastodon", default="", validators=[validators.Length(min=0, max=100)]
+    )
+    github = StringField(
+        "GitHub username", default="", validators=[validators.Length(min=0, max=39)]
+    )
+    linkedin = StringField(
+        "LinkedIn username", default="", validators=[validators.Length(min=0, max=30)]
+    )
+
+    submit = SubmitField("Save")
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.country_code.choices = [("", "")]
+        self.country_code.choices.extend(
+            sorted(
+                ((country.alpha_3, country.name) for country in pycountry.countries),
+                key=lambda elem: elem[1],
+            )
+        )
+        # Optional: attach user instance if provided
+        self.user = kwargs.get("user", None)
+
+    def validate(self) -> bool:
+        validated = super().validate()
+
+        # --- Login validation ---
+        login = (self.login.data or "").strip()
+        cleaned_login = User.make_valid_login(login)
+
+        # Uniqueness check (ignore current user) - use cleaned_login for accurate comparison
+        existing = User.query.filter(
+            db.func.lower(User.login) == cleaned_login.lower()
+        ).first()
+        if existing and existing.id != current_user.id:
+            self.login.errors.append("Login already taken.")
+            validated = False
+
+        if self.password.data:
+            if not self.current_password.data:
+                validated = False
+                self.password.errors.append("You must provide your current password.")
+
+            if self.current_password.data == self.password.data:
+                validated = False
+                self.password.errors.append(
+                    "You entered the same password as your current one."
+                )
+
+            if self.current_password.data and not existing.check_password(
+                self.current_password.data
+            ):
+                validated = False
+                self.password.errors.append("Invalid current password.")
+
+        # Invalid characters
+        if login != cleaned_login:
+            self.login.errors.append(
+                "This login has invalid characters. Please use letters, numbers, hyphens and underscores only."
+            )
+            validated = False
+
+        # Reserved username check - prevent route collisions
+        if cleaned_login.lower() in RESERVED_USERNAMES:
+            self.login.errors.append(
+                "This username is reserved and cannot be used. Please choose a different username."
+            )
+            validated = False
+
+        # Blacklist check - use cleaned_login for consistency
+        if cleaned_login != "admin" and not validate(cleaned_login):
+            self.login.errors.append("Username not allowed.")
+            validated = False
+
+        # --- Email validation ---
+        email = (self.email.data or "").strip().lower()
+        try:
+            email_domain = email.split("@", 1)[1]
+        except IndexError:
+            self.email.errors.append("Invalid email address format.")
+            return False
+
+        # Only run domain-level checks if email has changed
+        if email != (current_user.email or "").lower():
+            if is_email_in_misp_disposable_list(email_domain):
+                self.email.errors.append(
+                    "Email address detected in MISP warning list of disposable email."
+                )
+                validated = False
+            if not is_email_in_allow_list(email_domain):
+                self.email.errors.append("The email domain is not allowed.")
+                validated = False
+            if is_email_in_block_list(email_domain):
+                self.email.errors.append("The email domain is blocked.")
+                validated = False
+            if not has_mx_record(email_domain):
+                self.email.errors.append("The email domain is not deliverable.")
+                validated = False
+
+        return validated
+
+
+class UserForm(FlaskForm):  # type: ignore[misc]
+    """Create or edit a user (for the administrator)."""
+
+    login = StringField(
+        "Login",
+        [
+            validators.Length(min=3, max=30),
+            validators.InputRequired("Please enter your login."),
+        ],
+        render_kw={"autofocus": True},
+    )
+    name = StringField(
+        "Name",
+        [
+            validators.Length(min=3, max=50),
+            validators.InputRequired("Your display name (firstname, lastname)."),
+        ],
+    )
+    organisation = StringField(
+        "Organisation", validators=[validators.Length(min=0, max=50)]
+    )
+    password = PasswordField(
+        "Password (leave blank to keep current)",
+        validators=[validators.Optional(), validators.Length(min=5, max=500)],
+    )
+    email = EmailField(
+        "Email",
+        [
+            InputRequired("Please enter your email address."),
+            Email("Please enter your email address."),
+        ],
+    )
+    country_code = SelectField("Country")
+    bio = TextAreaField(
+        "Bio (link to external websites and images will be automatically removed)",
+        default="",
+        validators=[validators.Length(min=0, max=5000)],
+    )
+    webpage = URLField(
+        "Webpage", default="", validators=[validators.Length(min=0, max=100)]
+    )
+    mastodon = URLField(
+        "Mastodon", default="", validators=[validators.Length(min=0, max=100)]
+    )
+    github = StringField(
+        "GitHub username", default="", validators=[validators.Length(min=0, max=39)]
+    )
+    linkedin = StringField(
+        "LinkedIn username", default="", validators=[validators.Length(min=0, max=30)]
+    )
+
+    is_active = BooleanField("Active", default=True)
+    is_confirmed = BooleanField("Confirmed", default=True)
+    is_admin = BooleanField("Admin", default=False)
+    is_commenter = BooleanField("Commenter", default=False)
+    is_reporter = BooleanField("Reporter", default=False)
+    failed_otp_attempts = IntegerField(
+        "Failed OTP attempts",
+        default=0,
+        validators=[
+            validators.NumberRange(min=0, max=5, message="Must be between 0 and 5")
+        ],
+    )
+    submit = SubmitField("Save")
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.country_code.choices = [("", "")]
+        self.country_code.choices.extend(
+            sorted(
+                ((country.alpha_3, country.name) for country in pycountry.countries),
+                key=lambda elem: elem[1],
+            )
+        )
+
+    def validate(self) -> bool:
+        validated = super().validate()
+        cleaned_login = User.make_valid_login(self.login.data)
+        if self.login.data != cleaned_login:
+            self.login.errors.append(
+                "This login has invalid characters. "
+                "Please use letters, numbers, hyphens and underscores only."
+            )
+        # Reserved username check - prevent route collisions
+        if cleaned_login.lower() in RESERVED_USERNAMES:
+            self.login.errors.append(
+                "This username is reserved and cannot be used. Please choose a different username."
+            )
+            validated = False
+        # Use cleaned_login for blacklist check for consistency
+        if cleaned_login != "admin" and not validate(cleaned_login):
+            self.login.errors.append("Username not allowed.")
+            validated = False
+        return validated
+
+
+class SightingForm(FlaskForm):  # type: ignore[misc]
+    type = SelectField("Type")
+    source = StringField(
+        "Source",
+        [
+            validators.Length(min=3, max=2048),
+            validators.InputRequired("Please enter a source."),
+        ],
+        render_kw={"autofocus": True},
+    )
+    vulnerability = StringField(
+        "Vulnerability",
+        [
+            validators.Length(min=3, max=50),
+            validators.InputRequired("Please enter a vulnerability."),
+        ],
+    )
+    creation_timestamp = DateTimeLocalField(
+        "Date",
+        validators=[validators.InputRequired("Please enter a date.")],
+    )
+    submit = SubmitField("Save", render_kw={"class": "form-control"})
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.type.choices = [
+            ("seen", "Seen"),
+            ("published-proof-of-concept", "Published Proof of Concept"),
+            ("exploited", "Exploited"),
+            ("not-exploited", "Not exploited"),
+            ("confirmed", "Confirmed"),
+            ("not-confirmed", "Not confirmed"),
+            ("patched", "Patched"),
+            ("not-patched", "Not patched"),
+        ]
+
+
+class OrganizationForm(FlaskForm):  # type: ignore[misc]
+    """Create or edit an organization (for the administrator)."""
+
+    name = StringField(
+        "Name",
+        [
+            validators.Length(min=3, max=100),
+            validators.InputRequired("Please enter a name."),
+        ],
+    )
+    short_name = StringField(
+        "Short name",
+        [
+            validators.Length(min=3, max=50),
+            validators.InputRequired("Please enter a short name."),
+        ],
+    )
+    description = TextAreaField(
+        "Description",
+        [
+            validators.Length(min=3, max=500),
+            validators.InputRequired("Please enter a description"),
+        ],
+    )
+    short_description = TextAreaField(
+        "Short description",
+        [
+            validators.Length(min=3, max=250),
+            validators.InputRequired("Please enter a short description"),
+        ],
+    )
+    gna_id = IntegerField(
+        "GNA Identifier", description="Reserved GNA Identifier", default=-1
+    )
+    gcve_pull = BooleanField(
+        "GCVE Pull",
+        default=False,
+        description="Pull advisories from the instance (a GNA identifier must be defined).",
+    )
+    website = URLField("Website")
+    email = EmailField("Email")
+    organization_type = StringField("Organization type")
+    country_code = SelectField("Country")
+    members = SelectMultipleField(
+        "Members",
+        coerce=int,
+        description="The members part of the organization.",
+    )
+    is_membership_restricted = BooleanField(
+        "Restricted membership",
+        default=True,
+        description="The membership model of the organization (restricted or not restricted).",
+    )
+    logo = FileField("Logo")
+    submit = SubmitField("Save")
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.members.choices = [(user.id, user.login) for user in User.query.all()]
+        self.country_code.choices = [("", "")]
+        self.country_code.choices.extend(
+            sorted(
+                ((country.alpha_3, country.name) for country in pycountry.countries),
+                key=lambda elem: elem[1],
+            )
+        )
+
+    def validate(self) -> bool:
+        validated = super().validate()
+        if self.gcve_pull.data and self.gna_id.data == -1:
+            self.gcve_pull.errors.append("Please set a valid GNA identifier.")
+            validated = False
+        return validated
+
+
+class OrganizationCPEVendorForm(FlaskForm):  # type: ignore[misc]
+    """Manage CPE vendor names related to an organization."""
+
+    name = StringField(
+        "Name",
+        [
+            validators.Length(min=3, max=400),
+            validators.InputRequired("Please enter a name."),
+        ],
+        render_kw={"autofocus": True, "list": "vendors_list"},
+    )
+
+
+class ProductForm(FlaskForm):  # type: ignore[misc]
+    """Create or edit a product (for the administrator)."""
+
+    name = StringField(
+        "Name",
+        [
+            validators.Length(min=3, max=100),
+            validators.InputRequired("Please enter a name."),
+        ],
+    )
+    short_name = StringField(
+        "Short name",
+        [
+            validators.Length(min=3, max=50),
+            validators.InputRequired("Please enter a short name."),
+        ],
+    )
+    description = TextAreaField(
+        "Description",
+        [
+            validators.Length(min=3, max=500),
+            validators.InputRequired("Please enter a description"),
+        ],
+    )
+    short_description = TextAreaField(
+        "Short description",
+        [
+            validators.Length(min=3, max=250),
+            validators.InputRequired("Please enter a short description"),
+        ],
+    )
+    part = SelectField("Part")
+    website = URLField("Website")
+    licenses = SelectMultipleField("Licenses", [validators.Optional()], coerce=int)
+    languages = SelectMultipleField(
+        "Programming languages", [validators.Optional()], coerce=int
+    )
+    organizations = SelectMultipleField(
+        "Organization(s)",
+        coerce=int,
+        description="The organization(s) managing the project.",
+    )
+    logo = FileField("Logo")
+    submit = SubmitField("Save")
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.part.choices = [
+            ("a", "Application"),
+            ("h", "Hardware"),
+            ("o", "Operating System"),
+        ]
+        self.organizations.choices = [
+            (organization.id, organization.name)
+            for organization in Organization.query.all()
+        ]
+        self.licenses.choices = [
+            (license.id, license.name) for license in License.query.all()
+        ]
+        self.languages.choices = [
+            (language.id, language.name) for language in Language.query.all()
+        ]
+
+
+class ProductCPEProductForm(FlaskForm):  # type: ignore[misc]
+    """Manage CPE productendor names related to a product."""
+
+    name = StringField(
+        "Name",
+        [
+            validators.Length(min=3, max=400),
+            validators.InputRequired("Please enter a name."),
+        ],
+        render_kw={"autofocus": True},
+    )
+
+
+class NotificationVendorProductForm(FlaskForm):  # type: ignore[misc]
+    vendor = StringField(
+        "Vendor",
+        [
+            validators.Length(min=1, max=500),
+            validators.DataRequired("Please enter a vendor."),
+            validators.InputRequired("Please enter a vendor."),
+        ],
+        render_kw={"autofocus": True, "list": "vendors_list"},
+    )
+    product = StringField(
+        "Product",
+        [
+            validators.Length(min=0, max=500),
+            validators.InputRequired("Please enter a product."),
+        ],
+        render_kw={"list": "products_list"},
+    )
+    frequency = SelectField("Frequency")
+    is_active = BooleanField("Active", default=True)
+    submit = SubmitField("Save", render_kw={"class": "form-control"})
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.frequency.choices = [
+            ("hourly", "Hourly"),
+            ("daily", "Daily"),
+            ("weekly", "Weekly"),
+        ]
+
+    def validate(self) -> bool:
+        validated = super().validate()
+        if (
+            validated
+            and self.vendor.data.lower() not in vulnerabilitylookup.get_vendors()
+        ):
+            self.vendor.errors.append("Unknown vendor.")
+            validated = False
+        return validated
+
+
+class NotificationOrganizationProductForm(FlaskForm):  # type: ignore[misc]
+    organization_uuid = HiddenField()
+    organization = StringField(
+        "Organization",
+        [
+            validators.Length(min=1, max=500),
+            validators.DataRequired("Please enter an organization."),
+            validators.InputRequired("Please enter an organization."),
+        ],
+        render_kw={"autofocus": True, "list": "organizations_list"},
+    )
+    product_uuid = HiddenField()
+    product = StringField(
+        "Product",
+        [
+            validators.Length(min=0, max=500),
+            validators.InputRequired("Please enter a product."),
+        ],
+        render_kw={"list": "org_products_list"},
+    )
+    frequency = SelectField("Frequency")
+    is_active = BooleanField("Active", default=True)
+    submit1 = SubmitField("Save", render_kw={"class": "form-control"})
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.frequency.choices = [
+            ("hourly", "Hourly"),
+            ("daily", "Daily"),
+            ("weekly", "Weekly"),
+        ]
+
+    # def validate(self) -> bool:
+    #     validated = super().validate()
+    #     if self.vendor.data.lower() not in vulnerabilitylookup.get_vendors():
+    #         self.vendor.errors.append("Unknown vendor.")
+    #         validated = False
+    #     return validated
+
+
+class VulnerabilityDisclosureForm(FlaskForm):  # type: ignore[misc]
+    """Form for submitting or editing a vulnerability disclosure."""
+
+    reporter_legal_status = SelectField(
+        "Your legal status",
+        description="Are you reporting this vulnerability as a natural personal or a legal person.",
+    )
+    title = StringField(
+        "Title",
+        [
+            validators.Length(min=3, max=100),
+            validators.InputRequired("Please enter a title."),
+        ],
+    )
+    description = TextAreaField(
+        "Description",
+        [
+            validators.Length(min=3, max=5000),
+            validators.InputRequired("Please enter a description."),
+        ],
+        description="Provide a detailed description of the vulnerability. Consider including how it was found, how to reproduce it, its impact, any patches or workarounds, and references.",
+    )
+    vulnerability_id = StringField(
+        "Vulnerability ID",
+        [
+            validators.Optional(),
+            validators.Length(min=3, max=50),
+        ],
+        description="If available, provide the associated vulnerability ID (e.g., CVE identifier).",
+    )
+    online_service = BooleanField(
+        "Online Service",
+        description="Indicates whether the vulnerability affects an online service.",
+        default=False,
+    )
+    affected_products = StringField(
+        "Affected Products",
+        [
+            validators.Length(min=0, max=50),
+        ],
+        description="Provide known information about the affected product(s), including vendor, product name, and version.",
+        render_kw={"placeholder": "vendor:product"},
+    )
+    cwes = SelectMultipleField(
+        "Related CWEs",
+        coerce=int,
+        description="Optionally select any relevant Common Weakness Enumerations (CWEs) related to this vulnerability.",
+    )
+    capecs = SelectMultipleField(
+        "Related CAPECs",
+        coerce=int,
+        description="Optionally select any relevant Common Attack Pattern Enumeration and Classification (CAPECs) related to this vulnerability.",
+    )
+    anonymous = BooleanField(
+        "Remain Anonymous",
+        description="Check this box if the reporter does not wish to be publicly credited.",
+        default=False,
+    )
+    credits = StringField(
+        "Credits",
+        [
+            validators.Length(min=0, max=100),
+        ],
+        render_kw={"placeholder": "Name, company or email address."},
+    )
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.cwes.choices = []
+        for cwe in vulnerabilitylookup.list_cwe(number=200):
+            self.cwes.choices.append((cwe["@ID"], cwe["@Name"]))
+        self.capecs.choices = []
+        for capec in vulnerabilitylookup.list_capec(number=1000):
+            self.capecs.choices.append((capec["@ID"], capec["@Name"]))
+
+
+class VulnerabilityDisclosureAdminForm(FlaskForm):  # type: ignore[misc]
+    """Form for submitting or editing a vulnerability disclosure."""
+
+    disclosed_timestamp = DateTimeLocalField(
+        "Disclosed timestamp",
+        validators=[validators.InputRequired("Please enter a date.")],
+    )
+    state = SelectField("State")
+    reporter_legal_status = SelectField(
+        "Your legal status",
+        description="Are you reporting this vulnerability as a natural personal or a legal person.",
+    )
+    title = StringField(
+        "Title",
+        [
+            validators.Length(min=3, max=100),
+            validators.InputRequired("Please enter a title."),
+        ],
+    )
+    description = TextAreaField(
+        "Description",
+        [
+            # validators.Length(min=3, max=100),
+            validators.InputRequired("Please enter a description."),
+        ],
+        description="Provide a detailed description of the vulnerability. Consider including how it was found, how to reproduce it, its impact, any patches or workarounds, and references.",
+    )
+    vulnerability_id = StringField(
+        "Vulnerability ID",
+        [
+            validators.Length(min=0, max=50),
+        ],
+        description="If available, provide the associated vulnerability ID (e.g., CVE identifier).",
+    )
+    online_service = BooleanField(
+        "Online Service",
+        description="Indicates whether the vulnerability affects an online service.",
+        default=False,
+    )
+    affected_products = StringField(
+        "Affected Products",
+        [
+            validators.Length(min=0, max=50),
+        ],
+        description="Provide known information about the affected product(s), including vendor, product name, and version.",
+        render_kw={"placeholder": "vendor:product"},
+    )
+    cwes = SelectMultipleField(
+        "Related CWEs",
+        coerce=int,
+        description="Optionally select any relevant Common Weakness Enumerations (CWEs) related to this vulnerability.",
+    )
+    capecs = SelectMultipleField(
+        "Related CAPECs",
+        coerce=int,
+        description="Optionally select any relevant Common Attack Pattern Enumeration and Classification (CAPECs) related to this vulnerability.",
+    )
+    anonymous = BooleanField(
+        "Remain Anonymous",
+        description="Check this box if the reporter does not wish to be publicly credited.",
+        default=False,
+    )
+    credits = StringField(
+        "Credits",
+        [
+            validators.Length(min=0, max=100),
+        ],
+        render_kw={"placeholder": "Name, company or email address."},
+    )
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.state.choices = [
+            ("reported", "Reported"),
+            ("under_review", "Under review"),
+            ("vendor_contacted", "Vendor contacted"),
+            ("waiting_information_from_reporter", "Waiting information from reporter"),
+            ("approved", "Approved"),
+            ("rejected", "Rejected"),
+            ("disclosed", "Disclosed"),
+            ("closed", "Closed"),
+        ]
+        self.cwes.choices = []
+        for cwe in vulnerabilitylookup.list_cwe(number=200):
+            self.cwes.choices.append((cwe["@ID"], cwe["@Name"]))
+        self.capecs.choices = []
+        for capec in vulnerabilitylookup.list_capec(number=1000):
+            self.capecs.choices.append((capec["@ID"], capec["@Name"]))
+
+
+class CommentForm(FlaskForm):  # type: ignore[misc]
+    """Form for submitting or editing a vulnerability disclosure."""
+
+    description = TextAreaField(
+        "Description",
+        [
+            validators.Length(min=3, max=1000),
+            validators.InputRequired("Please enter a description."),
+        ],
+    )
+    submit = SubmitField("Save", render_kw={"class": "form-control"})
+
+
+class KEVEntryForm(FlaskForm):  # type: ignore[misc]
+    """Form for creating/editing a KEV entry (BCP-07 compliant)."""
+
+    vuln_id = StringField(
+        "Vulnerability ID",
+        [
+            validators.Length(min=3, max=100),
+            validators.InputRequired("Please enter a vulnerability ID."),
+        ],
+        description="CVE, GHSA, GCVE, or other vulnerability identifier",
+        render_kw={"autofocus": True},
+    )
+    alt_id = TextAreaField(
+        "Alternative IDs",
+        [validators.Optional()],
+        description="One alternative ID per line (e.g., other CVE IDs, vendor IDs)",
+        render_kw={"rows": 3},
+    )
+    exploited = BooleanField("Exploited", default=True)
+    status_reason = SelectField(
+        "Status Reason",
+        [validators.InputRequired()],
+    )
+    status_updated_at = DateTimeLocalField(
+        "Status Updated At",
+        validators=[validators.InputRequired("Please enter a date.")],
+    )
+
+    # Characteristics (JSON fields)
+    remote_code_execution = SelectField(
+        "Remote Code Execution",
+        choices=[("", "Unknown"), ("true", "Yes"), ("false", "No")],
+    )
+    authentication_required = SelectField(
+        "Authentication Required",
+        choices=[("", "Unknown"), ("true", "Yes"), ("false", "No")],
+    )
+    local_access_required = SelectField(
+        "Local Access Required",
+        choices=[("", "Unknown"), ("true", "Yes"), ("false", "No")],
+    )
+    severity = StringField(
+        "Severity",
+        [validators.Optional()],
+        description="Severity score (0.0-100.0)",
+    )
+
+    # Timestamps (JSON fields)
+    first_seen_at = DateTimeLocalField(
+        "First Seen At", validators=[validators.Optional()]
+    )
+    asserted_at = DateTimeLocalField("Asserted At", validators=[validators.Optional()])
+    last_seen_at = DateTimeLocalField(
+        "Last Seen At", validators=[validators.Optional()]
+    )
+
+    # Scope (JSON fields)
+    scope_notes = TextAreaField(
+        "Scope Notes",
+        [validators.Optional()],
+        description="Human-readable clarifications",
+        render_kw={"rows": 3},
+    )
+
+    submit = SubmitField("Save", render_kw={"class": "form-control"})
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.status_reason.choices = [
+            ("confirmed", "Confirmed"),
+            ("suspected", "Suspected"),
+            ("disputed", "Disputed"),
+            ("historical", "Historical"),
+            ("unknown", "Unknown"),
+        ]
+
+
+class KEVEvidenceForm(FlaskForm):  # type: ignore[misc]
+    """Form for adding evidence to a KEV entry."""
+
+    evidence_type = SelectField("Evidence Type", [validators.Optional()])
+    source = StringField(
+        "Source",
+        [
+            validators.Length(min=1, max=500),
+            validators.InputRequired("Please enter a source."),
+        ],
+        render_kw={"autofocus": True},
+    )
+    signal = SelectField("Signal", [validators.Optional()])
+    confidence = StringField(
+        "Confidence",
+        [validators.Optional()],
+        description="Number (0.0-1.0) or descriptive string",
+    )
+    details = TextAreaField(
+        "Details",
+        [validators.Optional()],
+        description="Additional implementation-specific details (JSON)",
+        render_kw={"rows": 3},
+    )
+    submit = SubmitField("Add Evidence", render_kw={"class": "form-control"})
+
+    def __init__(self, *args: str, **kwargs: int) -> None:
+        super().__init__(*args, **kwargs)
+        self.evidence_type.choices = [
+            ("", "Not specified"),
+            ("incident_response", "Incident Response"),
+            ("telemetry", "Telemetry"),
+            ("honeypot", "Honeypot"),
+            ("sinkhole", "Sinkhole"),
+            ("vendor_report", "Vendor Report"),
+            ("csirt_report", "CSIRT Report"),
+            ("public_report", "Public Report"),
+            ("research_report", "Research Report"),
+            ("unknown", "Unknown"),
+        ]
+        self.signal.choices = [
+            ("", "Not specified"),
+            ("in_the_wild_attempts", "In The Wild Attempts"),
+            ("successful_exploitation", "Successful Exploitation"),
+            ("confirmed_compromise", "Confirmed Compromise"),
+            ("mass_scanning", "Mass Scanning"),
+            ("weaponized_exploit_available", "Weaponized Exploit Available"),
+        ]

@@ -1,0 +1,54 @@
+import logging
+from typing import Any, Tuple
+
+import requests
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+)
+
+from website.web.bootstrap import application
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+epss_ns = Namespace("epss", description="EPSS related operations.")
+
+
+@epss_ns.route("/<string:vulnerability_id>")
+class EPSSItem(Resource):  # type: ignore[misc]
+    @typed(epss_ns.doc(description="Get the EPSS score of a vulnerability."))
+    @typed(
+        epss_ns.doc(
+            responses={
+                200: "Success.",
+                404: "EPSS score not found.",
+                502: "Bad Gateway: Invalid response from EPSS service.",
+                503: "Service Unavailable: Unable to reach EPSS service or misconfigured.",
+            }
+        )
+    )
+    def get(self, vulnerability_id: str) -> Tuple[dict[Any, Any], int]:
+        """Get the EPSS score of a vulnerability."""
+        epss_service = application.config.get("EPSS_SERVICE")
+        if not epss_service:
+            return {"message": "EPSS service not configured."}, 503
+
+        params = {"scope": "time-series", "cve": vulnerability_id.upper()}
+        try:
+            r = requests.get(epss_service, params=params, timeout=10)
+        except requests.RequestException as e:
+            return {"message": f"Connection error: {e}"}, 503
+
+        if r.status_code == 404:
+            return {"message": "EPSS score not found."}, 404
+        if not r.ok:
+            return {"message": f"EPSS service returned {r.status_code}."}, 502
+
+        try:
+            epss_value = r.json()
+        except ValueError:
+            return {"message": "Invalid JSON response from EPSS service."}, 502
+
+        return epss_value, 200

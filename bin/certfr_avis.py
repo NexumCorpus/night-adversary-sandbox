@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+
+import logging.config
+
+from vulnerabilitylookup.default import AbstractManager, get_config
+from vulnerabilitylookup.feeders.certfr_avis import CertFrAvis
+
+logging.config.dictConfig(get_config('logging'))
+
+
+class CertFrAvisImporter(AbstractManager):
+
+    def __init__(self, loglevel: int | None=None, *, reimport: bool=False) -> None:
+        self.script_name = 'certfr_avis_importer'
+        super().__init__(loglevel)
+        self.certfr = CertFrAvis(reimport=reimport)
+
+    def _to_run_forever(self) -> None:
+        self.certfr.update(self.shutdown_requested)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='CERT FR Avis Importer')
+    parser.add_argument('--reimport', default=False, action='store_true', help='Reimport all data')
+    args = parser.parse_args()
+    cfr = CertFrAvisImporter(reimport=args.reimport)
+    cfr.run(sleep_in_sec=3600)
+
+
+if __name__ == '__main__':
+    main()

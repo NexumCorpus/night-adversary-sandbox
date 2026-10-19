@@ -1,0 +1,263 @@
+{% from 'bootstrap5/utils.html' import render_icon %}
+{%- macro sort_link(column_name, label) %}
+    {%- set new_dir = 'asc' if request.args.get('sort') == column_name and request.args.get('sort_order') == 'desc' else 'desc' %}
+    <a style="text-decoration:underline dotted" href="{{ request.url | update_query(sort=column_name, sort_order=new_dir) }}">
+        {{ label }}
+    </a>
+{%- endmacro %}
+{% macro table_users(users) %}
+  <form id="batchActionForm" method="post" action="{{ url_for('admin_user_bp.batch_action') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+    <div class="d-flex align-items-center mb-2 gap-2">
+      <select name="action" id="batchActionSelect" class="form-select form-select-sm w-auto">
+        <option value="">-- Select action --</option>
+        <option value="delete">Delete selected</option>
+      </select>
+      <button type="button" id="applyBatchAction" class="btn btn-sm btn-primary">Apply</button>
+    </div>
+
+    <div class="table-responsive">
+      <table id="table-users" class="table table-hover table-nowrap">
+        <thead>
+          <tr>
+            <th><input type="checkbox" id="selectAll"></th>
+            <th>Login</th>
+            <th>Email address</th>
+            <th>{{ sort_link('organisation', 'Organisation') }}</th>
+            <th>Country</th>
+            <th>Permissions</th>
+            <th>{{ sort_link('notifications', 'Notifications') }}</th>
+            <th>{{ sort_link('member_since', 'Member since') }}</th>
+            <th>{{ sort_link('last_seen', 'Last seen') }}</th>
+            <th>State</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for user in users %}
+          <tr>
+            <td>
+              <input type="checkbox" name="user_ids" value="{{ user.id }}" class="user-checkbox" data-login="{{ user.login }}">
+            </td>
+            <td><a href="{{ url_for('user_bp.profile', login=user.login) }}">{{ user.login }}</a></td>
+            <td title="{{ user.email }}">
+              <a href="mailto:{{ user.email }}">{{ user.email }}</a>
+            </td>
+            <td><a href="{{ request.url | update_query(organisation=user.organisation) }}">{{ user.organisation }}</a></td>
+            <td><a href="{{ request.url | update_query(country=user.country_code) }}">{{ user.country_code }}</a></td>
+            <td class="permissions">
+              {% for permission in user.permissions() %}
+                <a href="{{ request.url | update_query(permission=permission) }}">{{ permission }}</a>
+              {% endfor %}
+            </td>
+            <td><a href="{{ url_for('admin_notifications_bp.list_notifications', query=user.login) }}">{{ user.notifications.count() }}</a></td>
+            <td class="date" title="{{ user.created_at | datetimeformat }}">
+              {{ user.created_at | datetimeformat('%Y-%m-%d') }}
+            </td>
+            <td class="date" title="{{ user.last_seen | datetimeformat }}">
+              {{ user.last_seen | datetimeformat('%Y-%m-%d') }}
+            </td>
+            <td>
+              {% if user.is_active %}{{ render_icon('lock', title='Account active', color='green') }}{% else %}{{ render_icon('lock', title='Account inactive', color='red') }}{% endif %}
+              {% if user.is_confirmed %}{{ render_icon('check', title='Account confirmed', color='green') }}{% else %}{{ render_icon('check', title='Account not confirmed', color='red') }}{% endif %}
+              {% if user.is_two_factor_authentication_enabled %}{{ render_icon('key', title='Two-Factor Authentication enabled', color='green') }}{% else %}{{ render_icon('key', title='Two-Factor Authentication not enabled', color='red') }}{% endif %}
+              {% if user.failed_otp_attempts %}{{ render_icon('exclamation', title='Failed 2FA attempts', color='orange') }}{% endif %}
+            </td>
+            <td>
+              {% if current_user.id != user.id %}
+                <a class="btn btn-primary btn-sm" href="{{ url_for('admin_user_bp.form_user', user_id=user.id) }}">{{ render_icon('pen', title='Edit the user') }}</a>
+                <a class="btn btn-warning btn-sm" href="#"
+                  data-bs-toggle="modal"
+                  data-bs-target="#reset2FAUserModal"
+                  data-action="reset2FA"
+                  data-user-id="{{ user.id }}"
+                  data-user-login="{{ user.login }}">
+                  {{ render_icon('arrow-clockwise', title='Reset Two-Factor Authentication') }}
+                </a>
+                <a class="btn btn-danger btn-sm" href="#"
+                  data-bs-toggle="modal"
+                  data-bs-target="#deleteUserModal"
+                  data-action="delete"
+                  data-user-id="{{ user.id }}"
+                  data-user-login="{{ user.login }}">
+                  {{ render_icon('trash') }}
+                </a>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </form>
+
+<!-- Delete confirmation modal -->
+<div class="modal fade" id="deleteUserModal" tabindex="-1" aria-labelledby="deleteUserModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <!-- Header -->
+      <div class="modal-header bg-danger text-white">
+        <h5 class="modal-title" id="deleteUserModalLabel">Confirm Deletion</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <!-- Form -->
+      <form id="deleteUserForm" method="post" action="{{ url_for('admin_user_bp.batch_action') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+        <div class="modal-body">
+          <p id="deleteUserText" class="fw-bold text-danger"></p>
+          <ul id="deleteUserList" class="mt-2"></ul>
+          <div data-role="user-ids"></div>
+          <input type="hidden" name="action" value="delete" />
+          <div class="mb-3 mt-3">
+            <label for="deleteUserPassword" class="form-label">Enter your password to confirm:</label>
+            <input type="password" id="deleteUserPassword" name="password" class="form-control" required>
+          </div>
+        </div>
+        <!-- Footer -->
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-danger">Delete</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<!-- Reset 2FA modal -->
+<div class="modal fade" id="reset2FAUserModal" tabindex="-1" aria-labelledby="reset2FAUserModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <!-- Header -->
+      <div class="modal-header bg-danger text-white">
+        <h5 class="modal-title" id="reset2FAUserModalLabel">Confirm reset</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <!-- Form -->
+      <form id="reset2FAUserForm" method="post" action="{{ url_for('admin_user_bp.batch_action') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+        <div class="modal-body">
+          <p id="reset2FAUserText" class="fw-bold text-danger"></p>
+          <ul id="reset2FAUserList" class="mt-2"></ul>
+          <div data-role="user-ids"></div>
+          <input type="hidden" name="action" value="reset2FA" />
+          <div class="mb-3 mt-3">
+            <label for="reset2FAUserPassword" class="form-label">Enter your password to confirm:</label>
+            <input type="password" id="reset2FAUserPassword" name="password" class="form-control" required>
+          </div>
+        </div>
+        <!-- Footer -->
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-danger">Delete</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  // === Batch action ===
+  const applyBtn = document.getElementById('applyBatchAction');
+  if (applyBtn) {
+    applyBtn.addEventListener('click', function (event) {
+      event.preventDefault();
+
+      const action = document.getElementById('batchActionSelect').value;
+      const selectedCheckboxes = Array.from(document.querySelectorAll('.user-checkbox:checked'));
+
+      if (!action) {
+        alert('Please select an action.');
+        return;
+      }
+      if (selectedCheckboxes.length === 0) {
+        alert('Please select at least one user.');
+        return;
+      }
+
+      if (action === 'delete' || action === 'reset2FA') {
+        const modalId = action === 'delete' ? 'deleteUserModal' : 'reset2FAUserModal';
+        const modalTextId = action === 'delete' ? 'deleteUserText' : 'reset2FAUserText';
+        const modalListId = action === 'delete' ? 'deleteUserList' : 'reset2FAUserList';
+        const modalFormId = action === 'delete' ? 'deleteUserForm' : 'reset2FAUserForm';
+
+        const list = document.getElementById(modalListId);
+        const text = document.getElementById(modalTextId);
+        const form = document.getElementById(modalFormId);
+
+        // Reset previous hidden inputs
+        form.querySelectorAll('input[name="user_ids"]').forEach(i => i.remove());
+
+        // Insert hidden inputs for selected users
+        list.innerHTML = '';
+        selectedCheckboxes.forEach(cb => {
+          const li = document.createElement('li');
+          li.textContent = `${cb.dataset.login} (ID: ${cb.value})`;
+          list.appendChild(li);
+
+          const hidden = document.createElement('input');
+          hidden.type = 'hidden';
+          hidden.name = 'user_ids';
+          hidden.value = cb.value;
+          form.appendChild(hidden);
+        });
+
+        text.textContent = action === 'delete'
+          ? `You are about to delete ${selectedCheckboxes.length} user(s).`
+          : `You are about to reset Two-Factor Authentication for ${selectedCheckboxes.length} user(s).`;
+
+        form.querySelector('input[name="action"]').value = action;
+
+        // Show modal
+        const modal = new bootstrap.Modal(document.getElementById(modalId));
+        modal.show();
+      } else {
+        // For other batch actions (if any), submit main form
+        document.getElementById('batchActionForm').submit();
+      }
+    });
+  }
+
+  // === Modals for single-user actions ===
+  document.querySelectorAll('[data-bs-toggle="modal"]').forEach(button => {
+    button.addEventListener('click', function (event) {
+      // Only handle if modal has data-action
+      const action = button.dataset.action;
+      if (!action) return;
+
+      const userId = button.dataset.userId;
+      const userLogin = button.dataset.userLogin;
+      const modalId = action === 'delete' ? 'deleteUserModal' : 'reset2FAUserModal';
+      const modalTextId = action === 'delete' ? 'deleteUserText' : 'reset2FAUserText';
+      const modalListId = action === 'delete' ? 'deleteUserList' : 'reset2FAUserList';
+      const modalFormId = action === 'delete' ? 'deleteUserForm' : 'reset2FAUserForm';
+
+      const list = document.getElementById(modalListId);
+      const text = document.getElementById(modalTextId);
+      const form = document.getElementById(modalFormId);
+
+      // Reset previous hidden inputs
+      form.querySelectorAll('input[name="user_ids"]').forEach(i => i.remove());
+
+      // Insert current user
+      list.innerHTML = `<li>${userLogin} (ID: ${userId})</li>`;
+      text.textContent = action === 'delete'
+        ? 'You are about to delete the following user:'
+        : 'You are about to reset Two-Factor Authentication for:';
+
+      const hidden = document.createElement('input');
+      hidden.type = 'hidden';
+      hidden.name = 'user_ids';
+      hidden.value = userId;
+      form.appendChild(hidden);
+
+      form.querySelector('input[name="action"]').value = action;
+
+      // Form always posts to batch endpoint
+      form.action = "{{ url_for('admin_user_bp.batch_action') }}";
+    });
+  });
+});
+</script>
+{%- endmacro %}

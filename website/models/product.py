@@ -1,0 +1,251 @@
+import json
+import uuid
+from collections import defaultdict
+from datetime import datetime
+from itertools import product
+from typing import Any
+
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import validates
+
+from website.lib.sanitizers import sanitize_text
+from website.web.bootstrap import db, vulnerabilitylookup
+
+product_license_association = db.Table(
+    "product_license_association",
+    db.metadata,
+    db.Column("product_id", db.Integer, db.ForeignKey("product.id")),
+    db.Column("license_id", db.Integer, db.ForeignKey("license.id")),
+)
+
+product_language_association = db.Table(
+    "product_language_association",
+    db.metadata,
+    db.Column("product_id", db.Integer, db.ForeignKey("product.id")),
+    db.Column("language_id", db.Integer, db.ForeignKey("language.id")),
+)
+
+
+class Product(db.Model):  # type: ignore[name-defined, misc]
+    """Represents a product."""
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    uuid = db.Column(UUID(as_uuid=True), unique=True, default=uuid.uuid4)
+    name = db.Column(db.String(), unique=True, nullable=False)
+    short_name = db.Column(db.String(), default="")
+    description = db.Column(db.String(), default="")
+    short_description = db.Column(db.String())
+    part = db.Column(
+        db.Enum("a", "h", "o", name="part_enum"),
+        nullable=True,
+    )
+    website = db.Column(db.String(), default="")
+    creation_timestamp = db.Column(
+        db.DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_timestamp = db.Column(
+        db.DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    # Foreign keys
+    icon_id = db.Column(
+        db.Integer, db.ForeignKey("icon.id"), nullable=True, default=None
+    )
+    submitter_id = db.Column(
+        db.Integer, db.ForeignKey("user.id"), nullable=True, default=None
+    )
+
+    # Relationships
+    # Many-to-Many Relationship with Organization
+    organizations = db.relationship(
+        "Organization",
+        secondary="organization_product_association",
+        back_populates="products",
+    )
+
+    # Relationships with Code locations
+    code_locations = db.relationship(
+        "Code", backref="product", lazy="dynamic", cascade="all,delete-orphan"
+    )
+
+    # Many-to-Many Relationship with License
+    licenses = db.relationship(
+        "License",
+        secondary=product_license_association,
+        backref="products",
+    )
+
+    # Many-to-Many Relationship with Language
+    languages = db.relationship(
+        "Language", secondary=lambda: product_language_association, backref="products"
+    )
+
+    @validates("name")
+    def validates_name(self, key: str, value: str) -> str:
+        assert len(value) <= 100, "maximum length for name: 100"
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        return cleaned
+
+    @validates("short_name")
+    def validates_short_name(self, key: str, value: str) -> str:
+        assert len(value) <= 50, "maximum length for short name: 50"
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        return cleaned
+
+    @validates("description")
+    def validates_description(self, key: str, value: str) -> str:
+        assert len(value) <= 500, "maximum length for description: 500"
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        return cleaned
+
+    @validates("short_description")
+    def validates_short_description(self, key: str, value: str) -> str:
+        assert len(value) <= 250, "maximum length for short description: 250"
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        return cleaned
+
+    def get_cpe_products(self) -> list[Any]:
+        """Returns the list of CPE product names (synonyms) related to the product."""
+        return [alias for alias in self.cpe_products]
+
+    def get_vendors_products_combinations(self) -> list[tuple[str, str]]:
+        """Returns the combination of all vendor and prodcut CPE names."""
+        cpe_products = [product.name for product in self.get_cpe_products()]
+        cpe_vendors = [
+            vendor.name
+            for organization in list(self.organizations)
+            for vendor in organization.get_cpe_vendors()
+        ]
+        combinations = list(product(cpe_vendors, cpe_products))
+        return combinations
+
+    def find_vulnerabilities(
+        self, sources: list[str], since: datetime
+    ) -> dict[str, list[tuple[str, dict[str, Any]]]]:
+        """Returns vulnerabilities matching the combination of all vendor and product CPE names."""
+        result = defaultdict(list)
+
+        # Step 1: query once for all vulnerabilities since "since"
+        pipe = vulnerabilitylookup.storage.pipeline()
+        now_ts = datetime.now().timestamp()
+        since_ts = since.timestamp()
+        for source in sources:
+            pipe.zrevrangebyscore(f"index:{source}", max=now_ts, min=since_ts)
+        source_results = dict(zip(sources, pipe.execute()))
+
+        # Step 2: prefetch product sets once
+        product_keys = {}
+        pipe = vulnerabilitylookup.storage.pipeline()
+        for vuln_vendor, vuln_product in self.get_vendors_products_combinations():
+            key = f"{vuln_vendor.strip().lower()}:{vuln_product.strip().lower()}:vulnerabilities"
+            product_keys[key] = (vuln_vendor, vuln_product)
+            pipe.smembers(key)
+        product_sets_raw = pipe.execute()
+        product_sets = dict(zip(product_keys, product_sets_raw))
+        # Convert to Python sets for O(1) membership checks
+        product_sets = {k: set(map(str.lower, v)) for k, v in product_sets.items()}
+
+        # Step 2b: build reverse index vuln_id -> product_keys
+        vuln_to_products: dict[str, list[str]] = defaultdict(list)
+        for product_key, members in product_sets.items():
+            for v_id in members:
+                vuln_to_products[v_id].append(product_key)
+
+        # Step 3: iterate vulnerabilities since "since"
+        vuln_cache: dict[str, dict[str, Any]] = {}
+        for source, vuln_ids in source_results.items():
+            for vuln_id in vuln_ids:
+                v_id = vuln_id.lower()
+
+                # Skip quickly if vuln_id not in any product set
+                if v_id not in vuln_to_products:
+                    continue
+
+                # Fetch vulnerability only once
+                if v_id not in vuln_cache:
+                    if vuln := vulnerabilitylookup.get_vulnerability(v_id):
+                        vuln_cache[v_id] = vuln
+
+                vuln = vuln_cache[v_id]
+                if not vuln:
+                    continue
+
+                # Only iterate product_keys where vuln_id is known to belong
+                for product_key in vuln_to_products[v_id]:
+                    result[source].append((v_id, vuln))
+
+        return result
+
+    def __repr__(self) -> str:
+        return self.name
+
+    def __str__(self) -> str:
+        return self.name
+
+    def as_json(self) -> str:
+        return json.dumps(
+            {
+                "uuid": str(self.uuid),
+                "name": self.name,
+                "description": self.description,
+                "website": self.website,
+                "creation_timestamp": self.creation_timestamp.strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                ),
+                "updated_timestamp": self.updated_timestamp.strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                ),
+                "product_synonyms": [
+                    product_name.to_dict() for product_name in self.get_cpe_products()
+                ],
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self.as_json())
+
+
+class CPEProduct(db.Model):  # type: ignore[name-defined, misc]
+    """Stores alternative CPE product names related to a Product."""
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    name = db.Column(db.String(), nullable=False, unique=True)
+    creation_timestamp = db.Column(
+        db.DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    # Foreign keys
+    product_id = db.Column(db.Integer, db.ForeignKey("product.id"), nullable=False)
+
+    # Relationships
+    product = db.relationship("Product", backref="cpe_products")
+
+    @validates("name")
+    def validates_name(self, key: str, value: str) -> str:
+        assert len(value) <= 100, "maximum length for name: 100"
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        if not cleaned:
+            raise ValueError("Invalid name.")
+        return cleaned
+
+    def as_json(self) -> str:
+        return json.dumps(
+            {
+                "name": self.name,
+                "creation_timestamp": self.creation_timestamp.strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                ),
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self.as_json())

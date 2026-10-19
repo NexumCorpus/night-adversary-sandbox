@@ -1,0 +1,102 @@
+{% extends "main.html" %}
+{% block head %}
+{{ super() }}
+<script src="{{ url_for('static', filename='js/showdown.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/lodash.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/luxon.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/pretty-print-json.min.js') }}"></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pretty-print-json.css') }}" />
+{% endblock %}
+{% block title %}Comments{% endblock %}
+{% block content %}
+<h1>Recent comments</h1>
+{% if not current_user.is_authenticated %}
+<div class="row mb-3">
+  <div class="col">
+    <p class="mb-2 mb-md-0 me-md-3">
+        <a href="{{ url_for('user_bp.login') }}">Log in</a> or
+        <a href="{{ url_for('user_bp.signup') }}">create an account</a> to share your comment.
+      </p>
+  </div>
+</div>
+{% endif %}
+<div class="row align-items-center mb-3">
+  <div class="col d-flex flex-column flex-md-row align-items-start align-items-md-center">
+    <div class="d-flex align-items-center flex-wrap">
+      <div class="btn-group me-3 mb-2 mb-md-0" role="group" aria-label="Comment filter">
+        <a class="btn {% if '' == meta_query %}btn-primary{% else %}btn-outline-primary{% endif %}" href="{{ url_for('comments_bp.list_comments') }}" title="All kinds of comments">All</a>
+        <a class="btn {% if 'PoC' in meta_query %}btn-primary{% else %}btn-outline-primary{% endif %}"
+          href="{{ url_for('comments_bp.list_comments') }}?meta={{ '[{\"tags\": [\"vulnerability:information=PoC\"]}]' | urlencode }}"
+          title="Comments related to a Proof of Concept">
+          PoC
+        </a>
+      </div>
+
+      {% if meta_query %}
+        <code class="text-truncate" style="max-width: 800px;" title="{{ meta_query }}">{{ meta_query }}</code>
+      {% endif %}
+
+      <span id="badge-filter" class="ms-3"><h3 class="d-inline-block mb-0"></h3></span>
+    </div>
+  </div>
+
+  <div class="col text-end mt-2 mt-md-0">
+    <a class="icon-link me-2" href="{{ url_for('comments_bp.feed_comments', format='atom') }}" type="application/atom+xml" title="Atom feed">
+      {{ render_icon('rss') }}
+    </a>
+    <a class="icon-link" href="{{ url_for('comments_bp.feed_comments', format='rss') }}" type="application/rss+xml" title="RSS feed">
+      {{ render_icon('rss-fill') }}
+    </a>
+  </div>
+</div>
+<div class="row">
+  <div class="col">
+    {{ pagination.links }}
+  </div>
+</div>
+<div id="list-comments">
+  {% for comment in comments %}
+  <div class="card markdown-description mb-3 shadow-sm">
+    <div class="card-header d-flex justify-content-between align-items-center">
+      <div>
+        <h5 class="card-title mb-0"><a href="{{ url_for('comment_bp.get', comment_uuid=comment.uuid) }}">{{ comment.title | safe }}</a></h5>
+        <small class="text-body-secondary">
+          <span class="datetime" title="{{ comment.creation_timestamp | string_to_datetime('%Y-%m-%dT%H:%M') }}">{{ comment.creation_timestamp | datetimeformat('%Y-%m-%dT%H:%M:%S') }}</span>
+          by <a href="{{ url_for('user_bp.profile', login=comment.author.login) }}">{{ comment.author.name }}</a>
+        </small>
+      </div>
+      <div class="btn-group">
+        <a class="btn btn-sm btn-outline-secondary"
+           href="{{ url_for('apiv1.comment_comment_item', comment_uuid=comment.uuid) }}" download>JSON</a>
+        <a class="btn btn-sm btn-primary"
+           href="{{ url_for('home_bp.vulnerability_view', vulnerability_id=comment.vulnerability) }}">
+           {{ comment.vulnerability | upper }}
+        </a>
+      </div>
+    </div>
+    <div class="card-body">
+      <p class="card-text">{{ comment.description | markdown | safe }}</p>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+<div class="row">
+  <div class="col">
+    {{ pagination.links }}
+  </div>
+</div>
+<div class="row">
+  <div class="col">
+    {{ pagination.info }}
+  </div>
+</div>
+<script>
+document.addEventListener("DOMContentLoaded", function() {
+  const DateTime = luxon.DateTime;
+  const elements = document.getElementsByClassName("datetime");
+  Array.prototype.forEach.call(elements, function(element) {
+    element.textContent = DateTime.fromISO(element.textContent).toRelative();
+  });
+});
+</script>
+{% endblock %}

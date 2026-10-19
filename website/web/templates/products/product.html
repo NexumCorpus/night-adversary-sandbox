@@ -1,0 +1,69 @@
+{% extends "main.html" %}
+{% import 'vulnerability_templates.html' as vuln_templates with context %}
+{% block title %}Product - {{ product.name }}{% endblock %}
+{% block content %}
+<div class="row mb-5">
+  <div class="col-lg-8 offset-lg-2">
+    <div class="card shadow-sm position-relative">
+      {% if product.icon_id %}
+        <img id="product-logo"
+             src="{{ url_for('uploaded_pictures', filename=product.uuid) }}.png"
+             class="position-absolute top-0 end-0 m-3 rounded"
+             style="width: 80px; height: auto;"
+             alt="{{ product.name }} logo" />
+      {% endif %}
+      <div class="card-body">
+        <h3 id="product-name">{{ product.name }}</h3>
+        <div class="mb-3">
+          <h5>Description</h5>
+          <p class="text-justify">{{ product.description }}</p>
+        </div>
+        {% if product.website %}
+        <div class="mb-3">
+          <h5>Website</h5>
+          <p class="text-justify"><a href="{{ product.website }}" rel="noreferrer" target="_blank">{{ product.website }}</a></p>
+        </div>
+        {% endif %}
+        {% if product.licenses | count %}
+        <div class="mb-3">
+          <h5>Licenses</h5>
+          <p class="text-justify">{% for license in product.licenses %}<a href="https://spdx.org/licenses/{{ license.license_id }}" rel="noreferrer" target="_blank">{{ license.name }}</a>{% endfor %}</p>
+        </div>
+        {% endif %}
+        <div>
+          <h5>Product name{% if product.get_cpe_products() | count > 1 %}s{% endif %}</h5>
+          <p>{{ product.get_cpe_products() | map(attribute='name') | join(', ') }}</p>
+        </div>
+        <div>
+          <h5>Related organization{% if product.organizations | count > 1 %}s{% endif %}</h5>
+          <p>{% for organization in product.organizations %}<a class="p-1" href="{{ url_for('organization_bp.get_by_uuid', organization_uuid=organization.uuid) }}">{{ organization.name }}</a><a class="position-absolute end-0 p-1" href="{{ url_for('user_bp.process_notification', organization_uuid=organization.uuid, product_uuid=product.uuid) }}" title="Create a notification for this product.">{{ render_icon('bell', title='Create a notification for this product.') }}</a>{% endfor %}</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<nav aria-label="breadcrumb" class="mb-4">
+  <ol class="breadcrumb p-3 rounded shadow-sm" style="background-color: #446d80; color: #fff;">
+    <li class="breadcrumb-item active" style="color: #fff;" aria-current="page">
+      {{ render_icon('bug', title='Vulnerabilities') }} Recent vulnerabilities
+    </li>
+  </ol>
+</nav>
+
+{% for vuln in vulnerabilities %}
+  {{vuln_templates.cvelistv5_view(source=source, vulnerability_id=vuln[0], vulnerability_data=vuln[1])}}
+  <br />
+{% endfor %}
+
+<div class="row">
+  <div class="col">
+      {{ pagination.links }}
+  </div>
+</div>
+<div class="row">
+  <div class="col">
+      {{ pagination.info }}
+  </div>
+</div>
+{% endblock %}

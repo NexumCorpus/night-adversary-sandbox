@@ -1,0 +1,140 @@
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+from gcve import GNAEntry
+from gcve.gna import find_gna_by_short_name, get_gna
+from gcve.registry import (
+    load_references,
+    load_registry,
+    update_references,
+    update_registry,
+    update_registry_public_key,
+    update_registry_signature,
+    verify_registry_integrity,
+)
+
+from vulnerabilitylookup.default import get_config, get_homedir
+
+HOME_DIR = get_homedir()
+GCVE_DIR = HOME_DIR.joinpath("data/gcve")
+
+
+def update_local_gcve_registry() -> None:
+    """Update the local copy of the GCVE registry."""
+    update_registry_public_key(GCVE_DIR)
+    update_registry_signature(GCVE_DIR)
+    update_registry(GCVE_DIR)
+    update_references(GCVE_DIR)
+    if not verify_registry_integrity(GCVE_DIR):
+        raise Exception("GCVE registry integrity check failed.")
+
+
+def load_local_gcve_registry() -> List[GNAEntry]:
+    """Returns the local registry of GNA entries."""
+    gnas: List[GNAEntry] = []
+    try:
+        gnas = load_registry(GCVE_DIR)
+    except FileNotFoundError:
+        gnas = []
+    return gnas
+
+
+def load_local_gcve_references() -> Dict[str, Any]:
+    """Returns the local references of the GCVE registry."""
+    try:
+        return load_references(GCVE_DIR)
+    except FileNotFoundError:
+        return {}
+
+
+def verify_local_registry_integrity() -> bool:
+    """Returns a boolean indicating whether the local registry integrity is valid."""
+    return verify_registry_integrity(GCVE_DIR)
+
+
+def list_gna(short_name: str) -> List[GNAEntry]:
+    """Return the GNAs corresponding to the given short name, or an empty list if nothing found."""
+    return find_gna_by_short_name(short_name, load_local_gcve_registry())
+
+
+def get_by_id(id: int) -> Optional[GNAEntry]:
+    """Return the GNA corresponding to the identifier given in parameter."""
+    return get_gna(id, load_local_gcve_registry())
+
+
+def sync_organizations(login: str) -> None:
+    """Synchronize the organizations against the GCVE registry."""
+    # Import here to avoid circular import
+    from website.models import Organization, User
+    from website.web.bootstrap import db
+
+    user = User.query.filter(User.login == login).first()
+    if verify_local_registry_integrity():
+
+        gnas: List[GNAEntry] = []
+        try:
+            gnas = load_local_gcve_registry()
+        except FileNotFoundError:
+            gnas = []
+
+        for gna in gnas:
+            if (
+                Organization.query.filter(Organization.gna_id == gna.get("id")).count()
+                == 0
+            ):
+                new_org = Organization(
+                    name=gna.get("full_name", ""),
+                    short_name=gna.get("short_name", ""),
+                    gna_id=gna.get("id", None),
+                    gcve_pull=False,
+                    owner_id=user.id,
+                )
+                try:
+                    db.session.add(new_org)
+                    db.session.commit()
+                except Exception:
+                    continue
+
+
+def verify_gna_public_domain() -> bool:
+    """
+    Check whether the `gcve_pull_api` field of a GNA matches the known public domain of the Vulnerability-Lookup instance.
+
+    This function verifies whether the running Vulnerability-Lookup instance is registered in the GCVE registry.
+
+    Returns:
+        bool: True if the instance exists and its `gcve_pull_api` starts with the configured public domain; False otherwise.
+
+    Raises:
+        ValueError: If the public domain is not configured.
+        Exception: For any unexpected error during retrieval or validation.
+    """
+    gna_id = get_config("generic", "local_instance_name")
+    if not gna_id:
+        raise ValueError("local_instance_name is not configured.")
+
+    try:
+        gna_id = int(gna_id.replace("gna-", ""))
+    except Exception:
+        raise ValueError("local_instance_name is not a GNA id.")
+
+    try:
+        public_domain = get_config("generic", "public_domain")
+        if not public_domain:
+            raise ValueError("Public domain is not configured.")
+
+        gna = get_by_id(gna_id)
+        gcve_url = gna.get("gcve_pull_api", "") if gna else ""
+
+        parsed_url = urlparse(gcve_url)
+        if parsed_url.netloc == public_domain:
+            return True
+
+        return False
+
+    except ValueError:
+        raise  # Let the caller handle missing config explicitly.
+    except Exception:
+        # Optionally log here if a logging system is in place.
+        # logger.exception(f"Failed to verify GNA public domain for ID {id}: {e}")
+        return False

@@ -1,0 +1,336 @@
+import re
+import secrets
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import urlparse
+
+import pyotp
+from flask import url_for
+from flask_login import UserMixin  # type: ignore[import-untyped]
+from pyotp.totp import TOTP
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import validates
+from the_big_username_blacklist import validate as check_blacklist  # type: ignore[import-untyped]
+from validate_email import validate_email  # type: ignore[import-untyped]
+from werkzeug.security import check_password_hash
+
+from website.lib import constants
+from website.lib.constants import RESERVED_USERNAMES
+from website.lib.sanitizers import sanitize_markdown
+from website.models import Bundle, Comment
+from website.web.bootstrap import application, db
+
+user_organization_association = db.Table(
+    "user_organization_association",
+    db.metadata,
+    db.Column("user_id", db.Integer, db.ForeignKey("user.id")),
+    db.Column("organization_id", db.Integer, db.ForeignKey("organization.id")),
+)
+
+
+def generate_token() -> str:
+    return secrets.token_urlsafe(64)
+
+
+class User(db.Model, UserMixin):  # type: ignore[name-defined, misc]
+    """
+    Represent a user. Logins and api keys are unique, emails addresses are not.
+    """
+
+    id = db.Column(db.Integer, primary_key=True)
+    uuid = db.Column(
+        UUID(as_uuid=True), default=uuid.uuid4, unique=True, nullable=False
+    )
+    login = db.Column(db.String(30), unique=True, nullable=False)
+    name = db.Column(db.String(50), nullable=False)
+    email = db.Column(db.String(256), nullable=False)
+    pwdhash = db.Column(db.String(), nullable=False)
+    secret_token = db.Column(db.String(), unique=True)  # for Two-Factor Authentication
+    is_two_factor_authentication_enabled = db.Column(
+        db.Boolean, nullable=False, default=False
+    )
+    failed_otp_attempts = db.Column(db.Integer, default=0)
+
+    organisation = db.Column(db.String(50), default="")
+    country_code = db.Column(db.String(3), default="")  # for alpha-3 codes
+    bio = db.Column(db.String(5000), default="")
+    webpage = db.Column(db.String(2048), default="")
+    mastodon = db.Column(db.String(500), default="")
+    github = db.Column(db.String(39), default="")
+    linkedin = db.Column(db.String(30), default="")
+
+    created_at = db.Column(db.DateTime(), default=lambda: datetime.now(timezone.utc))
+    last_seen = db.Column(db.DateTime(), nullable=True)
+
+    apikey = db.Column(db.String(100), default=generate_token, unique=True)
+    feedkey = db.Column(db.String(100), default=generate_token, unique=True)
+
+    is_active = db.Column(db.Boolean(), default=True)
+    is_confirmed = db.Column(db.Boolean(), default=False)
+
+    # user rights
+    is_admin = db.Column(db.Boolean(), default=False)
+    is_commenter = db.Column(db.Boolean(), default=True)
+    is_reporter = db.Column(db.Boolean(), default=False)
+
+    # relationships
+    comments = db.relationship("Comment", backref="author", lazy="dynamic")
+    comments_disclosure = db.relationship(
+        "CommentDisclosure", backref="author", lazy="dynamic"
+    )
+    bundles = db.relationship("Bundle", backref="author", lazy="dynamic")
+    sightings = db.relationship("Sighting", backref="author", lazy="dynamic")
+    notifications = db.relationship(
+        "Notification", backref="subscriber", lazy="dynamic"
+    )
+    organizations = db.relationship(
+        "Organization",
+        secondary=lambda: user_organization_association,
+        backref="members",
+    )
+    vulnerability_disclosures = db.relationship(
+        "VulnerabilityDisclosure", backref="reporter", lazy="dynamic"
+    )
+    kev_entries = db.relationship("KEVEntry", backref="author", lazy="dynamic")
+
+    def __init__(self, **kwargs: Any):
+        super().__init__(**kwargs)
+        if self.secret_token is None:
+            self.secret_token = pyotp.random_base32()
+
+    def get_id(self) -> int:
+        """
+        Return the id of the user.
+        """
+        return self.id
+
+    def check_password(self, password: str) -> bool:
+        """
+        Check the password of the user.
+        """
+        return check_password_hash(self.pwdhash, password)
+
+    def generate_apikey(self) -> str:
+        self.apikey = generate_token()
+        return self.apikey
+
+    def generate_feedkey(self) -> str:
+        self.feedkey = generate_token()
+        return self.feedkey
+
+    def __repr__(self) -> str:
+        return "<User %r>" % (self.uuid)
+
+    def __str__(self) -> str:
+        return f"UUID: {self.uuid}\nLogin: {self.login}\nEmail: {self.email}"
+
+    @validates("login")
+    def validates_login(self, key: str, value: str) -> str:
+        cleaned = User.make_valid_login(value.strip())
+        assert 3 <= len(cleaned) <= 30, AssertionError("Maximum length for login: 30")
+
+        existing = (
+            db.session.query(User)
+            .filter(db.func.lower(User.login) == cleaned.lower())
+            .first()
+        )
+
+        # Only trigger duplicate error if the login belongs to another user
+        if existing and existing.id != self.id:
+            raise AssertionError("Login already taken.")
+
+        # Check for reserved usernames that would conflict with routes
+        if cleaned.lower() in RESERVED_USERNAMES:
+            raise AssertionError(
+                "This username is reserved and cannot be used. Please choose a different username."
+            )
+
+        if cleaned != "admin":
+            assert check_blacklist(cleaned), AssertionError("Username not allowed.")
+
+        return cleaned
+
+    @validates("email")
+    def validates_email(self, key: str, value: str) -> str:
+        value = value.strip()
+        assert 3 <= len(value) <= 256, AssertionError("Maximum length for email: 256")
+        assert validate_email(value), AssertionError("Email address not valid")
+
+        # If email changes, mark user as unconfirmed
+        if self.email and self.email.lower() != value.lower():
+            self.is_confirmed = False
+
+        return value
+
+    @validates("name")
+    def validates_name(self, key: str, value: str) -> str:
+        assert 3 <= len(value) <= 50, AssertionError("Maximum length for name: 50")
+        value = value.strip()
+        return value
+
+    @validates("bio")
+    def validates_bio(self, key: str, value: str) -> str:
+        assert 0 <= len(value) <= 5000, AssertionError("Maximum length for bio: 5000")
+        value = value.strip()
+
+        # Clean the bio content using the dedicated Markdown sanitizer
+        value = sanitize_markdown(value)
+
+        return value
+
+    @validates("country_code")
+    def validates_country_code(self, key: str, value: str) -> str:
+        assert 0 <= len(value) <= 3, AssertionError(
+            "Maximum length for country_code: 3"
+        )
+        value = value.strip()
+        return value
+
+    @validates("organisation")
+    def validates_organisation(self, key: str, value: str) -> str:
+        assert 0 <= len(value) <= 50, AssertionError(
+            "Maximum length for organisation: 50"
+        )
+        return re.sub("[^a-zA-Z0-9_-]", "", value.strip())
+
+    @validates("github")
+    def validates_github(self, key: str, value: str) -> str:
+        assert 0 <= len(value) <= 39, AssertionError("Maximum length for GitHub: 39")
+        if value.strip():
+            github_regex = r"^[a-zA-Z\d](?:[a-zA-Z\d]|-(?=[a-zA-Z\d])){0,38}$"
+            assert re.match(github_regex, value) is not None, AssertionError(
+                "Invalid GitHub username."
+            )
+        return value
+
+    @validates("linkedin")
+    def validates_linkedin(self, key: str, value: str) -> str:
+        assert 0 <= len(value) <= 30, AssertionError("Maximum length for LinkedIn: 30")
+        if value.strip():
+            allowed = r"a-zA-Z\dàâäéèêëîïôöùûüçñÀÂÄÉÈÊËÎÏÔÖÙÛÜÇÑ"
+            linkedin_regex = rf"^[{allowed}](?:[{allowed}-]{{0,28}}[{allowed}])?$"
+            assert re.match(linkedin_regex, value), AssertionError(
+                "Invalid LinkedIn username."
+            )
+        return value
+
+    @validates("apikey")
+    def validates_apikey(self, key: str, value: str) -> str:
+        assert 30 <= len(value) <= 100, AssertionError("Minimum length for apikey: 30")
+        return value
+
+    @validates("feedkey")
+    def validates_feedkey(self, key: str, value: str) -> str:
+        assert 30 <= len(value) <= 100, AssertionError("Minimum length for feedkey: 30")
+        return value
+
+    @staticmethod
+    def make_valid_login(login: str) -> str:
+        return re.sub("[^a-zA-Z0-9_-]", "", login)
+
+    def get_authentication_setup_uri(self) -> str:
+        """Returns the authentication URI for the Two-Factor Authentication as a string."""
+        image_url = url_for("static", filename="favicon.ico", _external=True)
+        image_uri = urlparse(image_url)
+        if image_uri.scheme != "https":
+            image_url = ""
+        return pyotp.totp.TOTP(self.secret_token).provisioning_uri(
+            name=self.login, issuer_name=application.config["APP_NAME"], image=image_url
+        )
+
+    def is_otp_valid(self, user_otp: Any) -> bool:
+        """Checks the validity of a One Time password."""
+        totp: TOTP = pyotp.parse_uri(self.get_authentication_setup_uri())  # type: ignore
+        return totp.verify(user_otp)
+
+    def nb_contributions(self) -> int:
+        """Returns the number of contributions (creation of comments and bundles) of the user."""
+        # Subquery for counting comments
+        comment_count = (
+            db.session.query(func.count(Comment.uuid))
+            .filter(Comment.author_id == self.id)
+            .scalar()
+        )
+
+        # Subquery for counting bundles
+        bundle_count = (
+            db.session.query(func.count(Bundle.uuid))
+            .filter(Bundle.author_id == self.id)
+            .scalar()
+        )
+
+        # Sum the counts
+        total_contributions = (comment_count or 0) + (bundle_count or 0)
+
+        return total_contributions
+
+    def permissions(self) -> list[str]:
+        """Returns the list of permissions of the user.
+        A: Admin, C: Commenter, R: Reporter."""
+        user_permissions = []
+        if self.is_admin:
+            user_permissions.append("A")
+        if self.is_commenter:
+            user_permissions.append("C")
+        if self.is_reporter:
+            user_permissions.append("R")
+        return user_permissions
+
+    def is_trustworthy(self, min_points: int = 15) -> bool:
+        """
+        Determine if a user is trustworthy based on profile completeness and email domain matching.
+        A trustworthy user can bypass moderation on comments.
+        """
+
+        points = 0
+
+        # Email address used for the tests
+        if self.email.strip() == "test@testorg.local":
+            points += min_points
+
+        # Check the profile
+        if self.organisation.strip():
+            points += 5
+
+        if self.bio.strip():
+            points += 5
+
+        if self.mastodon.strip():
+            points += 5
+
+        if self.linkedin.strip():
+            points += 5
+
+        if self.github.strip():
+            points += 5
+
+        # Check the email address
+        email = self.email.strip().lower()
+        email_domain = email.split("@")[-1] if "@" in email else ""
+
+        # Automatically assigns the minimum required points to users affiliated with European CSIRTs Network (CNW)
+        if email_domain in constants.EU_CSIRT_EMAIL_DOMAINS:
+            points += min_points
+
+        # Automatically assigns the minimum required points to users affiliated with FIRST.org
+        if email_domain in constants.FIRST_TEAMS:
+            points += min_points
+
+        # Check if email domain matches organisation (ie: IBM for ibm.com)
+        if email_domain and self.organisation.strip():
+            organisation_name = self.organisation.strip().lower().replace(" ", "")
+            email_variants = [
+                email_domain,
+                email_domain.replace(".", ""),
+                email_domain.replace("-", ""),
+            ]
+            if any(organisation_name in variant for variant in email_variants):
+                points += 10
+
+        # Penalize common free email providers
+        if email_domain in constants.FREE_EMAIL_DOMAINS:
+            points -= 15
+
+        return points >= min_points

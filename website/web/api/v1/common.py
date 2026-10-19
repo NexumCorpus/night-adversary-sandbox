@@ -1,0 +1,79 @@
+#! /usr/bin/env python
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from flask import request
+from flask_login import current_user  # type: ignore[import-untyped]
+from flask_restx import (  # type: ignore[import-untyped]
+    abort,
+    fields,
+)
+
+from website.models import User
+from website.web.bootstrap import db
+from website.web.permissions import login_user_bundle
+
+logger = logging.getLogger(__name__)
+
+
+def auth_func(func: Any) -> Any:
+    """Authentication decorator."""
+
+    def wrapper(*args: str, **kwargs: int) -> Any:
+        if not current_user.is_authenticated:
+            if "X-API-KEY" in request.headers:
+                token = request.headers.get("X-API-KEY", False)
+                if token:
+                    user = User.query.filter(User.apikey == token).first()
+                    if not user:
+                        logger.warning("Non authorized access.")
+                        abort(401, Error="Unauthorized.")
+                    if not user.is_active:
+                        logger.warning(f"Non authorized access for {user.login}.")
+                        abort(403, Error="Account is not active.")
+                    login_user_bundle(user)
+                    user.last_seen = datetime.now(timezone.utc)
+                    db.session.commit()
+            else:
+                logger.warning(
+                    "Non authorized access. Missing X-API-KEY in request headers."
+                )
+                abort(401, Error="Authentication required.")
+        return func(*args, **kwargs)
+
+    wrapper.__doc__ = func.__doc__
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+
+def uuid_type(value: str) -> uuid.UUID:
+    """Parse UUID"""
+    try:
+        val = uuid.UUID(value)
+    except ValueError:
+        raise ValueError("This is not a valid UUID.")
+    return val
+
+
+metada_params_model = {
+    "count": fields.Integer(
+        readonly=True, description="Total number of the items of the data."
+    ),
+    "page": fields.Integer(
+        readonly=True,
+        description="Number of the page.",
+    ),
+    "per_page": fields.Integer(readonly=True, description="Requested limit data."),
+}
+
+user_params_model = {
+    "login": fields.String(readonly=True, description="Login of the user."),
+    "name": fields.String(readonly=True, description="Name of the user."),
+    "uuid": fields.String(readonly=True, description="UUID of the user."),
+}
+
+user_light_params_model = {
+    "login": fields.String(readonly=True, description="Login of the user."),
+}

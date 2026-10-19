@@ -1,0 +1,351 @@
+{% extends "main.html" %}
+{% block head %}
+{{ super() }}
+<script src="{{ url_for('static', filename='js/showdown.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/lodash.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/luxon.min.js') }}"></script>
+{% endblock %}
+{% block title %}{{ user.login }}{% endblock %}
+{% block content %}
+<div class="row mb-3">
+  <div class="col text-end">
+    <a class="icon-link me-2" href="{{ url_for('user_bp.feed_activity', login=user.login, format='atom') }}" type="application/atom+xml" title="Atom feed">
+      {{ render_icon('rss') }}
+    </a>
+    <a class="icon-link" href="{{ url_for('user_bp.feed_activity', login=user.login, format='rss') }}" type="application/atom+xml" title="RSS feed">
+      {{ render_icon('rss-fill') }}
+    </a>
+  </div>
+</div>
+
+<div class="row align-items-center mb-4">
+  <div id="gravatar-container" class="col-md-2 text-center">
+    <img id="avatar" src="https://gravatar.com/avatar/{{ user.email | hash }}?s=220&d=404"
+         class="img-fluid rounded-circle" alt="Profile picture" title="Profile picture" />
+  </div>
+  <div class="col-md-6">
+    <h1 class="mb-0">
+      {{ user.login }}
+      {% if current_user.is_authenticated and current_user.id == user.id %}<a class="ms-2 text-decoration-none" href="{{ url_for('user_bp.form') }}" title="Edit your profile">
+        {{ render_icon('pen', title='Edit your profile') }}
+      </a>{% endif %}
+    </h1>
+
+    <div class="mt-2">
+      {% if user.is_admin %}
+      <span class="badge rounded-pill bg-light border text-dark me-2" title="Administrator of the platform">
+        👑 Admin
+      </span>
+      {% endif %}
+      {% if top_contributor %}
+      <span class="badge rounded-pill bg-light border text-dark me-2" title="Trophy - Top contributor">
+        🏆 Top contributor
+      </span>
+      {% endif %}
+      {% if top_3_contributors %}
+      <span class="badge rounded-pill bg-light border text-dark me-2" title="Silver Medal - Among the top 3 contributors">
+        🥈 Top 3 contributors
+      </span>
+      {% endif %}
+      {% if not top_3_contributors and top_5_contributors %}
+      <span class="badge rounded-pill bg-light border text-dark me-2" title="Bronze Medal - Among the top 5 contributors">
+        🥉 Top 5 contributors
+      </span>
+      {% endif %}
+      {% if user.vulnerability_disclosures.all() | count > 0 %}
+      <span class="badge rounded-pill bg-light border text-dark" title="Vulnerability Reporter Medal">
+        {{ render_icon('bug', title='Vulnerability disclosures', color='red') }} Vulnerability reporter
+      </span>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<div class="row mb-4">
+  <div class="col">
+    <p class="mb-1">{{ render_icon('calendar-event') }} Member since {{ user.created_at | datetimeformat('%B %d, %Y') }}.</p>
+    {% if user_country %}
+    <p class="mb-1">{{ render_icon('geo-alt', title='Location') }} {{ user_country }}</p>
+    {% endif %}
+    {% if user.organisation %}
+    <p class="mb-1">{{ render_icon('building', title='Organization') }} {{ user.organisation }}</p>
+    {% endif %}
+    {% if user.organizations | count > 0 %}
+    <p class="mb-1">{{ render_icon('people', title='Organizations') }} {{ user.organizations | join(', ') }}</p>
+    {% endif %}
+    {% if nb_contributions %}
+    <p class="mb-1">{{ render_icon('pen', title='Contributions') }} {{ nb_contributions }} contribution{% if nb_contributions > 1 %}s{% endif %}</p>
+    {% endif %}
+    {% if user.vulnerability_disclosures.all() | count > 0 %}
+    <p class="mb-1">{{ render_icon('bug', title='Vulnerability disclosures') }} {{ user.vulnerability_disclosures.count() }} vulnerability disclosure{% if user.vulnerability_disclosures.count() > 1 %}s{% endif %}</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="row">
+  {% if user.bio %}
+  <div class="col-md-6 mb-4">
+    <div class="card">
+      <div class="card-body">
+        <h5 class="card-title">Bio</h5>
+        <p class="card-text">{{ user.bio | safe }}</p>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <div class="col-md-6">
+    <ul class="list-group">
+      {% if user.webpage %}
+      <li class="list-group-item">{{ render_icon('globe') }} <a href="{{ user.webpage }}" rel="noreferrer me" target="_blank">{{ user.webpage }}</a></li>
+      {% endif %}
+      {% if user.github %}
+      <li class="list-group-item">{{ render_icon('github') }} <a href="https://github.com/{{ user.github }}" rel="noreferrer me" target="_blank">https://github.com/{{ user.github }}</a></li>
+      {% endif %}
+      {% if user.linkedin %}
+      <li class="list-group-item">{{ render_icon('linkedin') }} <a href="https://www.linkedin.com/in/{{ user.linkedin }}" rel="noreferrer me" target="_blank">https://www.linkedin.com/in/{{ user.linkedin }}</a></li>
+      {% endif %}
+      {% if user.mastodon %}
+      <li class="list-group-item">{{ render_icon('mastodon') }} <a href="{{ user.mastodon }}" rel="noreferrer me" target="_blank">{{ user.mastodon }}</a></li>
+      {% endif %}
+    </ul>
+  </div>
+</div>
+
+<hr />
+
+<div class="row">
+  <div class="col-md-6">
+    <div class="row">
+      <div class="col">
+        <h3>Recent comments</h3>
+      </div>
+        <div class="col text-end">
+          <a class="icon-link" href="{{ url_for('comments_bp.feed_comments', user=user.login, format='atom') }}" type="application/atom+xml" title="Atom feed">{{ render_icon('rss') }}</a>
+          <a class="icon-link" href="{{ url_for('comments_bp.feed_comments', user=user.login, format='rss') }}" type="application/atom+xml" title="RSS feed">{{ render_icon('rss-fill') }}</a>
+        </div>
+    </div>
+    <div id="list-comments">
+        <div class="d-flex justify-content-center">
+            <div class="spinner-border" role="status"><span class="sr-only">Loading…</span></div>
+        </div>
+    </div>
+    <p><a href="{{ url_for('comments_bp.list_comments') }}">All comments</a>.</p>
+  </div>
+  <div class="col-md-6">
+    <div class="row">
+      <div class="col">
+        <h3>Recent bundles</h3>
+      </div>
+        <div class="col text-end">
+          <a class="icon-link" href="{{ url_for('bundles_bp.feed_bundles', user=user.login, format='atom') }}" type="application/atom+xml" title="Atom feed">{{ render_icon('rss') }}</a>
+          <a class="icon-link" href="{{ url_for('bundles_bp.feed_bundles', user=user.login, format='rss') }}" type="application/atom+xml" title="RSS feed">{{ render_icon('rss-fill') }}</a>
+        </div>
+    </div>
+    <div id="list-bundles">
+      <div class="d-flex justify-content-center">
+          <div class="spinner-border" role="status"><span class="sr-only">Loading…</span></div>
+      </div>
+    </div>
+    <p><a href="{{ url_for('bundles_bp.list_bundles') }}">All bundles</a>.</p>
+  </div>
+</div>
+<script>
+document.addEventListener("DOMContentLoaded", function() {
+
+  // Remove Gravatar container if avatar fails to load
+  const avatar = document.getElementById('avatar');
+  if (avatar) {
+    avatar.onerror = function() {
+      const gravatarContainer = document.getElementById("gravatar-container");
+      if (gravatarContainer) gravatarContainer.remove();
+    };
+  }
+
+  const DateTime = luxon.DateTime;
+  const converter = new showdown.Converter({tables: true, noHeaderId: true, simpleLineBreaks: true});
+
+  // === Safely linkify CVE or other IDs in a text node ===
+  function safeLinkifyTextNode(text) {
+    const frag = document.createDocumentFragment();
+    const regex = /(CVE-\d{4}-\d{4,7})/g;
+    let lastIndex = 0;
+    let match;
+
+    while ((match = regex.exec(text)) !== null) {
+      if (match.index > lastIndex) {
+        frag.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+      }
+      const a = document.createElement("a");
+      a.href = "/vuln/" + match[1];
+      a.textContent = match[1];
+      frag.appendChild(a);
+      lastIndex = regex.lastIndex;
+    }
+
+    if (lastIndex < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }
+
+    return frag;
+  }
+
+  // === Convert Markdown to safe nodes with linkification ===
+  function markdownToSafeTextNodes(markdown) {
+    const html = converter.makeHtml(markdown);
+    const tempDiv = document.createElement("div");
+    tempDiv.innerHTML = html;
+
+    const fragment = document.createDocumentFragment();
+
+    Array.from(tempDiv.childNodes).forEach(node => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        fragment.appendChild(safeLinkifyTextNode(node.textContent));
+      } else if (["P", "LI", "H1", "H2"].includes(node.nodeName)) {
+        const el = document.createElement(node.nodeName.toLowerCase());
+        Array.from(node.childNodes).forEach(child => {
+          if (child.nodeType === Node.TEXT_NODE) {
+            el.appendChild(safeLinkifyTextNode(child.textContent));
+          } else {
+            el.appendChild(document.createTextNode(child.textContent));
+          }
+        });
+        fragment.appendChild(el);
+      }
+      // ignore any other HTML tags
+    });
+
+    return fragment;
+  }
+
+  // === Helper to create comment card safely ===
+  function createCommentCard(comment) {
+    const card = document.createElement("div");
+    card.className = "card markdown-description";
+
+    const cardBody = document.createElement("div");
+    cardBody.className = "card-body";
+
+    const h5 = document.createElement("h5");
+    h5.className = "card-title";
+    const titleLink = document.createElement("a");
+    titleLink.href = "/comment/" + comment.uuid;
+    titleLink.textContent = comment.title;
+    h5.appendChild(titleLink);
+
+    const h6 = document.createElement("h6");
+    h6.className = "card-subtitle mb-2 text-body-secondary";
+    h6.textContent = DateTime.fromISO(comment.timestamp).toRelative();
+
+    const p = document.createElement("p");
+    p.className = "card-text";
+    p.appendChild(markdownToSafeTextNodes(comment.description));
+
+    const hr = document.createElement("hr");
+
+    const vulnLink = document.createElement("a");
+    vulnLink.className = "btn btn-primary";
+    vulnLink.href = "/vuln/" + comment.vulnerability;
+    vulnLink.textContent = comment.vulnerability;
+
+    cardBody.append(h5, h6, p, hr, vulnLink);
+    card.appendChild(cardBody);
+    return card;
+  }
+
+  // === Fetch comments ===
+  fetch("{{ url_for('apiv1.comment_comments_list', author=user.login, per_page=10) | safe }}")
+    .then(response => response.json())
+    .then(result => {
+      const container = document.getElementById("list-comments");
+      container.innerHTML = "";
+      if (result.metadata.count === 0) {
+        container.textContent = "No comment.";
+        return;
+      }
+
+      result.data
+        .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+        .forEach(comment => {
+          const card = createCommentCard(comment);
+          container.appendChild(card);
+          container.appendChild(document.createElement("br"));
+        });
+    })
+    .then(() => setTimeout(formatMarkdownOutput, 0))
+    .catch(error => console.error("Error:", error));
+
+  // === Helper to create bundle card safely ===
+  function createBundleCard(bundle) {
+    const card = document.createElement("div");
+    card.className = "card markdown-description";
+
+    const cardBody = document.createElement("div");
+    cardBody.className = "card-body";
+
+    const h5 = document.createElement("h5");
+    h5.className = "card-title";
+    const nameLink = document.createElement("a");
+    nameLink.href = "/bundle/" + bundle.uuid;
+    nameLink.textContent = bundle.name;
+    h5.appendChild(nameLink);
+
+    const h6 = document.createElement("h6");
+    h6.className = "card-subtitle mb-2 text-body-secondary";
+    h6.textContent = DateTime.fromISO(bundle.timestamp).toRelative();
+
+    const p = document.createElement("p");
+    p.className = "card-text";
+    p.appendChild(markdownToSafeTextNodes(bundle.description));
+
+    const relatedHeader = document.createElement("h5");
+    relatedHeader.className = "card-text";
+    relatedHeader.textContent = "Related vulnerabilities";
+
+    const vulnCard = document.createElement("div");
+    vulnCard.className = "card";
+
+    const ul = document.createElement("ul");
+    ul.className = "list-group list-group-flush";
+    bundle.related_vulnerabilities.forEach(vuln => {
+      const li = document.createElement("li");
+      li.className = "list-group-item";
+      const a = document.createElement("a");
+      a.href = "/vuln/" + vuln;
+      a.textContent = vuln;
+      li.appendChild(a);
+      ul.appendChild(li);
+    });
+
+    vulnCard.appendChild(ul);
+    cardBody.append(h5, h6, p, relatedHeader, vulnCard);
+    card.appendChild(cardBody);
+    return card;
+  }
+
+  // === Fetch bundles ===
+  fetch("{{ url_for('apiv1.bundle_bundles_list', author=user.login, per_page=10) | safe }}")
+    .then(response => response.json())
+    .then(result => {
+      const container = document.getElementById("list-bundles");
+      container.innerHTML = "";
+      if (result.metadata.count === 0) {
+        container.textContent = "No bundle.";
+        return;
+      }
+
+      result.data
+        .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at))
+        .forEach(bundle => {
+          delete bundle.author;
+          const card = createBundleCard(bundle);
+          container.appendChild(card);
+          container.appendChild(document.createElement("br"));
+        });
+    })
+    .then(() => setTimeout(formatMarkdownOutput, 0))
+    .catch(error => console.error("Error:", error));
+
+});
+</script>
+{% endblock %}

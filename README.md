@@ -1,0 +1,137 @@
+# Vulnerability-Lookup
+
+[![Vulnerability-Lookup logo](docs/_static/img/VL-hori-coul.jpg)](https://github.com/vulnerability-lookup/vulnerability-lookup)
+
+[![Latest release](https://img.shields.io/github/release/vulnerability-lookup/vulnerability-lookup.svg?style=flat-square)](https://github.com/vulnerability-lookup/vulnerability-lookup/releases/latest)
+[![License](https://img.shields.io/github/license/vulnerability-lookup/vulnerability-lookup.svg?style=flat-square)](https://www.gnu.org/licenses/agpl-3.0.html)
+[![Contributors](https://img.shields.io/github/contributors/vulnerability-lookup/vulnerability-lookup.svg?style=flat-square)](https://github.com/vulnerability-lookup/vulnerability-lookup/graphs/contributors)
+[![Stars](https://img.shields.io/github/stars/vulnerability-lookup/vulnerability-lookup.svg?style=flat-square)](https://github.com/vulnerability-lookup/vulnerability-lookup/stargazers)
+
+Vulnerability-Lookup facilitates quick correlation of vulnerabilities from various sources,
+independent of vulnerability IDs, and streamlines the management of Coordinated Vulnerability Disclosure (CVD).
+Vulnerability-Lookup is also a collaborative platform where users can comment on security advisories and create bundles.
+
+A Vulnerability-Lookup instance operated by [CIRCL](https://www.circl.lu) is available at [https://vulnerability.circl.lu](https://vulnerability.circl.lu). [GCVE](https://gcve.eu) is also running a vulnerability-lookup instance at [https://db.gcve.eu/](https://db.gcve.eu)
+
+
+## Main features
+
+- **Feeders**: Modular ingestion framework to import vulnerabilities from multiple sources. Default feeders are bundled and enabled out of the box.
+- **CVD process**: End-to-end management of **Security Advisories** and **[Coordinated Vulnerability Disclosures](https://www.circl.lu/pub/coordinated-vulnerability-disclosure)**.
+- **Local sources**: Support for adding instance-specific, custom vulnerability sources.
+- **Global CVE Allocation System**: Native integration with the **[GCVE](https://gcve.eu)**.
+- **KEV catalogs**: Per-instance management with synchronization of remote KEV catalogs (e.g. ENISA, CISA).
+- **Sightings**: Record and track vulnerability observations, including *seen*, *exploited*, *not exploited*, *confirmed*, *not confirmed*, *patched*, and *not patched*.
+- **Comments**: Add, review, and share analyst notes on advisories.
+- **Bundles**: Group related vulnerability advisories with contextual descriptions for easier tracking and analysis.
+- **RSS/Atom**: Subscribe to vulnerability updates and comments via RSS or Atom feeds.
+- **EPSS**: Integration with the Exploit Prediction Scoring System for improved risk prioritization.
+- **Watchlists**: Monitor vulnerabilities affecting specific products and receive email notifications.
+- **API**: Fast and comprehensive vulnerability lookup API, including cross-source correlation by vulnerability identifier.
+
+For more information, refer to the [user manual](https://www.vulnerability-lookup.org/user-manual/)
+or the [documentation](https://www.vulnerability-lookup.org/documentation).
+
+
+## Sources and Default Feeders
+
+The default sources included in Vulnerability-Lookup are the following:
+
+### National Vulnerability Databases
+
+- [NVD CVE](https://nvd.nist.gov) importer (API 2.0), with [Fraunhofer FKIE NVD JSON feeds](https://github.com/fkie-cad/nvd-json-data-feeds)
+- [China National Vulnerability Database (CNNVD)](https://www.cnnvd.org.cn)
+- [JVN iPedia](https://jvndb.jvn.jp) – Japanese vulnerability countermeasure database
+- CERT-FR [Alerts](https://www.cert.ssi.gouv.fr/alerte/) and [Advisories](https://www.cert.ssi.gouv.fr/avis/)
+- [CISA Known Exploited Vulnerabilities Catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
+- [CNW (EU CSIRTs network) Known Exploited Vulnerabilities](https://github.com/enisaeu/CNW)
+
+### Community & Open Source Databases
+
+- [CVE Project – cvelist](https://github.com/CVEProject/cvelist)
+- [Cloud Security Alliance – GSD Database](https://github.com/cloudsecurityalliance/gsd-database/)
+- [GitHub Advisory Database](https://github.com/github/advisory-database)
+- [PySec Advisory Database](https://github.com/pypa/advisory-database)
+- [OpenSSF Malicious Packages](https://github.com/ossf/malicious-packages)
+
+### CSAF-based Sources
+
+- [ABB](https://global.abb/group/en/technology/cyber-security/alerts-and-notifications)
+- [CERT-Bund](https://wid.cert-bund.de/portal/wid/start)
+- [CISA](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
+- [Cisco](https://www.cisco.com)
+- [Nozomi Networks](https://security.nozominetworks.com)
+- [Open-Xchange](https://www.open-xchange.com)
+- [Red Hat](https://access.redhat.com/security/)
+- [Schneider Electric](https://www.se.com/ww/en/work/support/cybersecurity/vulnerability-policy/)
+- [Sick](https://www.sick.com/psirt)
+- [Siemens](https://www.siemens.com/global/en/products/services/cert.html)  
+- [NCSC-NL](https://advisories.ncsc.nl)
+- [Microsoft](https://msrc.microsoft.com)
+- [Trustsource](https://app.trustsource.io/dashboard)
+
+### OSV Sources
+
+- [Bitnami Vulnerability Database](https://github.com/bitnami/vulndb)
+- [CleanStart OS packages](https://github.com/cleanstart-dev/cleanstart-security-advisories)
+- [Drupal Advisory Database](https://github.com/DrupalSecurityTeam/drupal-advisory-database)
+
+### Specialized Sources
+- [VARIoT](https://www.variotdbs.pl/vulns/) – IoT vulnerabilities database
+- [Tailscale Security Bulletins](https://tailscale.com/security-bulletins)
+
+### Weakness & Attack Pattern Catalogs
+- [CWE](https://cwe.mitre.org) (Common Weakness Enumeration)
+- [CAPEC](https://capec.mitre.org) (Common Attack Pattern Enumeration and Classification)
+
+
+## Sighting Sources
+
+Vulnerability-Lookup facilitates the recording of vulnerability sightings, regardless of whether they have been published by a source.
+A suite of sighting clients is already available to support this functionality:
+
+Our tools on the Python Package Index (PyPI):
+
+| Tool                                                                | Description                                                                                                                                                           |
+| ------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [ShadowSight](https://pypi.org/project/ShadowSight)                 | A client that retrieves vulnerability observations from the The Shadowserver Foundation and pushes them to a Vulnerability-Lookup instance.                           |
+| [FediVuln](https://pypi.org/project/FediVuln)                       | A client to gather vulnerability-related information from the Fediverse.                                                                                              |
+| [BlueSkySight](https://pypi.org/project/BlueSkySight)               | A client to gather vulnerability-related information from Bluesky.                                                                                                    |
+| [MISPSight](https://pypi.org/project/MISPSight)                     | A client that retrieves vulnerability observations from a MISP server and pushes them to a Vulnerability-Lookup instance.                                             |
+| [NucleiVuln](https://pypi.org/project/NucleiVuln)                   | A client designed to retrieve vulnerability-related observations from the Nuclei Git repository of templates and pushes them to a Vulnerability-Lookup instance.      |
+| [ExploitDBSighting](https://pypi.org/project/ExploitDBSighting)     | A client that retrieves vulnerability observations from Exploit-DB and pushes them to a Vulnerability-Lookup instance.                                                |
+| [KEVSight](https://pypi.org/project/KEVSight)                       | A client to generate sightings for Vulnerability-Lookup from the Known Exploited Vulnerabilities (KEV) catalog.                                                       |
+| [GistSight](https://pypi.org/project/GistSight)                     | A client for gathering vulnerability-related information from GitHub Gists.                                                                                           |
+| [MetasploitSight](https://pypi.org/project/MetasploitSight)         | A client designed to retrieve vulnerability-related information from the modules available in Metasploit.  
+
+
+If you want to create your own sigthing tool, it's recommended to use [PyVulnerabilityLookup](https://github.com/vulnerability-lookup/PyVulnerabilityLookup),
+a Python library to access Vulnerability-Lookup via its REST API.
+
+
+## Installation
+
+Generally speaking, requirements are the following:
+
+- Recent version of Python 3.10
+- Recent version of Poetry
+- [Kvrocks database](https://github.com/apache/kvrocks)
+
+[Installation instructions](https://www.vulnerability-lookup.org/documentation/installation.html) are available in the documentation.
+
+
+## Architecture
+
+![Overview of the Vulnerability-Lookup architecture](docs/_static/img/vulnerability-lookup.png)
+
+
+## License
+
+Vulnerability-Lookup is free software released under the "GNU Affero General Public License v3.0".
+
+~~~
+Copyright (c) 2023-2026 Computer Incident Response Center Luxembourg (CIRCL)
+Copyright (c) 2023-2026 Alexandre Dulaunoy - https://github.com/adulau
+Copyright (c) 2023-2026 Raphaël Vinot - https://github.com/Rafiot
+Copyright (c) 2024-2026 Cédric Bonhomme - https://github.com/cedricbonhomme
+~~~

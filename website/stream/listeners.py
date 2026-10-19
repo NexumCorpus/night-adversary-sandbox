@@ -1,0 +1,150 @@
+import json
+import logging
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from typing import Any
+
+from flask import url_for
+from sqlalchemy import event
+from sqlalchemy.engine import Connection
+from sqlalchemy.event import remove
+from sqlalchemy.inspection import inspect
+from sqlalchemy.orm import Mapper
+
+from vulnerabilitylookup.default import get_config
+from website.models import Bundle, Comment, Sighting
+from website.web.bootstrap import vulnerabilitylookup
+
+logging.config.dictConfig(get_config("logging"))
+
+executor = ThreadPoolExecutor(max_workers=10)
+
+
+def handle_exception(future: Any) -> None:
+    try:
+        future.result()  # Retrieve the result of the task; raises if an exception occurred
+    except Exception as e:
+        logging.error(f"Background task failed: {e}", exc_info=True)
+
+
+def publish_in_background(channel: str, message: str) -> None:
+    """Offload the publishing logic to a background thread to avoid blocking the database transaction."""
+
+    def task() -> None:
+        try:
+            vulnerabilitylookup.redis_client.publish(channel, message)
+        except Exception as e:
+            logging.error(f"Error in publish_in_background: {e}", exc_info=True)
+            raise  # Optionally re-raise the exception if needed
+
+    future = executor.submit(task)
+    # Optionally handle the exception when the future is retrieved
+    future.add_done_callback(handle_exception)
+
+
+def stream_comment(mapper: Mapper, connection: Connection, target: Any) -> None:  # type: ignore[type-arg]
+    """
+    Called after a new Comment instance is inserted into the database.
+    """
+    # Convert the object to a dictionary or JSON string
+    message = {
+        "payload": {
+            column.key: getattr(target, column.key)
+            for column in inspect(target).mapper.column_attrs
+        },
+        "instance_uuid": get_config("generic", "local_instance_uuid").lower(),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "data_type": "comment",
+        "uri": url_for("comment_bp.get", comment_uuid=target.uuid, _external=True),
+    }
+    # Publish to the channel
+    publish_in_background("comment", json.dumps(message))
+
+
+def stream_bundle(mapper: Mapper, connection: Connection, target: Any) -> None:  # type: ignore[type-arg]
+    """
+    Called after a new Bundle instance is inserted into the database.
+    """
+    # Convert the object to a dictionary or JSON string
+    message = {
+        "payload": {
+            column.key: getattr(target, column.key)
+            for column in inspect(target).mapper.column_attrs
+        },
+        "instance_uuid": get_config("generic", "local_instance_uuid").lower(),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "data_type": "bundle",
+        "uri": url_for("bundle_bp.get", bundle_uuid=target.uuid, _external=True),
+    }
+    # Publish to the channel
+    publish_in_background("bundle", json.dumps(message))
+
+
+def stream_sighting(mapper: Mapper, connection: Connection, target: Any) -> None:  # type: ignore[type-arg]
+    """
+    Called after a new Sighting instance is inserted into the database.
+    """
+    # Convert the object to a dictionary or JSON string
+    message = {
+        "payload": {
+            column.key: getattr(target, column.key)
+            for column in inspect(target).mapper.column_attrs
+        },
+        "instance_uuid": get_config("generic", "local_instance_uuid").lower(),
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "data_type": "sigthing",
+        "uri": f"{url_for('home_bp.vulnerability_view', vulnerability_id=target.vulnerability, _external=True)}#sightings",
+    }
+    # Publish to the channel
+    publish_in_background("sighting", json.dumps(message))
+
+
+# Registry of events required for unregistering listeners
+event_registry = {
+    "comment": (Comment, "after_insert", stream_comment),
+    "bundle": (Bundle, "after_insert", stream_bundle),
+    "sighting": (Sighting, "after_insert", stream_sighting),
+}
+
+
+def register_listeners() -> None:
+    """Register the listeners."""
+    for channel in get_config("stream", "channels"):
+        if channel in event_registry:
+            target, identifier, listener = event_registry[channel]
+            event.listen(target, identifier, listener)
+
+
+def remove_all_listeners() -> None:
+    """Remove all registered listeners."""
+    for target, event_name, listener in event_registry.values():
+        try:
+            remove(target, event_name, listener)
+        except Exception:
+            continue
+
+    # Clear the registry
+    event_registry.clear()
+
+
+# def remove_all_listeners_for_event(model, event_name) -> None:
+#     try:
+#         # Loop through all listeners and remove them
+#         while True:
+#             remove(model, event_name)
+#     except ValueError:
+#         # Raised when there are no more listeners to remove
+#         pass
+
+
+# def remove_all_listeners_for_model(model) -> None:
+#     event_names = [
+#         "before_insert",
+#         "after_insert",
+#         "before_update",
+#         "after_update",
+#         "before_delete",
+#         "after_delete",
+#     ]
+#     for event_name in event_names:
+#         remove_all_listeners_for_event(model, event_name)

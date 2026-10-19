@@ -1,0 +1,301 @@
+APP_NAME = "Vulnerability-Lookup" # Mandatory for the QRCode of the 2FA
+
+# Set it to True to run flask in debug mode. **do not do that in prod**
+DEBUG = False
+
+BOOTSTRAP_SERVE_LOCAL =  True
+SESSION_COOKIE_NAME = "vulnerability-lookup"
+
+CSRF_ENABLED = True
+SESSION_COOKIE_SAMESITE = "Strict"  # Can be 'Strict', 'Lax', or 'None'
+
+# #### Database ####
+DB_CONFIG_DICT = {
+    "user": "postgres",
+    "password": "password",
+    "host": "127.0.0.1",
+    "port": 5432,
+}
+DATABASE_NAME = "vulnlookup"
+SQLALCHEMY_DATABASE_URI = "postgresql+psycopg://{user}:{password}@{host}:{port}/{name}".format(
+    name=DATABASE_NAME, **DB_CONFIG_DICT
+)
+SQLALCHEMY_ENGINE_OPTIONS = {
+    'pool_size': 100,           # Number of persistent connections in the pool
+    'max_overflow': 50,         # Additional connections for spikes in traffic
+    'pool_timeout': 30,         # Wait time for a connection before timeout
+    'pool_recycle': 1800,       # Recycle connections every 30 minutes to prevent stale connections
+    'pool_pre_ping': True       # Ensures the connection is valid before using
+}
+
+
+# #### Email notifications ####
+MAIL_SERVER = "localhost"
+MAIL_PORT = 25
+MAIL_USE_TLS = False
+MAIL_USE_SSL = False
+MAIL_DEBUG = False
+MAIL_USERNAME = None
+MAIL_PASSWORD = None
+MAIL_DEFAULT_SENDER = "admin@localhost"
+TOKEN_VALIDITY_PERIOD = 3600
+PLATFORM_URL = "https://vulnerability.circl.lu"
+
+
+# #### Modules (Blueprints) ####
+WEB_MODULES = {
+    "vulnerability_disclosure": False,
+}
+
+# #### External services ####
+ML_GATEWAY = "http://127.0.0.1:8000/"
+EPSS_SERVICE = "https://api.first.org/data/v1/epss"
+
+
+# #### Misc ####
+UPLOAD_FOLDER = "./website/web/public/pictures/"
+ALLOWED_EXTENSIONS = {"png"}
+
+ACCEPTED_DOMAINS_FOR_REGISTRATION = set()
+BLOCKED_DOMAINS_FOR_REGISTRATION = {"yougadget.top", "youchoice.cfd", "mozmail.com"}
+
+ENFORCE_2FA = True
+SELF_REGISTRATION = True
+PROTECT_USER_PAGES = False
+
+FEED_MAX_PER_PAGE = 50
+
+COMMENTS_MODERATION = True
+
+LOG_LEVEL = "INFO"
+LOG_PATH = "logs/website_warning.log"
+
+ADMIN_EMAIL = "info@circl.lu"
+ADMIN_NAME = "Computer Incident Response Center Luxembourg (CIRCL)"
+ADMIN_WEBSITE = "https://www.circl.lu"
+
+# MESSAGE_ABOUT = "<h3>Instance rules</h3>" \
+# "<ul><li>Share</li><li>Be kind</li></ul>"
+
+# MESSAGE_SIGNUP = "If you have any issue creating an account please contact the <a href='/about/more'>operator</a>."
+
+
+SOURCES_TO_SHOW = {
+    "cvelistv5": {
+        "name": "CVE List v5",
+        "url": "https://github.com/CVEProject/cvelistV5",
+        "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+        "spdx_id": "CC-BY-4.0"
+    },
+    "nvd": {
+        "name": "NVD",
+        "url": "https://nvd.nist.gov",
+        "license": "Public Domain",
+        "spdx_id": "CC0-1.0"
+    },
+    "fkie_nvd": {
+        "name": "FKIE NVD",
+        "url": "",
+        "license": "",
+        "spdx_id": ""
+    },
+    "github": {
+        "name": "GitHub",
+        "url": "https://github.com/",
+        "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+        "spdx_id": "CC-BY-4.0"
+    },
+    "pysec": {
+        "name": "PySec",
+        "url": "https://github.com/pypa/advisory-database",
+        "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+        "spdx_id": "CC-BY-4.0"
+    },
+    "emb3d": {
+        "name": "emb3d",
+        "url": "https://github.com/mitre/emb3d",
+        "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+        "spdx_id": "CC-BY-4.0"
+    },
+    "gsd": {
+        "name": "GSD",
+        "url": "https://gsd.id",
+        "license": "Creative Commons Zero v1.0 Universal",
+        "spdx_id": "CC0-1.0"
+    },
+    "ossf_malicious_packages": {
+        "name": "OpenSSF Malicious Packages",
+        "url": "https://github.com/ossf/malicious-packages",
+        "license": "Apache License 2.0",
+        "spdx_id": "Apache-2.0"
+    },
+    "bitnami_vulndb": {
+        "name": "Bitnami VulnDB",
+        "url": "https://github.com/bitnami/vulndb",
+        "license": "Apache License 2.0",
+        "spdx_id": "Apache-2.0"
+    },
+    "cleanstart": {
+        "name": "Cleanstart",
+        "url": "https://github.com/cleanstart-dev/cleanstart-security-advisories",
+        "license": "Apache License 2.0",
+        "spdx_id": "Apache-2.0"
+    },
+    "drupal": {
+        "name": "Drupal",
+        "url": "https://github.com/DrupalSecurityTeam/drupal-advisory-database",
+        "license": "MIT",
+        "spdx_id": "MIT"
+    },
+    "csaf_certbund": {
+        "name": "CSAF CERT-Bund",
+        "url": "https://wid.cert-bund.de/portal/wid/start",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_ncscnl": {
+        "name": "CSAF NCSC-NL",
+        "url": "https://advisories.ncsc.nl/",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_trustsource": {
+        "name": "CSAF Trustsource",
+        "url": "https://app.trustsource.io/",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_siemens": {
+        "name": "CSAF Siemens",
+        "url": "https://www.siemens.com/global/en/products/services/cert.html",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_redhat": {
+        "name": "CSAF Red Hat",
+        "url": "https://access.redhat.com/security/",
+        "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+        "spdx_id": "CC-BY-4.0"
+    },
+    "csaf_cisa": {
+        "name": "CSAF CISA",
+        "url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_cisco": {
+        "name": "CSAF CISCO",
+        "url": "https://www.cisco.com/",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_sick": {
+        "name": "CSAF Sick",
+        "url": "https://www.sick.com/psirt",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_nozominetworks": {
+        "name": "CSAF Nozomi Networks",
+        "url": "https://security.nozominetworks.com",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_ox": {
+        "name": "CSAF Open-Xchange",
+        "url": "https://www.open-xchange.com",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_microsoft": {
+        "name": "CSAF Microsoft",
+        "url": "https://msrc.microsoft.com",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_abb": {
+        "name": "CSAF ABB",
+        "url": "https://global.abb/group/en/technology/cyber-security/alerts-and-notifications",
+        "license": "",
+        "spdx_id": ""
+    },
+    "variot": {
+        "name": "VARIoT",
+        "url": "https://www.variotdbs.pl/vulns/",
+        "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+        "spdx_id": "CC-BY-4.0"
+    },
+    "jvndb": {
+        "name": "JVNDB",
+        "url": "https://jvndb.jvn.jp/en/",
+        "license": "",
+        "spdx_id": ""
+    },
+    "tailscale": {
+        "name": "Tailscale",
+        "url": "https://tailscale.com/security-bulletins",
+        "license": "",
+        "spdx_id": ""
+    },
+    "circl": {
+        "name": "CIRCL",
+        "url": "https://vulnerability.circl.lu",
+        "license": "",
+        "spdx_id": ""
+    },
+    "csaf_suse": {
+        "name": "CSAF Suse",
+        "url": "https://www.suse.com/support/security/",
+        "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+        "spdx_id": "CC-BY-4.0"
+    },
+    "csaf_opensuse": {
+        "name": "CSAF OpenSuse",
+        "url": "https://www.suse.com/support/security/",
+        "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+        "spdx_id": "CC-BY-4.0"
+    },
+    "csaf_se": {
+        "name": "CSAF SchneiderElectric",
+        "url": "https://www.se.com/ww/en/work/support/cybersecurity/vulnerability-policy/",
+        "license": "",
+        "spdx_id": ""
+    },
+    "cnvd": {
+        "name": "CNVD",
+        "url": "https://www.cnvd.org.cn/",
+        "license": "",
+        "spdx_id": ""
+    },
+    "fstec": {
+        "name": "FSTEC",
+        "url": "https://bdu.fstec.ru",
+        "license": "",
+        "spdx_id": ""
+    },
+    "certfr_avis": {
+        "name": "CERT FR Avis",
+        "url": "https://www.cert.ssi.gouv.fr/avis/",
+        "license": "",
+        "spdx_id": ""
+    },
+    "certfr_alerte": {
+        "name": "CERT FR Alerte",
+        "url": "https://www.cert.ssi.gouv.fr/alerte/",
+        "license": "",
+        "spdx_id": ""
+    },
+    "osv_ossfuzz": {
+        "name": "OSV OSS Fuzz",
+        "url": "https://github.com/google/oss-fuzz",
+        "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+        "spdx_id": "CC-BY-4.0"
+    },
+    "osv_rustsec": {
+        "name": "OSV Rustsec",
+        "url": "https://rustsec.org/advisories/",
+        "license": "Creative Commons Attribution 4.0 International (CC BY 4.0)",
+        "spdx_id": "CC-BY-4.0"
+    },
+    # "certag": {"name": "CERTAG", "url": "", "license": "", "spdx_id": ""},
+}

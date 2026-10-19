@@ -1,0 +1,57 @@
+# Steps to add a new source
+
+## New Feeder
+
+1. Create a new feeder in `vulnerabilitylookup/feeders/`. A generic feeder needs to
+   inherit from `AbstractFeeder`.
+   If it is a CSAF provider, use `CSAFGeneric` instead.
+   If it is an OSV provider, use `OSVParser` instead.
+
+    Example: `vulnerabilitylookup/feeders/my_feeder.py`
+
+2. Create a config file for the logger in `vulnerabilitylookup/feeders/` with the name `<feedname>_logging.json`
+
+    Example: `vulnerabilitylookup/feeders/my_feeder_logging.json`
+
+3. Create the script that will run regularly to fetch the data in `bin/`.
+
+    Example: `bin/my_feeder.py`
+
+4. Add a reference to that file in `pyproject.toml` under the `tool.poetry.scripts` section.
+
+    Example: `my_feeder = "bin.my_feeder:main"`
+
+5. Add an entry for tour new feeder in `config/modules.cfg.sample`.
+
+    Example:
+
+```ini
+[feeder:my_feeder]
+script_name = my_feeder_importer
+level = DEBUG
+```
+
+6. If your datasource is from github run command `git submodule add --name my_feeder <link to github> vulnerabilitylookup/feeders/my_feeder`
+
+7. Run `poetry install` to add the new script, and the command `my_feeder` is available. You can
+   run it manually for testing by command poetry run `my_feeder_importer`, and it will be automatically started next time you
+   restart the application.
+8. You can debug it connecting to Kvrocks by client and check if links are done correctly by command 'SMEMBERS <your main ID>:link
+
+## Add the new source in the web interface
+
+1. Add `my_feeder` to the list of sources in `config/website.py.sample` (and update `config/website.py`).
+
+2. Update `website/web/templates/main.html` with the new source.
+
+```
+<link href="{{ url_for('home_bp.feed_recent', format='atom', source='myfeeder') }}" rel="alternate" title="Recent vulnerabilities from myfeeder." type="application/atom+xml">
+```
+
+3. If the source is not a CSAF or an OSV provider, update `website/web/templates/recent.html` with the new source (see in the file for what is needed).
+
+4. Update `website/web/templates/vuln.html` with the new source (see in the file for what is needed).
+
+5. Update `website/web/templates/vulnerability_templates.html` with the new source. This one is the macro to render the vulnerability on the website. Look at the file for details.
+
+    NOTE: for CSAF an OSV sources, there are generic macros.

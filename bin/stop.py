@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+from subprocess import Popen, run
+
+from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+
+from vulnerabilitylookup.default import get_homedir, get_socket_path, tcp_cache_connect
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Stop the instance.')
+    parser.add_argument('--force', action='store_true', help='Wait a bit and send SIGKILL to the processes.')
+    args = parser.parse_args()
+
+    get_homedir()
+    if args.force:
+        p = Popen(['shutdown', '--force'])
+    else:
+        p = Popen(['shutdown'])
+    p.wait()
+    r = None
+    try:
+        r = tcp_cache_connect()
+    except RedisConnectionError as e:
+        print(f'Unable to connect to redis via TCP during startup: {e}')
+        print('Trying to connect via socket')
+    try:
+        if not r:
+            r = Redis(unix_socket_path=get_socket_path('cache'), db=1)
+        r.delete('shutdown')
+        print('Connection successfull, shutting down databases...')
+        p_backend = run(['run_backend', '--stop'])
+        p_backend.check_returncode()
+        print('done.')
+    except RedisConnectionError:
+        # Already down, skip the stacktrace
+        print('WARNING: Redis is down, unable to remove the `shutdown` key from the redis cache database, DB 1. Remove the key manually if the website does not start.')
+
+
+if __name__ == '__main__':
+    main()

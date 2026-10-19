@@ -1,0 +1,246 @@
+function copyToClipboard(container_id) {
+    const copyText = document.getElementById(container_id).textContent;
+    const textArea = document.createElement('textarea');
+    textArea.textContent = copyText;
+    navigator.clipboard.writeText(textArea.value).then(function() {
+      /* clipboard successfully set */
+      showToast("Success", "Content copied to your clipboard.");
+    }, function() {
+      /* clipboard write failed */
+    });
+  }
+
+// Debounce function to limit how often fetch is called
+function debounce(func, wait) {
+    let timeout;
+    return function(...args) {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => func.apply(this, args), wait);
+    };
+}
+
+function openTabById(tabId) {
+  const tabButton = document.querySelector(`button[data-bs-target="${tabId}"]`);
+  if (tabButton) {
+    const tab = new bootstrap.Tab(tabButton);
+    tab.show();
+  } else {
+    console.error(`Tab with ID ${tabId} not found.`);
+  }
+}
+
+function truncateString(str, maxLength) {
+  if (str.length > maxLength) {
+      return str.slice(0, maxLength) + "…";
+  }
+  return str;
+}
+
+/**
+ * Get the value of a specific URL parameter by name.
+ *
+ * @param {string} paramName - The name of the parameter to retrieve.
+ * @param {string} [url=window.location.href] - The URL to parse (defaults to the current URL).
+ * @return {string|null} The value of the parameter, or null if not found.
+ */
+function getUrlParameter(paramName, url = window.location.href) {
+  const urlParams = new URLSearchParams(new URL(url).search);
+  return urlParams.get(paramName);
+}
+
+// Function to calculate the difference in days between two dates
+function daysBetweenDates(startDate, endDate) {
+  const start = new Date(startDate);
+  const end = new Date(endDate);
+  const diffTime = Math.abs(end - start); // Difference in milliseconds
+  return Math.ceil(diffTime / (1000 * 60 * 60 * 24)); // Convert to days
+}
+
+// Function to calculate the Monday of the week for a given date
+function getMonday(date) {
+  const d = new Date(date);
+  const day = d.getDay(); // 0 = Sunday, 1 = Monday, ..., 6 = Saturday
+  const diff = (day === 0 ? -6 : 1) - day; // Adjust to Monday
+  d.setDate(d.getDate() + diff);
+  return d;
+}
+
+function getWeekNumber(date) {
+  // Clone the date to avoid modifying the original
+  const currentDate = new Date(date);
+
+  // Set the first day of the week to Monday
+  currentDate.setHours(0, 0, 0, 0);
+
+  // Move to the nearest Thursday (to account for ISO 8601 standard)
+  currentDate.setDate(currentDate.getDate() + (4 - (currentDate.getDay() || 7)));
+
+  // Calculate the year start
+  const yearStart = new Date(currentDate.getFullYear(), 0, 1);
+
+  // Calculate the ISO week number
+  const weekNumber = Math.ceil(((currentDate - yearStart) / 86400000 + 1) / 7);
+
+  return weekNumber;
+}
+
+// Function to add days to a date
+function addDays(date, days) {
+  const result = new Date(date);
+  result.setDate(result.getDate() + days);
+  return result;
+}
+
+// Function to format the date as YYYY-MM-DD
+function formatDate(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0'); // Months are zero-based
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+// Function to show modal with dynamic content and pass the original event to the callback
+function showModal(title, message, confirmCallback, originalEvent) {
+  // Set the modal title and message
+  document.getElementById("dynamicConfirmModalLabel").innerText = title;
+  document.getElementById("dynamicModalMessage").innerText = message;
+
+  // Remove previous event listeners from the OK button
+  var confirmBtn = document.getElementById("dynamicConfirmBtn");
+  confirmBtn.replaceWith(confirmBtn.cloneNode(true)); // Clone to remove old listeners
+  confirmBtn = document.getElementById("dynamicConfirmBtn");
+
+  // Add new event listener for the OK button
+  confirmBtn.addEventListener("click", function() {
+    confirmCallback(originalEvent);  // Pass the original event to the callback
+    // Close the modal
+    var modal = bootstrap.Modal.getInstance(document.getElementById('dynamicConfirmModal'));
+    modal.hide();
+  });
+
+  // Show the modal
+  var confirmModal = new bootstrap.Modal(document.getElementById('dynamicConfirmModal'));
+  confirmModal.show();
+}
+
+
+// Function to display a toast with custom title and message
+function showToast(title, message) {
+  // Set the title and message
+  document.getElementById('toastTitle').innerText = title;
+  document.getElementById('toastMessage').innerText = message;
+
+  // Show the toast
+  var toastElement = document.getElementById('actionToast');
+  var toast = new bootstrap.Toast(toastElement);
+  toast.show();
+}
+
+
+function formatMarkdownOutput() {
+  // Add some Bootstrap CSS classes to elements generated from Markdown (lists, tables)
+  const lists = document.querySelectorAll('.markdown-description ul');
+  lists.forEach((list, index) => {
+    list.classList.add('list-group');
+
+    const listItems = list.querySelectorAll('li');
+    listItems.forEach((li) => {
+      li.classList.add('list-group-item');
+    });
+  });
+
+  const olists = document.querySelectorAll('.markdown-description ol');
+  olists.forEach((list, index) => {
+    list.classList.add('list-group', 'list-group-numbered');
+
+    const listItems = list.querySelectorAll('li');
+    listItems.forEach((li) => {
+      li.classList.add('list-group-item');
+    });
+  });
+
+  const tables = document.querySelectorAll('.markdown-description table');
+  tables.forEach((table, index) => {
+    // Add basic boostrap class for tables
+    table.classList.add('table', 'table-bordered');
+
+    // Make the table responsive
+    const responsiveDiv = document.createElement('div');
+    responsiveDiv.classList.add('table-responsive');
+    table.parentNode.insertBefore(responsiveDiv, table);
+    responsiveDiv.appendChild(table);
+  });
+}
+
+function truncateString(str, maxLength) {
+  if (str.length > maxLength) {
+      return str.slice(0, maxLength) + "...";
+  }
+  return str;
+}
+
+function isValidURL(string) {
+  try {
+    new URL(string);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function findCVEIdentifiers(text) {
+  // Regex pattern to match CVE identifiers (e.g., CVE-2021-34527)
+  const cveRegex = /\bCVE-\d{4}-\d{4,7}\b/gi;
+
+  // Find all matches
+  const matches = text.match(cveRegex);
+
+  // Return the array of matches or an empty array if none are found
+  return matches || [];
+}
+
+
+function linkifyCVE(inputString) {
+  // Regular expression to match CVE IDs in the format CVE-YYYY-NNNNN
+  const cveRegex = /\bCVE-\d{4}-\d{4,7}\b/gi;
+
+  // Replace each match with a link
+  return inputString.replace(cveRegex, (cve) => {
+      return `<a href="/vuln/${cve}" target="_blank">${cve}</a>`;
+  });
+}
+
+function linkifyGHSA(inputString) {
+  // Regular expression to match GHSA IDs in the format GHSA-xxxx-xxxx-xxxx
+  const ghsaRegex = /\bGHSA(-[23456789cfghjmpqrvwx]{4}){3}\b/gi;
+
+  // Replace each match with a link
+  return inputString.replace(ghsaRegex, (ghsa) => {
+      return `<a href="/vuln/${ghsa}" target="_blank">${ghsa}</a>`;
+  });
+}
+
+function linkifySecurityIdentifiers(inputString) {
+  // Regular expressions for CVE, GHSA, and PySec
+  const cveRegex = /\bCVE-\d{4}-\d{4,7}\b/gi;
+  const ghsaRegex = /\bGHSA(-[23456789cfghjmpqrvwx]{4}){3}\b/gi;
+  const pysecRegex = /\bpysec-\d{4}-\d+\b/gi;
+
+  // Split the input string by <a> tags to avoid altering existing links
+  return inputString.replace(/(<a[^>]*>.*?<\/a>)|([^<]+)/g, (match, anchor, nonAnchor) => {
+    // If it's an anchor tag, return it unchanged
+    if (anchor) return anchor;
+
+    // If it's not inside an anchor tag, replace CVE, GHSA and PySec IDs
+    return nonAnchor
+    .replace(cveRegex, (cve) => {
+      return `<a href="/vuln/${cve}">${cve}</a>`;
+    })
+    .replace(ghsaRegex, (ghsa) => {
+      return `<a href="/vuln/${ghsa}">${ghsa}</a>`;
+    })
+    .replace(pysecRegex, (pysec) => {
+      return `<a href="/vuln/${pysec}">${pysec}</a>`;
+    });
+  });
+}

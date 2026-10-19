@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+
+import logging.config
+
+from vulnerabilitylookup.default import AbstractManager, get_config
+from vulnerabilitylookup.feeders.certfr_alerte import CertFrAlerte
+
+logging.config.dictConfig(get_config('logging'))
+
+
+class CertFrAlerteImporter(AbstractManager):
+
+    def __init__(self, loglevel: int | None=None, *, reimport: bool=False) -> None:
+        self.script_name = 'certfr_alerte_importer'
+        super().__init__(loglevel)
+        self.certfr = CertFrAlerte(reimport=reimport)
+
+    def _to_run_forever(self) -> None:
+        self.certfr.update(self.shutdown_requested)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='CERT FR Alerte Importer')
+    parser.add_argument('--reimport', default=False, action='store_true', help='Reimport all data')
+    args = parser.parse_args()
+    cfr = CertFrAlerteImporter(reimport=args.reimport)
+    cfr.run(sleep_in_sec=3600)
+
+
+if __name__ == '__main__':
+    main()

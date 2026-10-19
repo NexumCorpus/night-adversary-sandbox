@@ -1,0 +1,23 @@
+{% extends "main.html" %}
+{% block title %}Verify Two-Factor Authentication{% endblock %}
+{% block content %}
+<div class="row justify-content-center">
+  <div class="col-md-4">
+    <main class="form-signin w-100 m-auto">
+      <form class="form form-control" role="form" method="post" action="">
+        {{ form.csrf_token }}
+        {{ form.otp(placeholder="OTP", class="form-control", autofocus=true) }}
+        {{ form.otp.label }}
+        {% if form.otp.errors %}
+          {% for error in form.otp.errors %}
+          <div class="alert alert-danger" role="alert">
+            {{ error }}
+          </div>
+          {% endfor %}
+        {% endif %}
+        <button class="btn btn-primary form-control" type="submit">Verify</button>
+      </form>
+    </main>
+  </div>
+</div>
+{% endblock %}

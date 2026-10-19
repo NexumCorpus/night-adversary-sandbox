@@ -1,0 +1,364 @@
+import logging
+from typing import Any, Dict, Tuple
+
+from flask_login import current_user  # type: ignore[import-untyped]
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+    abort,
+    fields,
+    reqparse,
+)
+from sqlalchemy import delete, exc
+
+from website.lib.email_utils import (
+    has_mx_record,
+    is_email_in_allow_list,
+    is_email_in_block_list,
+    is_email_in_misp_disposable_list,
+)
+from website.models import Bundle, Comment, Notification, User, VulnerabilityDisclosure
+from website.notifications import notifications
+from website.web.api.v1.common import auth_func, metada_params_model
+from website.web.api.v1.types import ResultType
+from website.web.bootstrap import application, db, limiter
+from website.web.permissions import admin_permission
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+user_ns = Namespace("user", description="User related operations.")
+
+
+# Argument Parsing
+parser_get_users = reqparse.RequestParser()
+parser_get_users.add_argument("page", type=int, default=1, help="Number of the page.")
+parser_get_users.add_argument(
+    "per_page", type=int, default=10, help="Maximum number of elements to return."
+)
+
+
+parser = reqparse.RequestParser(bundle_errors=True)  # collect all validation errors
+parser.add_argument("page", type=int, default=1, help="Number of the page.")
+parser.add_argument(
+    "per_page", type=int, default=10, help="Maximum number of elements to return."
+)
+parser.add_argument("login", type=str, required=True, location="json", help="Login.")
+parser.add_argument(
+    "name",
+    type=str,
+    required=True,
+    location="json",
+    help="Display name (firstname, lastname).",
+)
+parser.add_argument("organisation", type=str, location="json", help="Organisation.")
+parser.add_argument("email", type=str, required=True, location="json", help="Email.")
+
+
+# Response marshalling
+user_params_model = {
+    "id": fields.Integer(description="User id."),
+    "uuid": fields.String(description="User UUID."),
+    "login": fields.String(description="User login."),
+    "name": fields.String(description="User name."),
+    "organisation": fields.String(description="User organisation."),
+    "email": fields.String(description="User email."),
+    "apikey": fields.String(description="User API key.", readonly=True),
+    "is_admin": fields.Boolean(
+        description="Boolean specifying whether the user is administrator."
+    ),
+    "is_reporter": fields.Boolean(
+        description="Boolean specifying whether the user is reporter."
+    ),
+    "is_commenter": fields.Boolean(
+        description="Boolean specifying whether the user is commenter."
+    ),
+    "created_at": fields.DateTime(
+        description="Creation time of the user.", readonly=True
+    ),
+    "last_seen": fields.DateTime(
+        description="Last seen time of the user.", readonly=True
+    ),
+}
+
+user_params_model_light = {
+    "uuid": fields.String(description="User UUID."),
+    "login": fields.String(description="User login."),
+    "is_admin": fields.Boolean(
+        description="Boolean specifying whether the user is administrator."
+    ),
+    "is_reporter": fields.Boolean(
+        description="Boolean specifying whether the user is reporter."
+    ),
+    "is_commenter": fields.Boolean(
+        description="Boolean specifying whether the user is commenter."
+    ),
+    "created_at": fields.DateTime(
+        description="Creation time of the user.", readonly=True
+    ),
+    "last_seen": fields.DateTime(
+        description="Last seen time of the user.", readonly=True
+    ),
+}
+
+user_model = user_ns.model("UserFull", user_params_model)
+user_model_light = user_ns.model("UserFull", user_params_model_light)
+metadata = user_ns.model("metadata", metada_params_model)
+
+user_list_fields = user_ns.model(
+    "UsersList",
+    {
+        "metadata": fields.Nested(
+            metadata, description="Metada related to the result."
+        ),
+        "data": fields.List(
+            fields.Nested(user_model_light, skip_none=True),
+            description="List of users.",
+        ),
+    },
+)
+
+
+@user_ns.route("/me")
+class UserSelf(Resource):  # type: ignore[misc]
+    @typed(
+        user_ns.doc(
+            description="Get information about the currently authenticated user."
+        )
+    )
+    @typed(
+        user_ns.doc(
+            responses={200: "Success.", 404: "User not found."},
+        )
+    )
+    @typed(user_ns.marshal_with(user_model, skip_none=True))
+    @typed(auth_func)
+    def get(self) -> Tuple[dict[Any, Any], int]:
+        "Get information about the currently authenticated user."
+        me = User.query.filter(
+            User.id == current_user.id,
+            User.is_active == True,  # noqa: E712
+            User.is_confirmed == True,  # noqa: E712
+        ).first()
+        if not me:
+            return {"message": "User not found."}, 404
+        return me, 200
+
+
+@user_ns.route("/api_key")
+class UserNewAPIKey(Resource):  # type: ignore[misc]
+    @typed(
+        user_ns.doc(
+            description="Regenerating the API key of the authenticated user with the current API key."
+        )
+    )
+    @typed(
+        user_ns.doc(
+            responses={
+                200: "Success.",
+                403: "Wrong API key submitted.",
+                404: "User not found.",
+            }
+        )
+    )
+    @typed(
+        user_ns.expect(
+            user_ns.model(
+                "API Key",
+                {
+                    "apikey": fields.String(
+                        description="The current API key of the user."
+                    )
+                },
+                location="json",
+            )
+        )
+    )
+    @typed(user_ns.marshal_with(user_model, skip_none=True))
+    @typed(auth_func)
+    def post(self) -> Tuple[dict[Any, Any], int]:
+        "Regenerating the API key of the authenticated user with the current API key."
+        user_obj = User.query.filter(
+            User.id == current_user.id,
+            User.is_active == True,  # noqa: E712
+            User.is_confirmed == True,  # noqa: E712
+        ).first()
+
+        if not user_obj:
+            return {"message": "User not found."}, 404
+
+        data = user_ns.payload
+
+        if user_obj.apikey != data.get("apikey", ""):
+            return {"message": "Wrong API key submitted."}, 403
+
+        user_obj.generate_apikey()
+        db.session.commit()
+
+        return user_obj, 200
+
+
+@user_ns.route("/<int:user_id>")
+class UserItem(Resource):  # type: ignore[misc]
+    @typed(user_ns.doc(description="Delete a user."))
+    @typed(
+        user_ns.doc(
+            responses={
+                204: "Success.",
+                403: "Administrator permission required or not the current user.",
+                404: "User not found.",
+                500: "Internal server error.",
+            }
+        )
+    )
+    @typed(auth_func)
+    def delete(self, user_id: int) -> Tuple[dict[Any, Any], int]:
+        """Endpoint for deleting a user."""
+        user = User.query.filter(User.id == user_id).first()
+        if not user:
+            return abort(404, "User not found.")
+
+        if not current_user.is_admin and current_user.id != user.id:
+            return abort(403, "You cannot delete this user.")
+
+        try:
+            status: Tuple[dict[Any, Any], int] = ({}, 204)
+            if current_user.is_admin:
+                db.session.execute(
+                    delete(Notification).where(Notification.user_id == user.id)
+                )
+                db.session.execute(delete(Comment).where(Comment.author_id == user.id))
+                db.session.execute(delete(Bundle).where(Bundle.author_id == user.id))
+                db.session.execute(
+                    delete(VulnerabilityDisclosure).where(
+                        VulnerabilityDisclosure.reporter_id == user.id
+                    )
+                )
+                db.session.delete(user)
+                status = ({}, 204)
+            else:
+                # A user can only deactivate themselves.
+                user.is_active = False
+                status = ({"message": "User deactivated."}, 200)
+
+            db.session.commit()
+            return status
+
+        except Exception:
+            db.session.rollback()
+            return abort(500, "Internal server error.")
+
+
+@user_ns.route("/")
+class UsersList(Resource):  # type: ignore[misc]
+    @typed(user_ns.doc("list_users"))
+    @typed(
+        user_ns.doc(
+            responses={200: "Success.", 403: "Admin permission required."},
+        )
+    )
+    @typed(user_ns.marshal_list_with(user_list_fields))
+    @typed(user_ns.expect(parser_get_users))
+    @typed(auth_func)
+    @typed(admin_permission.require(http_exception=403))
+    def get(self) -> Tuple[ResultType, int]:
+        """List all users. Only available to administrators."""
+        args = parser_get_users.parse_args()
+        page = args.pop("page", 1)  # 1-based page index
+        per_page = args.pop("per_page", 10)  # Number of records per page
+
+        # Enforce maximum per_page limit
+        if per_page not in [1, ..., 200]:
+            per_page = 10
+
+        # Calculate the offset based on page and per_page
+        offset = (page - 1) * per_page
+
+        result: ResultType = {
+            "data": [],
+            "metadata": {
+                "count": 0,  # Total number of records matching the filters
+                "page": page,  # Current page number
+                "per_page": per_page,  # Number of records per page
+            },
+        }
+
+        query = User.query
+
+        # Get total record count
+        total = query.count()
+
+        # Apply pagination
+        results = query.offset(offset).limit(per_page).all()
+
+        # Populate the result
+        result["data"] = results
+        result["metadata"]["count"] = total
+
+        return result, 200
+
+    @limiter.limit("3 per hour")  # limit to 3 registrations/hour per IP
+    @typed(user_ns.doc(description="Create a non-admin user."))
+    @typed(
+        user_ns.doc(
+            responses={
+                201: "Success.",
+                403: "Self-registration is disabled.",
+                422: "Email address not accepted (disposable email detected, blocked domain, or invalid domain).",
+                429: "Too many requests (maximum 3 registrations/hour per IP)",
+            }
+        )
+    )
+    @typed(user_ns.expect(parser))
+    @typed(user_ns.marshal_with(user_model))
+    def post(self) -> Tuple[Dict[Any, Any], int]:
+        if not application.config["SELF_REGISTRATION"]:
+            return abort(403, description="Self-registration is disabled.")
+
+        args = parser.parse_args(strict=True)  # reject unknown fields right away
+
+        try:
+            email_donain = args["email"].split("@")[1]
+        except Exception:
+            return abort(422, description="Invalid email address.")
+        if is_email_in_misp_disposable_list(email_donain):
+            return abort(422, description="Disposable email addresses are prohibited.")
+        if not is_email_in_allow_list(email_donain):
+            return abort(422, description="The email domain is not allowed.")
+        if is_email_in_block_list(email_donain):
+            return abort(422, description="The email domain is blocked.")
+        if not has_mx_record(email_donain):
+            return abort(422, description="Invalid email domain.")
+
+        try:
+            new_user = User(
+                login=args["login"],
+                name=args["name"],
+                organisation=args.get("organisation"),
+                email=args["email"],
+                pwdhash="",
+                is_admin=False,
+                is_reporter=False,
+                is_active=True,
+                is_confirmed=False,
+                last_seen=None,
+            )
+
+            db.session.add(new_user)
+            db.session.commit()
+
+        except AssertionError as e:
+            db.session.rollback()
+            return abort(400, f"{e}")
+        except exc.IntegrityError:
+            db.session.rollback()
+            return abort(400, "Impossible to create the user.")
+
+        # Send the confirmation email
+        try:
+            notifications.confirm_account(new_user)
+        except Exception as error:
+            logger.warning(f"Problem while sending activation email: {error}")
+
+        return new_user, 201

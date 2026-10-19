@@ -1,0 +1,192 @@
+import logging
+from typing import Any, Tuple
+
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+    fields,
+    reqparse,
+)
+
+from website.web.api.v1.common import metada_params_model
+from website.web.api.v1.types import ResultType
+from website.web.bootstrap import vulnerabilitylookup
+from website.web.filters.capec import render_description
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+cwe_ns = Namespace("cwe", description="CWE related operations.")
+
+# Argument Parsing
+parser = reqparse.RequestParser()
+parser.add_argument(
+    "vuln_id",
+    type=str,
+    help="ID of a vulnerability that references one or more CWE identifiers.",
+)
+parser.add_argument(
+    "page",
+    type=int,
+    default=1,
+    help="Number of the page.",
+)
+parser.add_argument(
+    "per_page",
+    type=int,
+    default=100,
+    help="Maximum number of elements to return.",
+)
+
+# Response marshalling
+related_weakness_model = cwe_ns.model(
+    "RelatedWeakness",
+    {
+        "@Nature": fields.String(
+            description="Nature of the relationship", required=True
+        ),
+        "@CWE_ID": fields.String(
+            description="CWE ID of the related weakness", required=True
+        ),
+        "@View_ID": fields.String(
+            description="View ID of the related weakness", required=True
+        ),
+        "@Ordinal": fields.String(
+            description="Ordinal of the relationship", required=True
+        ),
+    },
+)
+
+related_weaknesses_model = cwe_ns.model(
+    "RelatedWeaknesses",
+    {
+        "Related_Weakness": fields.List(
+            fields.Nested(related_weakness_model),
+            description="List of related weaknesses",
+        ),
+    },
+)
+
+mitigation_model = cwe_ns.model(
+    "Mitigation",
+    {
+        "@Mitigation_ID": fields.String(
+            description="Id of the mitigation", required=True
+        ),
+        "Description": fields.String(
+            description="Description of the mitigation", required=True
+        ),
+    },
+)
+
+potential_mitigations_model = cwe_ns.model(
+    "Mitigations",
+    {
+        "Mitigation": fields.List(
+            fields.Nested(mitigation_model),
+            description="List of potential mitigations",
+        ),
+    },
+)
+
+cwe_model = cwe_ns.model(
+    "CWE",
+    {
+        "@ID": fields.String(description="CWE ID", required=True),
+        "@Name": fields.String(description="Name of the CWE", required=True),
+        "@Abstraction": fields.String(
+            description="Abstraction of the CWE", required=True
+        ),
+        "@Structure": fields.String(description="Structure of the CWE", required=True),
+        "@Status": fields.String(description="Status of the CWE", required=True),
+        "Description": fields.String(
+            description="Description of the CWE", required=True
+        ),
+        "Related_Weaknesses": fields.Nested(
+            related_weaknesses_model, description="Related weaknesses"
+        ),
+        "Potential_Mitigations": fields.Nested(
+            potential_mitigations_model, description="Potential mitigations"
+        ),
+    },
+)
+
+
+metadata = cwe_ns.model("metadata", metada_params_model)
+
+cwe_list_fields = cwe_ns.model(
+    "CWEsList",
+    {
+        "metadata": fields.Nested(
+            metadata, description="Metada related to the result."
+        ),
+        "data": fields.List(
+            fields.Nested(cwe_model, skip_none=True), description="List of CWEs."
+        ),
+    },
+)
+
+
+@cwe_ns.route("/")
+class CWEList(Resource):  # type: ignore[misc]
+    @typed(cwe_ns.doc("list_cwes"))
+    @typed(cwe_ns.expect(parser))
+    @typed(cwe_ns.marshal_list_with(cwe_list_fields))
+    def get(self) -> Tuple[ResultType, int]:
+        """List all CWEs."""
+        args = parser.parse_args()
+        page = args.pop("page", 1)  # 1-based page index
+        per_page = args.pop("per_page", 1000)  # Number of records per page
+
+        # Enforce maximum per_page limit
+        if per_page not in [1, ..., 1000]:
+            per_page = 1000
+
+        result: ResultType = {
+            "data": [],
+            "metadata": {
+                "count": 0,
+                "page": page,
+                "per_page": per_page,
+            },
+        }
+
+        if vuln_id := args.get("vuln_id"):
+            cwes = vulnerabilitylookup.get_cwes_by_vulnerability(vuln_id)
+            print(vuln_id)
+            result["data"] = [vulnerabilitylookup.get_cwe(cwe_id) for cwe_id in cwes]
+            result["metadata"]["count"] = len(cwes)
+        else:
+            result["data"] = vulnerabilitylookup.list_cwe(per_page, page)
+            result["metadata"]["count"] = vulnerabilitylookup.nb_cwe()
+
+        for elem in result["data"]:
+            mitigations = elem.get("Potential_Mitigations", {}).get("Mitigation", [])
+
+            # Normalize to list of dicts
+            if isinstance(mitigations, dict):
+                mitigations = [mitigations]
+            elif isinstance(mitigations, str):
+                mitigations = [{"Description": mitigations}]
+            elif not isinstance(mitigations, list):
+                mitigations = []
+
+            for potential_mitigation in mitigations:
+                description = potential_mitigation.get("Description")
+                if description:
+                    potential_mitigation["Description"] = render_description(
+                        description
+                    )
+
+        return result, 200
+
+
+@cwe_ns.route("/<string:cwe_id>")
+class CWEItem(Resource):  # type: ignore[misc]
+    @typed(cwe_ns.doc(description="Get detailed information about a CWE."))
+    def get(self, cwe_id: str) -> dict[str, Any] | None:
+        """Get detailed information about a CWE."""
+        _cwe_id = cwe_id.lower()
+        _cwe_id = _cwe_id if _cwe_id.startswith("cwe-") else f"cwe-{_cwe_id}"
+        return vulnerabilitylookup.get_cwe(_cwe_id)

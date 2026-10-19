@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+
+
+import logging
+import os
+from typing import Any, Dict
+
+from flask import Flask
+from flask_bootstrap import Bootstrap5  # type: ignore[import-untyped]
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_migrate import Migrate  # type: ignore[import-untyped]
+from flask_sqlalchemy import SQLAlchemy
+from flask_wtf.csrf import CSRFProtect  # type: ignore[import-untyped]
+from werkzeug.middleware.proxy_fix import ProxyFix
+
+import website.web.filters as jinja_filters
+from vulnerabilitylookup.default import get_config
+from vulnerabilitylookup.vulnerabilitylookup import VulnerabilityLookup
+from website import BASE_DIR
+from website.lib.gcve_utils import load_local_gcve_references
+from website.web.helpers import get_secret_key, get_security_password_salt, sri_load
+
+
+def set_logging(
+    log_path: str = "",
+    log_level: int = logging.INFO,
+    modules: list[str] = [],
+    log_format: str = "%(asctime)s %(name)s %(levelname)s %(message)s",
+) -> None:
+    if not modules:
+        modules = ["root", "website"]
+    if log_path:
+        handler: logging.Handler = logging.FileHandler(log_path)
+    else:
+        handler = logging.StreamHandler()
+    formater = logging.Formatter(log_format)
+    handler.setFormatter(formater)
+    for logger_name in modules:
+        logger = logging.getLogger(logger_name)
+        logger.addHandler(handler)
+        for handler in logger.handlers:
+            handler.setLevel(log_level)
+        logger.setLevel(log_level)
+
+
+application: Flask = Flask(__name__)
+application.wsgi_app = ProxyFix(application.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)  # type: ignore
+
+# Loads the appropriate configuration
+TESTING = os.environ.get("TESTING", "")
+if TESTING == "gh_action":
+    # Testing on GitHub Actions
+    application.config.from_pyfile(
+        os.path.join(BASE_DIR, "config", "website.py"), silent=False
+    )
+    application.config["SQLALCHEMY_DATABASE_URI"] = (
+        "postgresql+psycopg://postgres:password@localhost:5432/vulnlookuptest"
+    )
+elif TESTING.endswith(".py"):
+    # Testing on a local machine with configuration from a Python config file.
+    # if you launch the tests with pytest the environment variable 'TESTING' is already
+    # set in pyproject.toml (tool.pytest.ini_options) to `website_test.py`.
+    # so you can create a file config/website_test.py with your database configuration
+    application.config.from_pyfile(
+        os.path.join(BASE_DIR, "config", TESTING), silent=False
+    )
+    set_logging(
+        application.config["LOG_PATH"], log_level=application.config["LOG_LEVEL"]
+    )
+else:
+    # The production configuration file
+    application.config.from_pyfile(
+        os.path.join(BASE_DIR, "config", "website.py"), silent=False
+    )
+    set_logging(
+        application.config["LOG_PATH"], log_level=application.config["LOG_LEVEL"]
+    )
+
+application.config["SECRET_KEY"] = get_secret_key()
+application.config["SECURITY_PASSWORD_SALT"] = get_security_password_salt()
+application.config["PUBLIC_DOMAIN"] = get_config("generic", "public_domain")
+
+if "WEB_MODULES" not in application.config:
+    application.config["WEB_MODULES"] = {}
+
+# Creates the upload folders (for logos of projects and organizations) if it does not exist
+if not application.config.get("UPLOAD_FOLDER", False):
+    application.config["UPLOAD_FOLDER"] = "./website/web/public/pictures/"
+os.makedirs(application.config["UPLOAD_FOLDER"], exist_ok=True)
+
+if application.config.get("DEBUG", False):
+    application.debug = True
+
+Bootstrap5(application)
+
+# Database and migration
+db = SQLAlchemy(application)
+migrate = Migrate(application, db, directory="website/migrations")
+
+# Enable CSRF protection globally
+csrf = CSRFProtect(application)
+
+
+vulnerabilitylookup: VulnerabilityLookup = VulnerabilityLookup()  # type: ignore[unused-ignore]
+# inject vulnerabilitylookup in filters.py (to avoid a circular import issue)
+jinja_filters.init_filters(vulnerabilitylookup)
+
+
+# Rate limiting for flask applications
+limiter = Limiter(
+    key_func=get_remote_address,  # identifies the client by IP
+    app=application,
+    storage_uri=f"redis://{get_config('generic', 'storage_db_hostname')}:{get_config('generic', 'storage_db_port')}",
+    storage_options={"socket_connect_timeout": 30},
+    strategy="fixed-window",
+)
+
+# ##### Load GCVE references into the application config
+
+application.config["GCVE_REFERENCES"] = load_local_gcve_references()
+
+
+# ##### Global methods passed to Jinja
+
+
+# Remove the old listener (if it exists) and re-register it
+def get_sri(directory: str, filename: str) -> str:
+    sha512 = sri_load()[directory][filename]
+    return f"sha512-{sha512}"
+
+
+application.jinja_env.globals.update(get_sri=get_sri)
+
+
+# ##### Context processor for KEV catalogs
+@application.context_processor
+def inject_kev_catalogs() -> Dict[str, Any]:
+    """Inject KEV catalog list into all templates."""
+    gcve_references = application.config.get("GCVE_REFERENCES", {})
+    kev_catalogs_list = gcve_references.get("kev", [])
+
+    # Get local instance info
+    local_instance_uuid = get_config("generic", "local_instance_uuid")
+    local_instance_name = get_config("generic", "local_instance_name")
+
+    # Check if local instance is already in the GCVE KEV catalogs list
+    local_in_gcve = False
+    catalogs: list[dict[str, Any]] = []
+
+    for catalog in kev_catalogs_list:
+        if catalog["uuid"] == local_instance_uuid:
+            # Local instance found in GCVE list - mark it as local and add first
+            catalogs.insert(
+                0,
+                {
+                    "uuid": None,  # None means local catalog (no catalog_uuid param)
+                    "short_name": catalog["short_name"],
+                    "is_local": True,
+                },
+            )
+            local_in_gcve = True
+        else:
+            # External catalog
+            catalogs.append(
+                {
+                    "uuid": catalog["uuid"],
+                    "short_name": catalog["short_name"],
+                    "is_local": False,
+                }
+            )
+
+    # If local instance not in GCVE list, add it as the first entry
+    if not local_in_gcve:
+        catalogs.insert(
+            0,
+            {
+                "uuid": None,  # None means local catalog (no catalog_uuid param)
+                "short_name": local_instance_name,
+                "is_local": True,
+            },
+        )
+
+    return {"kev_catalogs_menu": catalogs}
+
+
+# ##### Jinja custom filters
+application.jinja_env.filters["str_to_obj"] = jinja_filters.str_to_obj
+application.jinja_env.filters["datetimeformat"] = jinja_filters.datetimeformat
+application.jinja_env.filters["string_to_datetime"] = jinja_filters.string_to_datetime
+application.jinja_env.filters["markdown"] = jinja_filters.to_markdown
+application.jinja_env.filters["hash"] = jinja_filters.hash
+application.jinja_env.filters["update_query"] = jinja_filters.update_query_params
+application.jinja_env.filters["is_url"] = jinja_filters.is_url
+application.jinja_env.filters["cve_to_gcve"] = jinja_filters.cve_to_gcve
+application.jinja_env.filters["tag_badges"] = jinja_filters.render_tag_badges
+application.jinja_env.filters["sanitize_html"] = jinja_filters.sanitize_html
+
+application.jinja_env.filters["get_capec"] = jinja_filters.capec.get_capec
+application.jinja_env.filters["render_description"] = (
+    jinja_filters.capec.render_description
+)
+
+application.jinja_env.filters["cvss_base_score"] = jinja_filters.cvev5.cvss_base_score
+application.jinja_env.filters["cvss_severity"] = jinja_filters.cvev5.cvss_severity
+application.jinja_env.filters["cvss_list"] = jinja_filters.cvev5.extract_cvss_metrics
+application.jinja_env.filters["extract_cwe_list"] = jinja_filters.cvev5.extract_cwe_list
+application.jinja_env.filters["extract_impacted_products"] = (
+    jinja_filters.cvev5.extract_impacted_products
+)
+application.jinja_env.filters["extract_references"] = (
+    jinja_filters.cvev5.extract_references
+)
+application.jinja_env.filters["cvss_clean_vector"] = (
+    jinja_filters.cvev5.cvss_clean_vector
+)
+application.jinja_env.filters["extract_credits"] = jinja_filters.cvev5.extract_credits
+
+
+application.jinja_env.filters["extract_credits_ossf"] = (
+    jinja_filters.ossf.extract_credits
+)

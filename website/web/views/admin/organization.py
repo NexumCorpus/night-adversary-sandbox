@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+import os
+from uuid import UUID
+
+from flask import (
+    Blueprint,
+    abort,
+    flash,
+    make_response,
+    redirect,
+    render_template,
+    request,
+    url_for,
+)
+from flask_login import (  # type: ignore[import-untyped]
+    current_user,
+    login_required,
+)
+from flask_paginate import (  # type: ignore[import-untyped]
+    Pagination,
+    get_page_args,
+    get_parameter,
+)
+from markupsafe import Markup, escape
+from sqlalchemy import or_
+from werkzeug import Response as WerkzeugResponse
+
+from website.lib.utils import escape_ilike
+from website.models import (
+    CPEVendor,
+    Icon,
+    Organization,
+    User,
+)
+from website.web.bootstrap import application, db
+from website.web.forms import (
+    OrganizationCPEVendorForm,
+    OrganizationForm,
+)
+from website.web.permissions import admin_permission
+
+admin_organization_bp = Blueprint(
+    "admin_organization_bp", __name__, url_prefix="/admin/organization"
+)
+admin_organizations_bp = Blueprint(
+    "admin_organizations_bp", __name__, url_prefix="/admin/organizations"
+)
+
+
+@admin_organizations_bp.route("/", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def list_organizations() -> str:
+    """List the organizations registered to the platform (including the GNAs)."""
+    organization_query = request.args.get("query", "")
+    only_gna = request.args.get("only_gna", False)
+
+    organizations = Organization.query
+    if organization_query:
+        escaped_query = escape_ilike(organization_query)
+        try:
+            uuid_obj = UUID(organization_query)
+        except Exception:
+            uuid_obj = None
+        if uuid_obj:
+            organizations = organizations.filter(
+                or_(
+                    Organization.uuid == uuid_obj,
+                    Organization.name.ilike(f"%{escaped_query}%", escape="\\"),
+                    Organization.organization_type == organization_query,
+                )
+            )
+        else:
+            organizations = organizations.filter(
+                or_(
+                    Organization.organization_type == organization_query,
+                    Organization.name.ilike(f"%{escaped_query}%", escape="\\"),
+                    Organization.short_name.ilike(f"%{escaped_query}%", escape="\\"),
+                )
+            )
+    if only_gna:
+        organizations = organizations.filter(Organization.gna_id != None)  # noqa: E711
+
+    organizations = organizations.order_by(Organization.creation_timestamp.desc())
+
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=organizations.count(),
+        record_name="organizations",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    organizations = organizations.offset(offset).limit(per_page)
+
+    return render_template(
+        "admin/organizations.html",
+        organizations=organizations,
+        pagination=pagination,
+    )
+
+
+@admin_organization_bp.route("/create", methods=["GET"])
+@admin_organization_bp.route("/edit/<int:organization_id>", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def form_organization(organization_id: int = 0) -> str:
+    """Return a form to create and edit a user."""
+    action = "Add an organization"
+    head_titles = [action]
+    form = OrganizationForm()
+    if not organization_id:
+        return render_template(
+            "admin/edit_organization.html",
+            action=action,
+            head_titles=head_titles,
+            form=form,
+        )
+
+    organization = Organization.query.filter(Organization.id == organization_id).first()
+    form = OrganizationForm(obj=organization)
+    form.members.data = [user.id for user in organization.members]
+    if organization.gna_id is None:
+        form.gna_id.data = -1
+    action = "Edit an organization"
+    head_titles = [action]
+    head_titles.append(organization.name)
+    return render_template(
+        "admin/edit_organization.html",
+        action=action,
+        head_titles=head_titles,
+        form=form,
+        organization=organization,
+    )
+
+
+@admin_organization_bp.route("/create", methods=["POST"])
+@admin_organization_bp.route("/edit/<int:organization_id>", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def process_organization_form(organization_id: int = 0) -> str | WerkzeugResponse:
+    """Edit an organization."""
+    form = OrganizationForm()
+
+    if not form.validate():
+        return render_template("admin/edit_organization.html", form=form)
+
+    # Edit an existing organization
+    if organization_id:
+        organization = Organization.query.filter(
+            Organization.id == organization_id
+        ).first()
+
+        # Logo
+        f = form.logo.data
+        if f:
+            try:
+                # Delete the previous icon
+                old_icon = Icon.query.filter(Icon.id == organization.icon_id).first()
+                icon_url = os.path.join(
+                    application.config["UPLOAD_FOLDER"], old_icon.url
+                )
+                os.unlink(icon_url)
+                db.session.delete(old_icon)
+                organization.icon_url = None
+                db.session.commit()
+            except Exception as e:
+                print(e)
+
+            # Save the new icon
+            filename = f"{organization.uuid}.png"
+            icon_url = os.path.join(application.config["UPLOAD_FOLDER"], filename)
+            f.save(icon_url)
+            # Create the corresponding new icon object
+            new_icon = Icon(url=filename)
+            db.session.add(new_icon)
+            db.session.commit()
+            organization.icon_id = new_icon.id
+
+        # Members
+        new_members = []
+        for user_id in form.members.data:
+            user = User.query.filter(User.id == user_id).first()
+            new_members.append(user)
+        organization.members = new_members
+        del form.members
+        form.populate_obj(organization)
+        organization.gna_id = form.gna_id.data if form.gna_id.data != -1 else None
+        db.session.commit()
+        flash(f"Organization {form.name.data} successfully updated.", "success")
+        return redirect(
+            url_for(
+                "admin_organization_bp.form_organization",
+                organization_id=organization.id,
+            )
+        )
+
+    # Create a new organization
+    new_organization = Organization(
+        name=form.name.data,
+        short_name=form.short_name.data,
+        description=form.description.data,
+        short_description=form.short_description.data,
+        website=form.website.data,
+        gna_id=form.gna_id.data if form.gna_id.data != -1 else None,
+        email=form.email.data,
+        organization_type=form.organization_type.data,
+        is_membership_restricted=form.is_membership_restricted.data,
+        owner_id=current_user.id,
+    )
+    # Members
+    new_members = []
+    for user_id in form.members.data:
+        user = User.query.filter(User.id == user_id).first()
+        new_members.append(user)
+    new_organization.members = new_members
+    del form.members
+
+    db.session.add(new_organization)
+    db.session.commit()
+
+    # Icon
+    f = form.logo.data
+    if f:
+        filename = f"{new_organization.uuid}.png"
+        icon_url = os.path.join(application.config["UPLOAD_FOLDER"], filename)
+        f.save(icon_url)
+        # Create the corresponding new icon object
+        new_icon = Icon(url=filename)
+        db.session.add(new_icon)
+        db.session.commit()
+        new_organization.icon_id = new_icon.id
+
+    flash(
+        f"Organization {new_organization.name} successfully created.",
+        "success",
+    )
+
+    return redirect(
+        url_for(
+            "admin_organization_bp.form_organization",
+            organization_id=new_organization.id,
+        )
+    )
+
+
+@admin_organization_bp.route("/<int:organization_id>/delete", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def delete_organization(organization_id: int = 0) -> WerkzeugResponse:
+    """Allow administrators to delete an organization."""
+    organization = Organization.query.filter(Organization.id == organization_id).first()
+    if organization is None:
+        abort(404)
+    CPEVendor.query.filter(CPEVendor.organization_id == organization.id).delete()
+    db.session.commit()
+    db.session.delete(organization)
+    db.session.commit()
+    flash("Organization deleted.", "success")
+    return redirect(url_for("admin_organizations_bp.list_organizations"))
+
+
+@admin_organization_bp.route("/<int:organization_id>/cpe_vendor", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def form_organization_cpe_vendor(organization_id: int) -> str:
+    organization = Organization.query.filter(Organization.id == organization_id).first()
+    if not organization:
+        abort(404)
+
+    form = OrganizationCPEVendorForm()
+
+    action = f"Manage CPE vendor names for {organization.name}"
+    head_titles = [action]
+
+    return render_template(
+        "admin/edit_organization_cpe_vendor.html",
+        action=action,
+        head_titles=head_titles,
+        form=form,
+        organization=organization,
+    )
+
+
+@admin_organization_bp.route("/<int:organization_id>/cpe_vendor", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def process_form_organization_cpe_vendor(
+    organization_id: int,
+) -> str | WerkzeugResponse:
+    organization = Organization.query.filter(Organization.id == organization_id).first()
+    if not organization:
+        abort(404)
+
+    form = OrganizationCPEVendorForm()
+
+    if not form.validate():
+        return render_template("admin/edit_organization_cpe_vendor.html", form=form)
+
+    if cpe_vendor := CPEVendor.query.filter(CPEVendor.name == form.name.data).first():
+        url = url_for(
+            "admin_organization_bp.form_organization_cpe_vendor",
+            organization_id=cpe_vendor.organization_id,
+        )
+
+        flash(
+            Markup(
+                f"CPE Vendor Name already defined for "
+                f"<a href='{escape(url)}'>{escape(cpe_vendor.vendor.name)}</a>."
+            ),
+            "danger",
+        )
+
+        return redirect(
+            url_for(
+                "admin_organization_bp.form_organization_cpe_vendor",
+                organization_id=organization_id,
+            )
+        )
+
+    try:
+        new_vendor_name = CPEVendor(
+            name=form.name.data, organization_id=organization_id
+        )
+
+        db.session.add(new_vendor_name)
+        db.session.commit()
+
+        flash("CPE vendor name created.", "success")
+    except ValueError:
+        flash("Invalid name.", "danger")
+
+    return redirect(
+        url_for(
+            "admin_organization_bp.form_organization_cpe_vendor",
+            organization_id=organization_id,
+        )
+    )
+
+
+@admin_organization_bp.route(
+    "/<int:organization_id>/cpe_vendor/<int:cpe_vendor_name_id>/delete",
+    methods=["POST"],
+)
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def delete_cpe_vendor(
+    organization_id: int, cpe_vendor_name_id: int
+) -> WerkzeugResponse:
+    """Allow administrators to delete a CPE vendor name."""
+    organization = Organization.query.filter(Organization.id == organization_id).first()
+    if organization is None:
+        abort(404)
+    cpe_vendor_name = CPEVendor.query.filter(CPEVendor.id == cpe_vendor_name_id).first()
+    if cpe_vendor_name is None:
+        abort(404)
+    db.session.delete(cpe_vendor_name)
+    db.session.commit()
+    flash("CPE vendor name deleted.", "success")
+    return redirect(
+        url_for(
+            "admin_organization_bp.form_organization_cpe_vendor",
+            organization_id=organization_id,
+        )
+    )
+
+
+@admin_organization_bp.route(
+    "/<uuid:organization_uuid>/export_cpe_information",
+    methods=["GET"],
+)
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def export_cpe_information(organization_uuid: str) -> WerkzeugResponse:
+    """Export CPE information for the organization."""
+    organization = Organization.query.filter(
+        Organization.uuid == organization_uuid
+    ).first()
+    if organization is None:
+        abort(404)
+
+    # Create a response with the raw JSON data
+    response = make_response(organization.to_dict())
+
+    # Set headers for file download and proper content type
+    response.headers["Content-Disposition"] = (
+        f"attachment; filename={organization.uuid}.json"
+    )
+    response.headers["Content-Type"] = "application/json"
+
+    return response

@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import os
+import time
+from pathlib import Path
+from subprocess import Popen
+
+from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+
+from vulnerabilitylookup.default import get_homedir, get_socket_path, get_config, get_postgres_info, \
+    VulnerabilityLookupException, tcp_cache_connect, is_running_in_docker
+
+
+def check_running(name: str) -> bool:
+    if name == "storage":
+        r = Redis(get_config('generic', 'storage_db_hostname'), get_config('generic', 'storage_db_port'))
+    else:
+        try:
+            tcp_cache_connect()
+            return True
+        except RedisConnectionError as e:
+            print(f'Unable to connect to redis via TCP during startup: {e}')
+            print('Trying to connect via socket')
+
+        socket_path = get_socket_path(name)
+        if not os.path.exists(socket_path):
+            return False
+        r = Redis(unix_socket_path=socket_path)
+    try:
+        if bool(r.ping()):
+            print('Connection via socket successfull.')
+            return True
+        return False
+    except RedisConnectionError as e:
+        print(f'Unable to connect to redis: {e}')
+        return False
+
+
+def launch_cache(storage_directory: Path | None=None) -> None:
+    if not storage_directory:
+        storage_directory = get_homedir()
+    if not check_running('cache'):
+        process = Popen(["./run_redis.sh"], cwd=storage_directory / 'cache')
+        try:
+            # Give time for the process to start (and potentially fail)
+            process.wait(timeout=5)
+        except TimeoutError:
+            pass
+        process.poll()
+        if process.returncode == 1:
+            raise VulnerabilityLookupException('Failed to start Redis cache database.')
+
+
+def shutdown_cache() -> None:
+    try:
+        tcp_cache_connect()
+    except RedisConnectionError:
+        pass
+
+    r = Redis(unix_socket_path=get_socket_path('cache'))
+    r.shutdown(save=True)
+    print('Redis cache database shutdown.')
+
+
+def launch_storage(storage_directory: Path | None=None) -> None:
+    if not storage_directory:
+        storage_directory = get_homedir()
+    if not check_running('storage'):
+        Popen(["./run_kvrocks.sh"], cwd=storage_directory / 'storage')
+
+
+def shutdown_storage() -> None:
+    redis = Redis(get_config('generic', 'storage_db_hostname'), get_config('generic', 'storage_db_port'))
+    redis.shutdown()
+    print('Kvrocks storage database shutdown.')
+
+
+def launch_migratons() -> None:
+    p = get_postgres_info()
+    if 'error' in p or any(not p[table] for table in p):
+        commands = [
+            ["db_init"],
+            ["db", "stamp", "head"],
+            ["import_osi_approved_licenses"],
+            ["import_languages"]
+        ]
+        for command in commands:
+            try:
+                command = ["poetry", "run", "flask", "--app", "website.app"] + command
+                process = Popen(command)
+                process.wait(timeout=5)
+                if process.returncode != 0:
+                    raise Exception(f"Command {command} failed with return code {process.returncode}")
+                process.poll()
+                if process.returncode == 1:
+                    raise VulnerabilityLookupException(f'Failed to run command {command}.')
+            except TimeoutError:
+                pass
+            except Exception as e:
+                print(f"Error running command {command}: {e}")
+    else:
+        print("Database already initialized, skipping migrations.")
+
+
+def launch_all() -> None:
+    launch_cache()
+    launch_storage()
+    if is_running_in_docker():
+        launch_migratons()
+
+
+def check_all(stop: bool=False) -> None:
+    backends: dict[str, bool] = {'cache': False, 'storage': False}
+    while True:
+        for db_name in backends:
+            try:
+                backends[db_name] = check_running(db_name)
+            except Exception:
+                backends[db_name] = False
+        if stop:
+            if not any(running for running in backends.values()):
+                break
+        else:
+            if all(running for running in backends.values()):
+                break
+        for db_name, running in backends.items():
+            if not stop and not running:
+                print(f"Waiting on {db_name} to start")
+            if stop and running:
+                print(f"Waiting on {db_name} to stop")
+        time.sleep(1)
+
+
+def stop_all() -> None:
+    shutdown_cache()
+    shutdown_storage()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Manage backend DBs.')
+    parser.add_argument("--start", action='store_true', default=False, help="Start all")
+    parser.add_argument("--stop", action='store_true', default=False, help="Stop all")
+    parser.add_argument("--status", action='store_true', default=True, help="Show status")
+    args = parser.parse_args()
+
+    if args.start:
+        launch_all()
+    if args.stop:
+        stop_all()
+    if not args.stop and args.status:
+        check_all()
+
+
+if __name__ == '__main__':
+    main()

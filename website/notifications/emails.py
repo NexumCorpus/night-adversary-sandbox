@@ -1,0 +1,126 @@
+#! /usr/bin/env python3
+
+import logging
+import os
+import smtplib
+from datetime import datetime, timezone
+from email.mime.application import MIMEApplication
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Any
+
+from website.lib.utils import async_maker
+from website.web.bootstrap import application
+
+logger = logging.getLogger(__name__)
+
+
+def send(*args: str, **kwargs: Any) -> None:
+    """
+    This functions enables to send an email (via different method).
+    """
+    if application.debug:
+        kwargs.pop("x_category")
+        write_email(**kwargs)
+    else:
+        send_smtp_async(**kwargs)
+
+
+def write_email(
+    to: str = "",
+    subject: str = "",
+    plaintext: str = "",
+    html: str = "",
+    csv_attachments: dict[str, str] = {},
+) -> None:
+    """Write the content of an email to the disk. If HTML part is available write this part, else the plain text part."""
+    filename = "sent-emails/{}.{}".format(
+        datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f"),
+        "html" if html else "txt",
+    )
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    if html:
+        content = html
+    else:
+        content = plaintext
+    with open(filename, "w") as f:
+        f.write(content)
+
+
+@async_maker
+def send_smtp_async(*args: str, **kwargs: Any) -> None:
+    """Wraps send_smtp in an async function to send an email."""
+    send_smtp(**kwargs)
+
+
+def send_smtp(
+    to: str = "",
+    subject: str = "",
+    plaintext: str = "",
+    html: str = "",
+    csv_attachments: dict[str, str] = {},
+    x_category: str = "",
+) -> None:
+    """
+    Send an email with optional HTML content and an optional CSV attachment.
+    """
+    # Create a multipart message
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = application.config["MAIL_DEFAULT_SENDER"]
+    msg["To"] = to
+    msg["X-Mailer"] = "Vulnerability-Lookup"
+    if x_category:
+        msg["X-Category"] = x_category
+
+    # Add plaintext part
+    if plaintext:
+        msg.attach(MIMEText(plaintext, "plain", "utf-8"))
+
+    # Add HTML part if provided
+    if html:
+        msg.attach(MIMEText(html, "html", "utf-8"))
+
+    # Add CSV attachment if provided
+    for attachment, csv in csv_attachments.items():
+        csv_attachment = MIMEApplication(csv.encode("utf-8"), _subtype="csv")
+        csv_attachment.add_header(
+            "Content-Disposition", "attachment", filename=f"{attachment}.csv"
+        )
+        msg.attach(csv_attachment)
+
+    try:
+        s = smtplib.SMTP(application.config["MAIL_SERVER"])
+        if application.config.get("MAIL_USERNAME"):
+            s.login(
+                application.config["MAIL_USERNAME"], application.config["MAIL_PASSWORD"]
+            )
+    except ConnectionRefusedError as e:
+        logger.error(f"Problem when sending email: {e}")
+    except Exception:
+        logger.exception("send_smtp raised:")
+    else:
+        try:
+            s.sendmail(
+                application.config["MAIL_DEFAULT_SENDER"],
+                msg["To"],
+                msg.as_string(),
+            )
+            s.quit()
+        except Exception:
+            logger.exception("Error sending email:")
+
+
+def check_smtp_connection(use_tls: bool = False) -> bool:
+    try:
+        if use_tls:
+            with smtplib.SMTP(application.config["MAIL_SERVER"]) as smtp:
+                smtp.starttls()
+                smtp.noop()  # Simple command to verify the connection
+        else:
+            with smtplib.SMTP(application.config["MAIL_SERVER"]) as smtp:
+                smtp.noop()
+        return True
+    except (smtplib.SMTPException, ConnectionRefusedError, TimeoutError) as e:
+        print(f"SMTP connection failed: {e}")
+        return False

@@ -1,0 +1,146 @@
+{% extends "main.html" %}
+{% block head %}
+  {{ super() }}
+  <script src="{{ url_for('static', filename='js/pretty-print-json.min.js') }}"></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/pretty-print-json.css') }}">
+{% endblock %}
+{% block title %}Comment - {{ comment.title }}{% endblock %}
+{% block content %}
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <div>
+      <h4 class="card-title mb-0">
+        <a href="{{ url_for('comment_bp.get', comment_uuid=comment.uuid) }}">
+          {{ comment.title | safe }}
+        </a>
+      </h4>
+      <small class="text-body-secondary">
+        Created on {{ comment.creation_timestamp | datetimeformat }},
+        updated on {{ comment.timestamp | datetimeformat }},
+        by <a href="{{ url_for('user_bp.profile', login=comment.author.login) }}">{{ comment.author.name }}</a>
+      </small>
+    </div>
+
+    <div class="btn-group" role="group">
+      <a class="btn btn-sm btn-outline-secondary"
+         href="{{ url_for('apiv1.comment_comment_item', comment_uuid=comment.uuid) }}"
+         download title="Download JSON">
+         JSON
+      </a>
+      <a class="btn btn-sm btn-primary"
+         href="{{ url_for('home_bp.vulnerability_view', vulnerability_id=comment.vulnerability) }}"
+         title="View associated vulnerability">
+         {{ comment.vulnerability | upper }}
+      </a>
+      <button class="btn btn-sm btn-outline-secondary dropdown-toggle"
+              id="btnGroupDropShare"
+              data-bs-toggle="dropdown"
+              aria-expanded="false"
+              title="Share">
+        {{ render_icon('share') }}
+      </button>
+      <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="btnGroupDropShare">
+        <li><a class="dropdown-item" href="https://news.ycombinator.com/submitlink?u=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('comment_bp.get', comment_uuid=comment.uuid) }}&t={{ comment.title }}" target="_blank">Hacker News</a></li>
+        <li><a class="dropdown-item" href="https://www.linkedin.com/shareArticle?mini=true&url=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('comment_bp.get', comment_uuid=comment.uuid) }}&title={{ comment.title }}" target="_blank">LinkedIn</a></li>
+        <li><a class="dropdown-item" href="https://mastodonshare.com/?text={{ comment.title }}&url=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('comment_bp.get', comment_uuid=comment.uuid) }}" target="_blank">Mastodon</a></li>
+        <li><a class="dropdown-item" href="https://www.newspipe.org/bookmark/bookmarklet?href=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('comment_bp.get', comment_uuid=comment.uuid) }}&title={{ comment.title }}" target="_blank">Newspipe</a></li>
+        <li><a class="dropdown-item" href="https://api.pinboard.in/v1/posts/add?url=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('comment_bp.get', comment_uuid=comment.uuid) }}&description=%27{{ comment.title }}%27" target="_blank">Pinboard</a></li>
+        <li><a class="dropdown-item" href="https://reddit.com/submit?url=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('comment_bp.get', comment_uuid=comment.uuid) }}&title={{ comment.title }}" target="_blank">Reddit</a></li>
+      </ul>
+      <a class="btn btn-sm btn-outline-secondary" title="Copy permalink" onclick="copyCurrentPageURL()">
+        {{ render_icon('clipboard') }}
+      </a>
+      {% if current_user.is_authenticated %}
+        <a class="btn btn-sm btn-outline-secondary" title="Edit comment" href="{{ url_for('comment_bp.form', comment_uuid=comment.uuid) }}">
+          {{ render_icon('pen') }}
+        </a>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card-body">
+    {% if comment.meta %}
+      {% set all_refs = [] %}
+      {% for elem in comment.meta %}
+        {% set refs = elem.get('ref') or elem.get('references') or elem.get('resources') %}
+        {% if refs %}
+          {% for url in refs %}
+            {% if url and url not in all_refs %}
+              {% set _ = all_refs.append(url) %}
+            {% endif %}
+          {% endfor %}
+        {% endif %}
+      {% endfor %}
+      {% if all_refs %}
+        <div class="alert alert-info mb-3" role="alert">
+          <h6 class="alert-heading mb-2">
+            {{ render_icon('link') }} References
+          </h6>
+          <ul class="mb-0">
+            {% for url in all_refs %}
+              <li><a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ url }}</a></li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+      {% for elem in comment.meta if 'tags' in elem %}
+        <div class="mb-2">
+          {% for tag in elem['tags'] %}
+            <span class="badge bg-primary">
+              <a class="link-light text-decoration-none"
+                 href="{{ url_for('comments_bp.list_comments') }}?meta={{ ('[{\"tags\": [\"' ~ tag ~ '\"]}]') | urlencode }}">
+                {{ tag }}
+              </a>
+            </span>
+          {% endfor %}
+        </div>
+      {% endfor %}
+    {% endif %}
+
+    <div id="markdown-description" class="markdown-description">
+      {{ description | safe }}
+    </div>
+
+    {% if comment.related_vulnerabilities %}
+      <hr>
+      <h5>Related vulnerabilities</h5>
+      <ul class="list-group list-group-flush">
+        {% for vuln in comment.related_vulnerabilities %}
+          <li class="list-group-item">
+            <a href="{{ url_for('home_bp.vulnerability_view', vulnerability_id=vuln) }}">{{ vuln }}</a>
+          </li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+
+    {% if comment.meta %}
+      <hr>
+      <h5>Meta</h5>
+      <pre id="jsoncontainer" class="bg-light p-2 rounded border">{{ comment.meta | tojson(indent=2) }}</pre>
+    {% endif %}
+  </div>
+</div>
+
+<script>
+  document.addEventListener("DOMContentLoaded", function() {
+    const jsonContainer = document.getElementById("jsoncontainer");
+    if (jsonContainer) {
+      const obj = JSON.parse(jsonContainer.innerText);
+      jsonContainer.innerHTML = prettyPrintJson.toHtml(obj, { quoteKeys: true });
+    }
+
+    const desc = document.getElementById("markdown-description");
+    if (desc) {
+      desc.innerHTML = linkifySecurityIdentifiers(desc.innerHTML);
+      formatMarkdownOutput();
+    }
+  });
+
+  function copyCurrentPageURL() {
+    navigator.clipboard.writeText(window.location.href)
+      .then(() => showToast("Success", "The comment permalink has been copied to your clipboard."))
+      .catch(err => console.error("Failed to copy:", err));
+  }
+</script>
+{% endblock %}

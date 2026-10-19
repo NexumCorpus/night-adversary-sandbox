@@ -1,0 +1,111 @@
+import json
+import re
+import uuid
+from typing import Any
+
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import validates
+
+from website.web.bootstrap import db
+from website.lib.sanitizers import sanitize_text
+
+
+vulnerability_patterns = re.compile(
+    r"^(?:"
+    r"CVE-\d{4}-\d{4,}"  # CVE
+    r"|GCVE-\d+-\d{4}-\d+"  # GCVE
+    r"|GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}"  # GHSA
+    r"|PYSEC-\d{4}-\d{2,5}"  # PYSEC
+    r"|GSD-\d{4}-\d{4,5}"  # GSD
+    r"|wid-sec-w-\d{4}-\d{4}"  # CERT-Bund
+    r"|cisco-sa-\d{8}-[A-Za-z0-9]+"  # CISCO
+    r"|RHSA-\d{4}:\d{4}"  # RedHat
+    r"|msrc_CVE-\d{4}-\d{4,}"  # MSRC CVE
+    r"|CERTFR-\d{4}-[A-Z]{3}-\d{3}"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+class Sighting(db.Model):  # type: ignore[name-defined, misc]
+    """Represent a sighting related to a vulnerability.
+
+    Type of sightings:
+     - Seen: The vulnerability was mentioned, discussed, or seen somewhere by the user.
+     - Published Proof of Concept: A public proof of concept is available for this vulnerability.
+     - Exploited: This vulnerability was exploited and seen by the user reporting the sighting.
+     - Not exploited: This vulnerability was not exploited or seen by the user reporting the sighting.
+     - Confirmed: The vulnerability is confirmed from an analyst perspective.
+     - Not confirmed: The user expresses doubt about the veracity of the vulnerability.
+     - Patched: This vulnerability was successfully patched by the user reporting the sighting.
+     - Not patched: This vulnerability was not successfully patched by the user reporting the sighting.
+    """
+
+    uuid = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    vulnerability_lookup_origin = db.Column(UUID(as_uuid=True), nullable=False)
+    vulnerability = db.Column(db.String(), nullable=True)
+    type = db.Column(db.String(), nullable=False)
+    source = db.Column(db.String(2048), default="")
+    creation_timestamp = db.Column(
+        db.DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+        index=True,
+    )
+
+    # foreign keys
+    author_id = db.Column(db.Integer(), db.ForeignKey("user.id"), nullable=False)
+
+    @validates("type")
+    def validate_type(self, key: str, value: str) -> str:
+        allowed_types = {
+            "seen",
+            "published-proof-of-concept",
+            "exploited",
+            "not-exploited",
+            "confirmed",
+            "not-confirmed",
+            "patched",
+            "not-patched",
+        }
+        if value not in allowed_types:
+            raise ValueError(f"Unsupported sighting type: {value}")
+        return value
+
+    @validates("vulnerability")
+    def validate_vulnerability(self, key: str, value: str | None) -> str | None:
+        if value is None:
+            return value
+        value = value.strip()
+        value = sanitize_text(value)
+        if not vulnerability_patterns.fullmatch(value):
+            raise ValueError(f"Invalid vulnerability identifier: {value!r}")
+        return value
+
+    @validates("source")
+    def validate_source(self, key: str, value: str) -> str:
+        if not value:
+            return ""
+        value = value.strip()
+        if len(value) > 2048:
+            raise ValueError("Source must not exceed 2048 characters")
+        return sanitize_text(value)
+
+    def as_json(self) -> str:
+        return json.dumps(
+            {
+                "uuid": str(self.uuid),
+                "vulnerability_lookup_origin": str(self.vulnerability_lookup_origin),
+                "author": str(self.author.uuid),
+                "vulnerability": self.vulnerability,
+                "type": self.type,
+                "source": self.source,
+                "creation_timestamp": self.creation_timestamp.strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                ),
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self.as_json())

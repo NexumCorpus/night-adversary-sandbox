@@ -1,0 +1,326 @@
+{% extends "main.html" %}
+{% block head %}
+  {{ super() }}
+  <script src="{{ url_for('static', filename='js/pretty-print-json.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/luxon.min.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/lodash.min.js') }}"></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/pretty-print-json.css') }}">
+{% endblock %}
+{% block title %}Bundle - {{ bundle.name }}{% endblock %}
+{% block content %}
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <div>
+      <h4 class="card-title mb-0">
+        <a href="{{ url_for('bundle_bp.get', bundle_uuid=bundle.uuid) }}">{{ bundle.name | safe }}</a>
+      </h4>
+      <small class="text-body-secondary">
+        Created on {{ bundle.creation_timestamp | datetimeformat }},
+        updated on {{ bundle.timestamp | datetimeformat }},
+        by <a href="{{ url_for('user_bp.profile', login=bundle.author.login) }}">{{ bundle.author.name }}</a>
+      </small>
+    </div>
+
+    <div class="btn-group" role="group">
+      <a class="btn btn-sm btn-outline-secondary"
+         href="{{ url_for('apiv1.bundle_bundle_item', bundle_uuid=bundle.uuid) }}"
+         download title="Download JSON">
+         JSON
+      </a>
+      <button class="btn btn-sm btn-outline-secondary dropdown-toggle"
+              id="btnGroupDropShare"
+              data-bs-toggle="dropdown"
+              aria-expanded="false"
+              title="Share">
+        {{ render_icon('share') }}
+      </button>
+      <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="btnGroupDropShare">
+        <li><a class="dropdown-item" href="https://news.ycombinator.com/submitlink?u=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('bundle_bp.get', bundle_uuid=bundle.uuid) }}&t={{ bundle.name }}" target="_blank">Hacker News</a></li>
+        <li><a class="dropdown-item" href="https://www.linkedin.com/shareArticle?mini=true&url=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('bundle_bp.get', bundle_uuid=bundle.uuid) }}&title={{ bundle.name }}" target="_blank">LinkedIn</a></li>
+        <li><a class="dropdown-item" href="https://mastodonshare.com/?text={{ bundle.name }}&url=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('bundle_bp.get', bundle_uuid=bundle.uuid) }}" target="_blank">Mastodon</a></li>
+        <li><a class="dropdown-item" href="https://www.newspipe.org/bookmark/bookmarklet?href=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('bundle_bp.get', bundle_uuid=bundle.uuid) }}&title={{ bundle.name }}" target="_blank">Newspipe</a></li>
+        <li><a class="dropdown-item" href="https://api.pinboard.in/v1/posts/add?url=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('bundle_bp.get', bundle_uuid=bundle.uuid) }}&description=%27{{ bundle.name }}%27" target="_blank">Pinboard</a></li>
+        <li><a class="dropdown-item" href="https://reddit.com/submit?url=https://{{ config.PUBLIC_DOMAIN }}{{ url_for('bundle_bp.get', bundle_uuid=bundle.uuid) }}&title={{ bundle.name }}" target="_blank">Reddit</a></li>
+      </ul>
+      <a class="btn btn-sm btn-outline-secondary" title="Copy permalink" onclick="copyCurrentPageURL()">
+        {{ render_icon('clipboard') }}
+      </a>
+      {% if current_user.is_authenticated and current_user.is_admin %}
+        <a class="btn btn-sm btn-outline-secondary" title="Edit" href="{{ url_for('admin_bundle_bp.form_bundle', bundle_uuid=bundle.uuid) }}">
+          {{ render_icon('pen') }}
+        </a>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card-body">
+    {% if bundle.meta %}
+      {% set all_refs = [] %}
+      {% for elem in bundle.meta %}
+        {% set refs = elem.get('ref') or elem.get('references') or elem.get('resources') %}
+        {% if refs %}
+          {% for url in refs %}
+            {% if url and url not in all_refs %}
+              {% set _ = all_refs.append(url) %}
+            {% endif %}
+          {% endfor %}
+        {% endif %}
+      {% endfor %}
+      {% if all_refs %}
+        <div class="alert alert-info mb-3" role="alert">
+          <h6 class="alert-heading mb-2">
+            {{ render_icon('link') }} References
+          </h6>
+          <ul class="mb-0">
+            {% for url in all_refs %}
+              <li><a href="{{ url }}" target="_blank" rel="noopener noreferrer">{{ url }}</a></li>
+            {% endfor %}
+          </ul>
+        </div>
+      {% endif %}
+    {% endif %}
+
+    <h5>Description</h5>
+    <div id="markdown-description" class="markdown-description mb-3">{{ description | safe }}</div>
+
+    <hr>
+    <h5>Vulnerabilities included in this bundle</h5>
+    <ul class="list-group mb-3">
+      {% for vuln in bundle.related_vulnerabilities %}
+        <li class="list-group-item list-group-item-related" vuln-id="{{ vuln }}">
+          <a href="{{ url_for('home_bp.vulnerability_view', vulnerability_id=vuln) }}">{{ vuln }}</a>:
+          <span class="vuln-description"></span>
+        </li>
+      {% endfor %}
+    </ul>
+
+    {% if bundle.meta %}
+      <h5>Meta</h5>
+      <pre id="jsoncontainer" class="bg-light p-2 rounded border">{{ bundle.meta | tojson(indent=2) }}</pre>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header">
+    <h5 id="combined-detection-rules" class="mb-0">Combined detection rules</h5>
+  </div>
+  <div class="card-body">
+    <p>Detection rules are retrieved from <a href="https://rulezet.org" rel="noreferrer" target="_blank">Rulezet</a>.</p>
+    <div id="list-detection-rules">
+      <!-- Spinner wrapper -->
+      <div class="spinner-wrapper d-flex justify-content-center my-3">
+        <div class="spinner-grow text-primary" role="status">
+          <span class="visually-hidden">Loading…</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<div class="card shadow-sm mb-4">
+  <div class="card-header">
+    <h5 id="combined-sightings" class="mb-0">Combined sightings</h5>
+  </div>
+  <div class="card-body">
+    <div class="table-responsive">
+      <table class="table align-middle">
+        <thead class="table-light">
+          <tr>
+            <th scope="col">Author</th>
+            <th scope="col">Vulnerability</th>
+            <th scope="col">Source</th>
+            <th scope="col">Type</th>
+            <th scope="col">Date</th>
+          </tr>
+        </thead>
+        <tbody id="sighting-table-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+  document.addEventListener("DOMContentLoaded", function() {
+    const jsonContainer = document.getElementById("jsoncontainer");
+    if (jsonContainer) {
+      const obj = JSON.parse(jsonContainer.innerText);
+      jsonContainer.innerHTML = prettyPrintJson.toHtml(obj, { quoteKeys: true });
+    }
+
+    const desc = document.getElementById("markdown-description");
+    if (desc) {
+      desc.innerHTML = linkifySecurityIdentifiers(desc.innerHTML);
+      formatMarkdownOutput();
+    }
+
+    const urlParts = window.location.pathname.split("/");
+    const bundle_uuid = urlParts[urlParts.length - 1];
+
+    fetch(`/api/bundle/?uuid=${bundle_uuid}`)
+    .then(response => response.json())
+    .then(bundleData => {
+      const vulnerabilities = bundleData.data[0]?.related_vulnerabilities || [];
+      loadDetectionRules(vulnerabilities);
+    })
+    .catch(error => console.error("Error fetching bundle:", error));
+
+    populateSightingsTable();
+    fetchAndAppendVulnerabilityDescriptions();
+  });
+
+  function copyCurrentPageURL() {
+    navigator.clipboard.writeText(window.location.href)
+      .then(() => showToast("Success", "The bundle permalink has been copied to your clipboard."))
+      .catch(err => console.error("Failed to copy:", err));
+  }
+
+  function loadDetectionRules(vuln_id) {
+    const ruleTemplate = _.template(`
+      <div class="card markdown-description mb-3">
+        <div class="card-body">
+          <h5 class="card-title">
+            <a href="<%= detail_url %>" rel="noreferrer" target="_blank"><%= _.escape(title) %></a>
+          </h5>
+          <% if (description) { %>
+            <p class="card-text"><%= _.escape(description) %></p>
+          <% } %>
+          <p class="card-text"><strong>Format:</strong> <%= _.escape(format) %></p>
+          <p class="card-text"><strong>Created:</strong> <%= _.escape(creation_date) %></p>
+          <% if (raw) {
+              const rawId = 'raw-' + _.uniqueId();
+          %>
+            <div class="d-flex align-items-start">
+              <pre id="<%= rawId %>" class="card-text flex-grow-1"><%= _.escape(raw) %></pre>
+              <button class="btn btn-sm btn-outline-secondary ms-2" onclick="copyToClipboard('<%= rawId %>')" title="Copy to clipboard">
+                {{ render_icon('clipboard') }}
+              </button>
+            </div>
+          <% } %>
+        </div>
+      </div>
+    `);
+
+    fetch("{{ url_for('apiv1.rulezet_rulezet_item', vulnerability_id='') }}"+vuln_id)
+      .then(response => response.json())
+      .then(result => {
+        const container = document.getElementById("list-detection-rules");
+        container.innerHTML = "";
+
+        if (!result.data || result.data.length === 0) {
+          container.innerHTML = "<p>This vulnerability is not linked to any detection rule.</p>";
+          return;
+        }
+
+        result.data.forEach(rule => {
+          const cardHTML = ruleTemplate({
+            title: rule.title,
+            description: rule.description,
+            format: rule.format,
+            creation_date: rule.creation_date,
+            raw: rule.raw,
+            detail_url: rule.detail_url || "#"
+          });
+
+          container.insertAdjacentHTML("beforeend", cardHTML);
+        });
+      });
+  }
+
+  function populateSightingsTable() {
+    const urlParts = window.location.pathname.split("/");
+    const uuid = urlParts[urlParts.length - 1];
+    const tableBody = document.getElementById("sighting-table-body");
+
+    function addRowToTable(sighting) {
+      const row = document.createElement("tr");
+
+      const authorCell = document.createElement("td");
+      authorCell.textContent = sighting.author.login || "";
+      row.appendChild(authorCell);
+
+      const vulnCell = document.createElement("td");
+      if (sighting.vulnerability) {
+        const vulnLink = document.createElement("a");
+        vulnLink.href = "/vuln/" + encodeURIComponent(sighting.vulnerability);
+        vulnLink.textContent = sighting.vulnerability.toUpperCase();
+        vulnCell.appendChild(vulnLink);
+      }
+      row.appendChild(vulnCell);
+
+      const sourceCell = document.createElement("td");
+      if (sighting.source && isValidURL(sighting.source)) {
+        const srcLink = document.createElement("a");
+        srcLink.href = sighting.source;
+        srcLink.rel = "noreferrer noopener";
+        srcLink.target = "_blank";
+        srcLink.textContent = sighting.source;
+        sourceCell.appendChild(srcLink);
+      } else {
+        sourceCell.textContent = sighting.source || "";
+      }
+      row.appendChild(sourceCell);
+
+      const typeCell = document.createElement("td");
+      typeCell.textContent = sighting.type || "";
+      row.appendChild(typeCell);
+
+      const dateCell = document.createElement("td");
+      dateCell.classList.add("datetime");
+      if (sighting.creation_timestamp) {
+        dateCell.textContent = sighting.creation_timestamp;
+        dateCell.title = sighting.creation_timestamp;
+      }
+      row.appendChild(dateCell);
+
+      tableBody.appendChild(row);
+    }
+
+    fetch(`/api/bundle/?uuid=${uuid}`)
+      .then(response => response.json())
+      .then(bundleData => {
+        const vulnerabilities = bundleData.data[0]?.related_vulnerabilities || [];
+        vulnerabilities.forEach(vuln_id => {
+          fetch(`/api/sighting/?vuln_id=${vuln_id}&date_from=1970-01-01`)
+            .then(response => response.json())
+            .then(sightingData => {
+              sightingData.data.sort((a, b) => a.vulnerability.localeCompare(b.vulnerability));
+              sightingData.data.forEach(sighting => addRowToTable(sighting));
+
+              const DateTime = luxon.DateTime;
+              document.querySelectorAll(".datetime").forEach(el => {
+                el.textContent = DateTime.fromISO(el.title).toRelative();
+              });
+            })
+            .catch(error => console.error("Error fetching sighting:", error));
+        });
+      })
+      .catch(error => console.error("Error fetching bundle:", error));
+  }
+
+  async function fetchAndAppendVulnerabilityDescriptions() {
+    const listItems = document.querySelectorAll(".list-group-item-related");
+    for (const listItem of listItems) {
+      const vulnId = listItem.getAttribute("vuln-id");
+      try {
+        const response = await fetch(`/api/vulnerability/${vulnId}`);
+        if (!response.ok) throw new Error(`Failed to fetch data for ${vulnId}`);
+        const data = await response.json();
+
+        let description = data?.containers?.cna?.title
+          || (data?.containers?.cna?.descriptions || []).find(d => d.lang === "en")?.value
+          || data?.details
+          || data?.document?.title
+          || "No description available.";
+
+        const span = listItem.querySelector(".vuln-description");
+        if (span) span.textContent = truncateString(description, 120);
+      } catch (error) {
+        console.error(`Error fetching data for ${vulnId}:`, error);
+      }
+    }
+  }
+</script>
+{% endblock %}

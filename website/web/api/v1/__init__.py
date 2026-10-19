@@ -1,0 +1,108 @@
+from typing import Any
+
+from importlib.metadata import version
+from flask import Blueprint
+from flask import render_template
+from flask_restx import Api  # type: ignore[import-untyped]
+
+from vulnerabilitylookup.default import get_config
+from website.web.bootstrap import application
+from website.web.bootstrap import csrf
+
+
+apiv1_blueprint = Blueprint(
+    "apiv1", __name__, url_prefix="/api"
+)  # should we put the version in the URL ?
+csrf.exempt(apiv1_blueprint)
+
+
+def setup_api(application: Any) -> Api:
+    authorizations = {
+        "apikey": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-KEY",
+        }
+    }
+
+    api = Api(
+        apiv1_blueprint,
+        title="Vulnerability-Lookup API",
+        version=version("vulnerabilitylookup"),
+        description="<a href='https://github.com/vulnerability-lookup/vulnerability-lookup' rel='noreferrer' target='_blank'>"
+        "<img src='https://vulnerability.circl.lu/static/img/VL-hori-coul.png' width='500px' /></a><br />"
+        "API to query <a href='https://github.com/vulnerability-lookup/vulnerability-lookup' rel='noreferrer' target='_blank'>Vulnerability-Lookup</a>. "
+        "A project from <a href='https://www.circl.lu' target='_blank'>CIRCL</a>."
+        "<br /><br />Back to the <a href='/'>main page</a>"
+        "<br /><br /><a href='https://www.vulnerability-lookup.org/documentation' target='_blank'>Official documentation</a> of the project.",
+        license="GNU Affero General Public License version 3",
+        license_url="https://www.gnu.org/licenses/agpl-3.0.html",
+        doc="/",
+        security="apikey",
+        authorizations=authorizations,
+        contact_email=application.config.get("ADMIN_EMAIL", "info@circl.lu"),
+        contact_url=application.config.get("ADMIN_WEBSITE", "https://www.circl.lu"),
+    )
+
+    from .decorator_helpers import typed
+
+    @typed(api.documentation)
+    def custom_ui() -> str:
+        http_schema = "http" if application.debug else "https"
+        return render_template(
+            "swagger-ui.html",
+            title=api.title,
+            specs_url="{}://{}/api/swagger.json".format(
+                http_schema, get_config("generic", "public_domain")
+            ),
+        )
+
+    from website.web.api.v1 import system
+    from website.web.api.v1 import vulnerability
+    from website.web.api.v1 import browse
+    from website.web.api.v1 import comment
+    from website.web.api.v1 import user
+    from website.web.api.v1 import bundle
+    from website.web.api.v1 import epss
+    from website.web.api.v1 import sighting
+    from website.web.api.v1 import stats
+    from website.web.api.v1 import cwe
+    from website.web.api.v1 import capec
+    from website.web.api.v1 import organization
+    from website.web.api.v1 import product
+    from website.web.api.v1 import emb3d
+    from website.web.api.v1 import cisa_kev
+    from website.web.api.v1 import cnw_kev
+    from website.web.api.v1 import gcve
+    from website.web.api.v1 import vlai
+    from website.web.api.v1 import rulezet
+    from website.web.api.v1 import kev
+
+    api.add_namespace(system.system_ns, path="/system")
+    api.add_namespace(system.system_ns_legacy, path="/")
+    api.add_namespace(vulnerability.vulnerability_ns, path="/vulnerability")
+    api.add_namespace(vulnerability.legacy_ns, path="/")
+    api.add_namespace(browse.browse_ns, path="/browse")
+    api.add_namespace(stats.stats_ns, path="/stats")
+    if get_config("generic", "user_accounts"):
+        api.add_namespace(comment.comment_ns, path="/comment")
+        api.add_namespace(user.user_ns, path="/user")
+        api.add_namespace(bundle.bundle_ns, path="/bundle")
+        api.add_namespace(sighting.sighting_ns, path="/sighting")
+    api.add_namespace(epss.epss_ns, path="/epss")
+    api.add_namespace(cwe.cwe_ns, path="/cwe")
+    api.add_namespace(capec.capec_ns, path="/capec")
+    api.add_namespace(organization.organization_ns, path="/organization")
+    api.add_namespace(product.product_ns, path="/product")
+    api.add_namespace(emb3d.emb3d_ns, path="/emb3d")
+    api.add_namespace(cisa_kev.cisa_kev_ns, path="/cisa_kev")
+    api.add_namespace(cnw_kev.cnw_kev_ns, path="/cnw_kev")
+    api.add_namespace(gcve.gcve_ns, path="/gcve")
+    api.add_namespace(vlai.vlai_ns, path="/vlai")
+    api.add_namespace(rulezet.rulezet_ns, path="/rulezet")
+    api.add_namespace(kev.kev_ns, path="/kev")
+
+    return api
+
+
+api = setup_api(application)

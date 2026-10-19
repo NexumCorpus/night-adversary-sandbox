@@ -1,0 +1,71 @@
+import re
+
+import bleach  # type: ignore[import-untyped]
+
+from website.lib.constants import ALLOWED_ATTRIBUTES, ALLOWED_TAGS
+
+
+vulnerability_patterns = re.compile(
+    r"^(?:"
+    r"CVE-\d{4}-\d{4,}"  # CVE
+    r"|GCVE-\d+-\d{4}-\d+"  # GCVE
+    r"|GHSA-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}-[A-Za-z0-9]{4}"  # GHSA
+    r"|PYSEC-\d{4}-\d{2,5}"  # PYSEC
+    r"|GSD-\d{4}-\d{4,5}"  # GSD
+    r"|wid-sec-w-\d{4}-\d{4}"  # CERT-Bund
+    r"|cisco-sa-\d{8}-[A-Za-z0-9]+"  # CISCO
+    r"|RHSA-\d{4}:\d{4}"  # RedHat
+    r"|msrc_CVE-\d{4}-\d{4,}"  # MSRC CVE
+    r"|CERTFR-\d{4}-[A-Z]{3}-\d{3}"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def sanitize_html_fragment(raw_html: str) -> str:
+    """Clean an HTML fragment of malicious content and return it."""
+    return bleach.clean(raw_html, tags=ALLOWED_TAGS, attributes=ALLOWED_ATTRIBUTES)
+
+
+def sanitize_text(raw_text: str) -> str:
+    return bleach.clean(raw_text, tags=[], attributes={}, strip=True)
+
+
+def sanitize_markdown(raw_markdown: str) -> str:
+    """
+    Clean Markdown content:
+      - remove Markdown images and links
+      - remove HTML links
+      - remove bare URLs
+      - allow only safe inline formatting (bold, italic, etc.)
+      - sanitize remaining HTML content
+    """
+    if not raw_markdown:
+        return ""
+
+    text = raw_markdown.strip()
+
+    # Remove Markdown images: ![alt](url)
+    text = re.sub(r"!\[.*?\]\s*\(.*?\)", "", text, flags=re.DOTALL)
+
+    # Remove Markdown links: [text](url)
+    text = re.sub(r"\[.*?\]\s*\(.*?\)", "", text, flags=re.DOTALL)
+
+    # Remove HTML links: <a ...>...</a>
+    text = re.sub(r"<a\s+[^>]*>.*?</a>", "", text, flags=re.DOTALL | re.IGNORECASE)
+
+    # Remove bare URLs (http, https)
+    text = re.sub(r"https?://[^\s]+", "", text, flags=re.IGNORECASE)
+
+    # Optional: remove inline HTML links but keep safe inline tags
+    allowed_tags = ["b", "i", "u", "em", "strong", "code", "pre"]
+    allowed_attributes: dict[str, list[str]] = {}
+
+    cleaned = bleach.clean(
+        text,
+        tags=allowed_tags,
+        attributes=allowed_attributes,
+        strip=True,
+    )
+
+    return cleaned

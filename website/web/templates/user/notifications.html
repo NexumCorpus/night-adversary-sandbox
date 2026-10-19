@@ -1,0 +1,151 @@
+{% extends "main.html" %}
+{% block title %}Your notifications{% endblock %}
+{% block content %}
+<h1>
+  <span class="text-decoration-none text-body">Your Notifications</span>
+  <span class="mx-2 text-muted">›</span>
+  <a href="{{ url_for('user_bp.watchlist') }}" class="">Your Watchlist</a>
+</h1>
+
+<!-- First Table: Notifications -->
+<div class="table-responsive-md">
+  <table id="table-notifications" class="table table-hover">
+    <caption>Your notifications matching known CPE vendor and product names.</caption>
+    <thead>
+      <tr>
+        <th>Vendor</th>
+        <th>Product</th>
+        <th>Frequency</th>
+        <th>Last execution time</th>
+        <th>Creation date</th>
+        <th>Hits</th>
+        <th>Active</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for notification in notifications %}
+        <tr>
+          <td><a href="{{ url_for('home_bp.search', vendor=notification.vendor) }}">{{ notification.vendor }}</a></td>
+          <td><a href="{{ url_for('home_bp.search', vendor=notification.vendor, product=notification.product) }}">{{ notification.product }}</a></td>
+          <td>{{ notification.frequency | capitalize }}</td>
+          <td>{{ notification.last_execution_time | datetimeformat('%Y-%m-%d %H:%M:%S %z') if notification.last_execution_time else 'Never'  }}</td>
+          <td>{{ notification.creation_timestamp | datetimeformat('%Y-%m-%d %H:%M:%S %z') }}</td>
+          <td>{{ notification.hits }}</td>
+          <td>{{ 'Yes' if notification.is_active else 'No' }}</td>
+          <td class="">
+            <a class="btn btn-primary btn-sm" href="{{ url_for('user_bp.process_notification', notification_id=notification.id) }}">
+              {{ render_icon('pen', title='Edit the notification') }}
+            </a>
+            <form method="POST" data-name="{{ notification.vendor }} / {{ notification.product }}" action="{{ url_for('user_bp.delete_notification', notification_id=notification.id) }}" style="display:inline;">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <a type="button" class="btn btn-danger btn-sm delete-btn">
+                {{ render_icon('trash') }}
+              </a>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<!-- Pagination -->
+<div class="row"><div class="col">{{ pagination.links }}</div></div>
+<div class="row"><div class="col">{{ pagination.info }}</div></div>
+
+<br /><hr /><br />
+
+<!-- Second Table: Organization Notifications -->
+<div class="table-responsive-md">
+  <table id="table-notifications_organizations" class="table table-hover">
+    <caption>Your notifications matching known <a href="{{ url_for('organizations_bp.list_organizations') }}">Organizations and products</a>.</caption>
+    <thead>
+      <tr>
+        <th>Organization</th>
+        <th>Product</th>
+        <th># CPE Vendor / Product names</th>
+        <th>Frequency</th>
+        <th>Last execution time</th>
+        <th>Creation date</th>
+        <th>Hits</th>
+        <th>Active</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for notification in notifications_organizations %}
+        <tr>
+          <td><a href="{{ url_for('organization_bp.get_by_uuid', organization_uuid=notification.org_object.uuid) }}">{{ notification.org_object.short_name }}</a></td>
+          <td><a href="{{ url_for('product_bp.get', product_uuid=notification.product_object.uuid) }}">{{ notification.product_object.name }}</a></td>
+          <td>
+            <span class="text-decoration-underline" data-bs-toggle="tooltip" data-bs-placement="left" title="{{ notification.org_object.get_cpe_vendors() | map(attribute='name') | join(', ') }}">{{ notification.org_object.get_cpe_vendors() | count() }}</span> /
+            <span class="text-decoration-underline" data-bs-toggle="tooltip" data-bs-placement="left" title="{{ notification.product_object.get_cpe_products() | map(attribute='name') | join(', ') }}">{{ notification.product_object.get_cpe_products() | count() }}</span>
+          </td>
+          <td>{{ notification.frequency | capitalize }}</td>
+          <td>{{ notification.last_execution_time | datetimeformat('%Y-%m-%d %H:%M:%S %z') if notification.last_execution_time else 'Never'  }}</td>
+          <td>{{ notification.creation_timestamp | datetimeformat('%Y-%m-%d %H:%M:%S %z') }}</td>
+          <td>{{ notification.hits }}</td>
+          <td>{{ 'Yes' if notification.is_active else 'No' }}</td>
+          <td>
+            <a class="btn btn-primary btn-sm" href="{{ url_for('user_bp.process_notification', notification_id=notification.id) }}">
+              {{ render_icon('pen', title='Edit the notification') }}
+            </a>
+            <form method="POST" data-name="{{ notification.vendor }} / {{ notification.product }}" action="{{ url_for('user_bp.delete_notification', notification_id=notification.id) }}"  style="display:inline;">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <a type="button" class="btn btn-danger btn-sm delete-btn">
+                {{ render_icon('trash') }}
+              </a>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="row"><div class="col">{{ pagination_organizations.links }}</div></div>
+<div class="row"><div class="col">{{ pagination_organizations.info }}</div></div>
+
+<br />
+<a class="btn btn-primary" href="{{ url_for('user_bp.new_notification') }}">Create a new notification</a>
+
+<!-- Reusable Delete Modal -->
+<div class="modal fade" id="deleteModal" tabindex="-1" aria-labelledby="deleteModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="deleteModalLabel">Confirm Deletion</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        Are you sure you want to delete <strong id="modalItemName"></strong>?
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-danger" id="confirmDeleteBtn">Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", function() {
+  const deleteModal = new bootstrap.Modal(document.getElementById('deleteModal'));
+  const modalItemName = document.getElementById('modalItemName');
+  let currentForm = null;
+
+  document.querySelectorAll('.delete-btn').forEach(btn => {
+    btn.addEventListener('click', function() {
+      currentForm = this.closest('form');
+      modalItemName.textContent = currentForm.dataset.name;
+      deleteModal.show();
+    });
+  });
+
+  document.getElementById('confirmDeleteBtn').addEventListener('click', function() {
+    if (currentForm) currentForm.submit();
+  });
+});
+</script>
+{% endblock %}

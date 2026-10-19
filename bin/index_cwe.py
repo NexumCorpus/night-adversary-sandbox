@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+from vulnerabilitylookup import VulnerabilityLookup
+from vulnerabilitylookup.helpers import fromisoformat_wrapper
+
+vl = VulnerabilityLookup()
+
+
+def index_cwe(source: str) -> None:
+    """Reindex the CWE."""
+
+    # --- Clear existing CWE-related keys ---
+    keys_to_delete = []
+    for key in vl.storage.scan_iter("cwe:*"):
+        if isinstance(key, bytes):
+            key = key.decode("utf-8")
+        if (
+            key == "cwe:index"
+            or key.startswith(f"cwe:ranking:{source}")
+            or (key.startswith("cwe:CWE-") and key.endswith(":vulnerabilities"))
+        ):
+            keys_to_delete.append(key)
+
+    if keys_to_delete:
+        print(f"Deleting {len(keys_to_delete)} old CWE index keys...")
+        for i in range(0, len(keys_to_delete), 500):
+            vl.storage.delete(*keys_to_delete[i : i + 500])
+
+    # --- Rebuild CWE indices ---
+    pipeline = vl.storage.pipeline()
+    for vuln in vl.get_all(source):
+        meta = vuln.get("cveMetadata", {})
+        cve_id = meta.get("cveId", "").lower()
+        gcve_id = meta.get("vulnId", "").lower() or None  # GCVE vulnerability id
+        vuln_id = ""
+
+        if gcve_id:
+            vuln_id = gcve_id
+        elif cve_id:
+            vuln_id = cve_id
+
+        if not vuln_id:
+            continue
+
+        # Pick a reference date (prefer published > updated > reserved)
+        if "datePublished" in meta:
+            ref_date = fromisoformat_wrapper(meta["datePublished"])
+        elif "dateUpdated" in meta:
+            ref_date = fromisoformat_wrapper(meta["dateUpdated"])
+        else:
+            ref_date = fromisoformat_wrapper(meta["dateReserved"])
+
+        period_month = ref_date.strftime("%Y-%m")
+        period_year = ref_date.strftime("%Y")
+
+        # Extract CWE IDs
+        cna = vuln.get("containers", {}).get("cna", {})
+        for problem_type in cna.get("problemTypes", []):
+            for desc in problem_type.get("descriptions", []):
+                if not desc or "cwe" not in desc.get("type", "").lower():
+                    continue
+
+                cwe_id = desc.get("cweId", "").strip().upper()
+                if not cwe_id.startswith("CWE-"):
+                    continue
+
+                # --- Store references ---
+                pipeline.sadd(f"cwe:{cwe_id}:vulnerabilities", vuln_id)
+                pipeline.sadd("cwe:index", cwe_id)
+                pipeline.zincrby(f"cwe:ranking:{source}", 1, cwe_id)
+                pipeline.sadd(f"{vuln_id}:cwe", cwe_id)
+
+                # --- Time-based rankings ---
+                pipeline.zincrby(f"cwe:ranking:{source}:{period_month}", 1, cwe_id)
+                pipeline.zincrby(f"cwe:ranking:{source}:{period_year}", 1, cwe_id)
+
+        # Batch flush every 1000 vulns
+        if pipeline.command_stack and len(pipeline.command_stack) >= 1000:
+            pipeline.execute()
+
+    # Final flush
+    if pipeline.command_stack:
+        pipeline.execute()
+
+
+if __name__ == "__main__":
+    index_cwe("gna-1")
+    index_cwe("cvelistv5")

@@ -1,0 +1,17 @@
+{
+  "register_listeners": true,
+  "pubsub_bp": true,
+  "global_subscription": false,
+  "channels": [
+    "vulnerability",
+    "comment",
+    "bundle",
+    "sighting"
+  ],
+  "_notes": {
+    "register_listeners": "Register the listeners for comments, bundles, and sightings.",
+    "pubsub_bp": "Activate or deactivate the subscription Blueprint for specific clients.",
+    "channels": "The list of channels exposed by the Pub/Sub Blueprint.",
+    "global_subscription": "Activate or deactivate the global subsciption mechanism for server-side processing of messages."
+  }
+}

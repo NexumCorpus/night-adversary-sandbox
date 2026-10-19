@@ -1,0 +1,141 @@
+import logging
+from typing import Tuple
+
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+    fields,
+    reqparse,
+)
+
+from website.models import Organization
+from website.web.api.v1.common import (
+    metada_params_model,
+    uuid_type,
+)
+from website.web.api.v1.types import ResultType
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+organization_ns = Namespace(
+    "organization", description="Organization related operations."
+)
+
+# Argument Parsing
+parser = reqparse.RequestParser()
+parser.add_argument(
+    "page",
+    type=int,
+    default=1,
+    help="Number of the page.",
+)
+parser.add_argument(
+    "per_page",
+    type=int,
+    default=1000,
+    help="Maximum number of elements to return.",
+)
+parser.add_argument("id", type=int, help="ID of the organization.")
+parser.add_argument("uuid", type=uuid_type, help="UUID of the organization.")
+parser.add_argument(
+    "name",
+    type=str,
+    help="The name of the organization.",
+)
+parser.add_argument(
+    "gna_id",
+    type=int,
+    help="The reserved GNA identifier of the organization.",
+)
+
+# Response marshalling
+organization_params_model = {
+    "id": fields.String(description="Organization id."),
+    "uuid": fields.String(description="Organization uuid."),
+    "name": fields.String(description="Organization name."),
+    "short_name": fields.String(description="Organization short name."),
+    "description": fields.String(description="Description."),
+    "gna_id": fields.Integer(
+        description="The reserved GNA identifier of the organization."
+    ),
+    "creation_timestamp": fields.DateTime(
+        description="Creation time of the organization.", readonly=True
+    ),
+    "updated_timestamp": fields.DateTime(
+        description="Updated time of the organization.", readonly=True
+    ),
+}
+organization = organization_ns.model(
+    "Organization", organization_params_model, skip_none=True
+)
+metadata = organization_ns.model("metadata", metada_params_model)
+
+organization_list_fields = organization_ns.model(
+    "OrganizationsList",
+    {
+        "metadata": fields.Nested(
+            metadata, description="Metada related to the result."
+        ),
+        "data": fields.List(
+            fields.Nested(organization, skip_none=True),
+            description="List of organizations.",
+        ),
+    },
+)
+
+
+@organization_ns.route("/")
+class OrganizationsList(Resource):  # type: ignore[misc]
+    @typed(organization_ns.doc("list_organizations"))
+    @typed(organization_ns.expect(parser))
+    @typed(organization_ns.marshal_list_with(organization_list_fields))
+    def get(self) -> Tuple[ResultType, int]:
+        """List all organizations."""
+        args = parser.parse_args()
+        page = args.pop("page", 1)  # 1-based page index
+        per_page = args.pop("per_page", 10)  # Number of records per page
+
+        # Enforce maximum per_page limit
+        if per_page > 100:
+            per_page = 100  # Adjust as needed for your use case
+
+        # Calculate the offset based on page and per_page
+        offset = (page - 1) * per_page
+
+        result: ResultType = {
+            "data": [],
+            "metadata": {
+                "count": 0,  # Total number of records matching the filters
+                "page": page,  # Current page number
+                "per_page": per_page,  # Number of records per page
+            },
+        }
+
+        query = Organization.query
+
+        # Apply filters
+        if args.get("id"):
+            query = query.filter(Organization.id == args["id"])
+        if args.get("uuid"):
+            query = query.filter(Organization.uuid == args["uuid"])
+        if args.get("name"):
+            query = query.filter(Organization.name.ilike("%" + args["name"] + "%"))
+        if args.get("gna_id"):
+            query = query.filter(Organization.gna_id == args["gna_id"])
+
+        # Order the query by timestamp, descending
+        query = query.order_by(Organization.updated_timestamp.desc())
+
+        # Get total record count
+        total = query.count()
+
+        # Apply pagination
+        results = query.offset(offset).limit(per_page).all()
+
+        # Populate the result
+        result["data"] = results
+        result["metadata"]["count"] = total
+
+        return result, 200

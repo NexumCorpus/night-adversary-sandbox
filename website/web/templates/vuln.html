@@ -1,0 +1,1738 @@
+{% extends "main.html" %}
+{% import 'vulnerability_templates.html' as vuln_templates with context %}
+{% import 'comment_templates.html' as comment_templates %}
+
+{% block head %}
+{{ super() }}
+<script src="{{ url_for('static', filename='js/json5.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/showdown.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/lodash.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/luxon.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/jsoneditor.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/pretty-print-json.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/easymde.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/luxon.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/chart.js') }}"></script>
+<script src="{{ url_for('static', filename='js/plots.js') }}"></script>
+<script src="{{ url_for('static', filename='js/d3.v7.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/cal-heatmap.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/core@2.js') }}"></script>
+<script src="{{ url_for('static', filename='js/Tooltip.min.js') }}"></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/easymde.min.css') }}" />
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pretty-print-json.css') }}" />
+<link rel="stylesheet" href="{{ url_for('static', filename='css/cal-heatmap.css') }}" />
+<style>
+  /* Optional styling to indicate clickable header */
+  th {
+    cursor: pointer;
+  }
+  .chevron {
+      font-size: 18px;
+      color: #446d80;
+  }
+
+  /* Style to make the chart scrollable horizontally */
+  .chart-container {
+    position: relative; /* Required for positioning */
+    width: 100%; /* Make it responsive */
+    height: 400px; /* Set a specific height for the chart */
+    overflow-x: auto; /* Enable horizontal scroll */
+  }
+  canvas {
+    width: 100% !important; /* Make the canvas take full width */
+    height: auto !important; /* Allow the height to adjust automatically */
+  }
+
+  .tooltip-style {
+    background-color: #333;
+    color: #fff;
+    padding: 5px 10px;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+
+  #sightings-heatmap-container {
+    width: 100%;
+    overflow-x: auto; /* Enable horizontal scroll */
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch; /* Smooth scrolling on iOS */
+    padding-bottom: 10px; /* Space for the scrollbar */
+  }
+
+  #cal-heatmap {
+      min-width: 750px; /* Adjusted based on a 12-month width to prevent squishing */
+  }
+</style>
+
+<meta property="og:type" content="article">
+<meta property="og:url" content="{{ request.url }}">
+<meta property="og:title" content="{{ vulnerability_id.upper() }} - Vulnerability-Lookup">
+<meta property="og:description" content="Details of the vulnerability {{ vulnerability_id.upper() }} from {{ source }} on Vulnerability-Lookup.">
+<meta property="og:image" sizes="1200x630" content="{{ url_for('static', filename='img/VL-verti-white-bg-1200x630.png', _external=True) }}">
+{% endblock %}
+
+{% block title %}{{ vulnerability_id.upper() }} - Vulnerability-Lookup{% endblock %}
+
+{% block content %}
+
+<!-- Modal Template for error messages -->
+<div class="modal" id="modalError" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">Action not permitted</h5>
+      </div>
+      <div class="modal-body">
+        <p id="modal-error-text">Modal body text goes here.</p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal Template for sightings -->
+<div class="modal fade" id="sightingModal" tabindex="-1" aria-labelledby="sightingModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="sightingModalLabel">Modal Title</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <p id="modalMessage">Modal Body</p>
+        <div class="mb-3">
+          <label for="sourceInput" class="form-label">Source (Optional)</label>
+          <input type="text" class="form-control" id="sourceInput" placeholder="Enter source">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="button" class="btn btn-primary" id="sightingModalConfirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+
+{% if source ==  'nvd' %}
+{{vuln_templates.nvd_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'cvelistv5' %}
+{{vuln_templates.cvelistv5_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'fkie_nvd' %}
+{{vuln_templates.fkie_nvd_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif "gna-" in source or source == local_instance_name %}
+{{vuln_templates.cvelistv5_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'github' %}
+{{vuln_templates.github_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'gsd' %}
+{{vuln_templates.gsd_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'pysec' %}
+{{vuln_templates.pysec_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'emb3d' %}
+{{vuln_templates.emb3d_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'ossf_malicious_packages' %}
+{{vuln_templates.ossf_malicious_packages_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'bitnami_vulndb' %}
+{{vuln_templates.bitnami_vulndb_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'cleanstart' %}
+{{vuln_templates.cleanstart_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'drupal' %}
+{{vuln_templates.drupal_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'csaf_certbund' %}
+{{vuln_templates.csaf_certbund_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'csaf_ncscnl' %}
+{{vuln_templates.csaf_ncscnl_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'csaf_siemens' %}
+{{vuln_templates.csaf_siemens_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'csaf_redhat' %}
+{{vuln_templates.csaf_redhat_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'csaf_cisa' %}
+{{vuln_templates.csaf_cisa_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'csaf_cisco' %}
+{{vuln_templates.csaf_cisco_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'csaf_sick' %}
+{{vuln_templates.csaf_sick_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'csaf_ox' %}
+{{vuln_templates.csaf_ox_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'csaf_nozominetworks' %}
+{{vuln_templates.csaf_nozominetworks_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'csaf_microsoft' %}
+{{vuln_templates.csaf_microsoft_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'csaf_abb' %}
+{{vuln_templates.csaf_abb_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'variot' %}
+{{vuln_templates.variot_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'jvndb' %}
+{{vuln_templates.jvndb_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'tailscale' %}
+{{vuln_templates.tailscale_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'csaf_suse' %}
+{{vuln_templates.csaf_suse_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'csaf_opensuse' %}
+{{vuln_templates.csaf_opensuse_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'csaf_trustsource' %}
+{{vuln_templates.csaf_trustsource_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'csaf_se' %}
+{{vuln_templates.csaf_se_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'cnvd' %}
+{{vuln_templates.cnvd_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'fstec' %}
+{{vuln_templates.fstec_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'osv_ossfuzz' %}
+{{vuln_templates.osv_ossfuzz_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source ==  'osv_rustsec' %}
+{{vuln_templates.osv_rustsec_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'certfr_avis' %}
+{{vuln_templates.certfr_avis_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source == 'certfr_alerte' %}
+{{vuln_templates.certfr_alerte_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+{% elif source %}
+Other source: {{source}}.
+<pre>{{vulnerability_data|tojson(indent=2)}}</pre>
+{% endif %}
+
+{% if vulnerability_data == {} %}
+{{ vuln_templates.unpublished(vulnerability_id=vulnerability_id) }}
+{% endif %}
+
+<br />
+<ul class="nav nav-tabs" id="pageTab" role="tablist">
+  <li class="nav-item">
+    <button class="nav-link active" id="related-tab" data-bs-toggle="tab" data-bs-target="#related" role="tab" aria-controls="related" aria-selected="true" href="#related">Related vulnerabilities <span class="badge bg-primary rounded-pill">{{ nb_linked_vulns }}</span></button>
+  </li>
+  {% if config.user_accounts  %}
+  <li class="nav-item">
+    <button class="nav-link" id="comments-tab" data-bs-toggle="tab" data-bs-target="#comments" role="tab" aria-controls="comments" aria-selected="false" onclick="loadComments()" href="#comments">Comments <span class="badge bg-primary rounded-pill" id="nb-comments">{{ nb_comments }}</span></button>
+  </li>
+  <li class="nav-item">
+    <button class="nav-link" id="bundles-tab" data-bs-toggle="tab" data-bs-target="#bundles" role="tab" aria-controls="bundles" aria-selected="false" onclick="loadBundles()" href="#bundles">Bundles <span class="badge bg-primary rounded-pill" id="nb-bundles">{{ nb_bundles }}</span></button>
+  </li>
+  <li class="nav-item">
+    <button class="nav-link" id="sightings-tab" data-bs-toggle="tab" data-bs-target="#sightings" role="tab" aria-controls="sightings" aria-selected="false" onclick="loadSightings()" href="#sightings">Sightings <span class="badge bg-primary rounded-pill" id="nb-sightings">{{ nb_sightings }}</span></button>
+  </li>
+  <li class="nav-item">
+    <button class="nav-link" id="sightingsCorrelations-tab" data-bs-toggle="tab" data-bs-target="#sightingsCorrelations" role="tab" aria-controls="sightingsCorrelations" aria-selected="false" onclick="loadSightingsCorrelations()" href="#sightingsCorrelations">Sighting correlations</button>
+  </li>
+  <li class="nav-item">
+    <button class="nav-link" id="cwes-tab" data-bs-toggle="tab" data-bs-target="#cwes" role="tab" aria-controls="cwes" aria-selected="false" onclick="loadCWEs()" href="#cwes">CWE mitigations</button>
+  </li>
+  <li class="nav-item">
+    <button class="nav-link" id="detection-rules-tab" data-bs-toggle="tab" data-bs-target="#detection-rules" role="tab" aria-controls="detection-rules" aria-selected="false" onclick="loadDetectionRules()" href="#detection-rules">Detection rules <span id="count-detection-rules" class="badge bg-primary rounded-pill"></span></button>
+  </li>
+  <li class="nav-item">
+    <button class="nav-link" id="emb3d-tab" data-bs-toggle="tab" data-bs-target="#emb3d" role="tab" aria-controls="emb3d" aria-selected="false" onclick="loadEmb3d()" href="#emb3d">EMB3D</button>
+  </li>
+  {% endif %}
+</ul>
+<div class="tab-content" id="pageTabContent">
+  <div class="tab-pane fade show active" id="related" role="tabpanel" aria-labelledby="related-tab">
+    <br />
+    <div class="row">
+      <div class="col text-end">
+        <a class="icon-link" href="{{ url_for('home_bp.feed_recent', vulnerability=vulnerability_id, format='atom', source='all') }}" type="application/atom+xml" title="Atom feed">{{ render_icon('rss') }}</a>
+        <a class="icon-link" href="{{ url_for('home_bp.feed_recent', vulnerability=vulnerability_id, format='rss', source='all') }}" type="application/atom+xml" title="RSS feed">{{ render_icon('rss-fill') }}</a>
+    </div>
+  </div>
+  {% if linked_vulns %}
+    {% for source, vulnerabilities in linked_vulns.items() %}
+      {% for vuln_id, vulnerability_data in vulnerabilities %}
+        {% if source ==  'nvd' %}
+        {{vuln_templates.nvd_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'cvelistv5' %}
+        {{vuln_templates.cvelistv5_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'fkie_nvd' %}
+        {{vuln_templates.fkie_nvd_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif "gna-" in source %}
+        {{vuln_templates.cvelistv5_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'github' %}
+        {{vuln_templates.github_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'gsd' %}
+        {{vuln_templates.gsd_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'pysec' %}
+        {{vuln_templates.pysec_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'emb3d' %}
+        {{vuln_templates.emb3d_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'ossf_malicious_packages' %}
+        {{vuln_templates.ossf_malicious_packages_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'bitnami_vulndb' %}
+        {{vuln_templates.bitnami_vulndb_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'cleanstart' %}
+        {{vuln_templates.cleanstart_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'drupal' %}
+        {{vuln_templates.drupal_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_certbund' %}
+        {{vuln_templates.csaf_certbund_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_ncscnl' %}
+        {{vuln_templates.csaf_ncscnl_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_siemens' %}
+        {{vuln_templates.csaf_siemens_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_redhat' %}
+        {{vuln_templates.csaf_redhat_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_cisa' %}
+        {{vuln_templates.csaf_cisa_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_cisco' %}
+        {{vuln_templates.csaf_cisco_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_sick' %}
+        {{vuln_templates.csaf_sick_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_ox' %}
+        {{vuln_templates.csaf_ox_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_nozominetworks' %}
+        {{vuln_templates.csaf_nozominetworks_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_microsoft' %}
+        {{vuln_templates.csaf_microsoft_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_abb' %}
+        {{vuln_templates.csaf_abb_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'variot' %}
+        {{vuln_templates.variot_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source == 'jvndb' %}
+        {{vuln_templates.jvndb_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source == 'tailscale' %}
+        {{vuln_templates.tailscale_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_suse' %}
+        {{vuln_templates.csaf_suse_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_opensuse' %}
+        {{vuln_templates.csaf_opensuse_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_trustsource' %}
+        {{vuln_templates.csaf_trustsource_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'csaf_se' %}
+        {{vuln_templates.csaf_se_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'cnvd' %}
+        {{vuln_templates.cnvd_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'fstec' %}
+        {{vuln_templates.fstec_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'osv_ossfuzz' %}
+        {{vuln_templates.osv_ossfuzz_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+        {% elif source ==  'osv_rustsec' %}
+        {{vuln_templates.osv_rustsec_view(source=source, vulnerability_id=vulnerability_id, vulnerability_data=vulnerability_data)}}
+        {% elif source == 'certfr_avis' %}
+        {{vuln_templates.certfr_avis_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source == 'certfr_alerte' %}
+        {{vuln_templates.certfr_alerte_view(source=source, vulnerability_id=vuln_id, vulnerability_data=vulnerability_data)}}
+        {% elif source %}
+        Other source: {{source}}.
+        <pre>{{vulnerability_data|tojson(indent=2)}}</pre>
+        {% endif %}
+        <br />
+      {% endfor%}
+    {% endfor%}
+  {% endif %}
+  </div>
+  {% if config.user_accounts  %}
+  <div class="tab-pane fade show" id="comments" role="tabpanel" aria-labelledby="comments-tab">
+    <br />
+
+    <div class="row">
+      <div class="col">
+        {% if config.user_accounts and current_user.is_authenticated %}
+        <button id="buttonNewComment" class="btn btn-primary" type="button" data-bs-toggle="collapse" data-bs-target="#newComment{{vulnerability_id}}" aria-expanded="false" aria-controls="newComment{{vulnerability_id}}">
+          New comment{{ render_icon('chevron-down') }}
+        </button>
+        {% elif config.user_accounts %}
+        <p><a href="{{ url_for('user_bp.login') }}">Log in</a> or <a href="{{ url_for('user_bp.signup') }}">create an account</a> to share your comment.</p>
+        {% endif %}
+      </div>
+      {% if config.user_accounts  %}
+      <div class="col text-end">
+          <a class="icon-link" href="{{ url_for('comments_bp.feed_comments', vulnerability=vulnerability_id, format='atom') }}" type="application/atom+xml" title="Atom feed">{{ render_icon('rss') }}</a>
+          <a class="icon-link" href="{{ url_for('comments_bp.feed_comments', vulnerability=vulnerability_id, format='rss') }}" type="application/atom+xml" title="RSS feed">{{ render_icon('rss-fill') }}</a>
+      </div>
+      {% endif %}
+    </div>
+    <div class="collapse" id="newComment{{vulnerability_id}}">
+      <div class="row">
+        <div class="col-md-9">
+          <div id="editor"></div>
+        </div>
+        <div class="col">
+          <br /><br /><br />
+          <div class="card card-body my-3">
+            <h5>Tags</h5>
+            <select class="form-multi-select" id="select-tags" size="14" multiple>
+              <optgroup label="Exploitability" exclusive="true">
+                <option value="vulnerability:exploitability=industrialised">Industrialised</option>
+                <option value="vulnerability:exploitability=customised">Customised</option>
+                <option value="vulnerability:exploitability=documented">Documented</option>
+                <option value="vulnerability:exploitability=theoretical">Theoretical</option>
+              </optgroup>
+              <optgroup label="Information" exclusive="false">
+                <option value="vulnerability:information=PoC">Proof-of-Concept</option>
+                <option value="vulnerability:information=remediation">Remediation</option>
+                <option value="vulnerability:information=annotation">Annotation</option>
+              </optgroup>
+              <optgroup label="Origin" exclusive="false">
+                <option value="vulnerability:origin=hardware">Hardware</option>
+                <option value="vulnerability:origin=software">Software</option>
+                <option value="vulnerability:origin=service">Service</option>
+                <option value="vulnerability:origin=procedural-implementation">Procedural implementation</option>
+              </optgroup>
+            </select>
+            <a href="https://www.misp-project.org/taxonomies.html#_vulnerability_3" rel="noreferrer" target="_blank">Taxonomy of the tags.</a>
+          </div>
+          <button class='btn btn-primary' id='savecomment' title="Save the comment">Save the comment</button>
+        </div>
+      </div>
+    </div>
+    <br /><br />
+    <div id="list-comments">
+      <!-- Spinner wrapper -->
+      <div class="spinner-wrapper d-flex justify-content-center my-3">
+        <div class="spinner-grow text-primary" role="status">
+          <span class="visually-hidden">Loading…</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-pane fade show" id="bundles" role="tabpanel" aria-labelledby="bundles-tab">
+    <br />
+    <div id="list-bundles">
+      <!-- Spinner wrapper -->
+      <div class="spinner-wrapper d-flex justify-content-center my-3">
+        <div class="spinner-grow text-primary" role="status">
+          <span class="visually-hidden">Loading…</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-pane fade show" id="sightings" role="tabpanel" aria-labelledby="sightings-tab">
+    <br />
+    <div class="row" id="sightings-pane-top">
+      <div class="col">
+        <a class="btn btn-primary" href="{{ url_for('sightings_bp.list_sightings', query=vulnerability_id) }}">All sightings related to this event</a>
+        <a class="btn btn-primary" href="{{ url_for('sightings_bp.export_sightings_vuln', vulnerability=vulnerability_id) }}">Export sightings related to this event</a>
+      </div>
+      <div class="col text-end">
+        <a class="icon-link" href="{{ url_for('sightings_bp.feed_sightings', vulnerability=vulnerability_id, format='atom') }}" type="application/atom+xml" title="Atom feed">{{ render_icon('rss') }}</a>
+        <a class="icon-link" href="{{ url_for('sightings_bp.feed_sightings', vulnerability=vulnerability_id, format='rss') }}" type="application/atom+xml" title="RSS feed">{{ render_icon('rss-fill') }}</a>
+      </div>
+    </div>
+
+    <div id="chart-sightings-wrapper" class="mt-4">
+      <ul class="nav nav-tabs" id="sightingsTab" role="tablist">
+        <li class="nav-item" role="presentation">
+          <button class="nav-link active" id="barchart-tab" data-bs-toggle="tab" data-bs-target="#barchart-pane" type="button" role="tab" aria-controls="barchart-pane" aria-selected="true">Bar Chart</button>
+        </li>
+        <li class="nav-item" role="presentation">
+          <button class="nav-link" id="heatmap-tab" data-bs-toggle="tab" data-bs-target="#heatmap-pane" type="button" role="tab" aria-controls="heatmap-pane" aria-selected="false">Heatmap</button>
+        </li>
+      </ul>
+
+      <div class="tab-content border-start border-end border-bottom p-3" id="sightingsTabContent">
+
+        <div class="tab-pane fade show active" id="barchart-pane" role="tabpanel" aria-labelledby="barchart-tab">
+          <div id="chart-sightings">
+            <div class="spinner-wrapper d-flex justify-content-center my-3">
+              <div class="spinner-grow text-primary" role="status">
+                <span class="visually-hidden">Loading…</span>
+              </div>
+            </div>
+          </div>
+          <div id="sightingsChartContainer" class="chart-container pt-3">
+            <canvas id="sightingsChart" height="400"></canvas>
+          </div>
+        </div>
+
+        <div class="tab-pane fade" id="heatmap-pane" role="tabpanel" aria-labelledby="heatmap-tab">
+          <div id="sightings-heatmap-container" class="mt-2 mb-2">
+            <div id="cal-heatmap"></div>
+            <div id="heatmap-legend" class="d-flex justify-content-end mt-2"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <button id="reset-table" class="btn btn-sm btn-outline-danger" style="display:none;">
+        Show all sightings
+      </button>
+    </div>
+
+    <div class="row">
+      <h3>Sightings</h3>
+      <div class="table-responsive">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Author</th>
+              <th scope="col">Source</th>
+              <th scope="col">Type</th>
+              <th scope="col">Date</th>
+            </tr>
+          </thead>
+          <tbody id="sighting-table-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div id="chart-detailed-legend" class="row">
+      <h3>Nomenclature</h3>
+      <div class="col-md-8">
+        <ul class="list-group list-group-flush">
+          <li class="list-group-item"><b>Seen</b>: The vulnerability was mentioned, discussed, or observed by the user.</li>
+          <li class="list-group-item"><b>Confirmed</b>: The vulnerability has been validated from an analyst's perspective.</li>
+          <li class="list-group-item"><b>Published Proof of Concept</b>: A public proof of concept is available for this vulnerability.</li>
+          <li class="list-group-item"><b>Exploited</b>: The vulnerability was observed as exploited by the user who reported the sighting.</li>
+          <li class="list-group-item"><b>Patched</b>: The vulnerability was observed as successfully patched by the user who reported the sighting.</li>
+          <li class="list-group-item"><b>Not exploited</b>: The vulnerability was not observed as exploited by the user who reported the sighting.</li>
+          <li class="list-group-item"><b>Not confirmed</b>: The user expressed doubt about the validity of the vulnerability.</li>
+          <li class="list-group-item"><b>Not patched</b>: The vulnerability was not observed as successfully patched by the user who reported the sighting.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-pane fade show" id="sightingsCorrelations" role="tabpanel" aria-labelledby="sightingsCorrelations-tab">
+    <br />
+    <div id="graph-container"><div id="tooltip" style="position: absolute; opacity: 0; pointer-events: none;" class="tooltip-style"></div></div>
+  </div>
+
+  <div class="tab-pane fade show" id="cwes" role="tabpanel" aria-labelledby="cwes-tab">
+    <br />
+    <div id="list-cwes">
+      <!-- Spinner wrapper -->
+      <div class="spinner-wrapper d-flex justify-content-center my-3">
+        <div class="spinner-grow text-primary" role="status">
+          <span class="visually-hidden">Loading…</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-pane fade show" id="detection-rules" role="tabpanel" aria-labelledby="detection-rules-tab">
+    <br />
+    <p>Detection rules are retrieved from <a href="https://rulezet.org" rel="noreferrer" target="_blank">Rulezet</a>.</p>
+    <div id="list-detection-rules">
+      <!-- Spinner wrapper -->
+      <div class="spinner-wrapper d-flex justify-content-center my-3">
+        <div class="spinner-grow text-primary" role="status">
+          <span class="visually-hidden">Loading…</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="tab-pane fade show" id="emb3d" role="tabpanel" aria-labelledby="emb3d-tab">
+    <br />
+    <div id="list-EMB3D">
+      <!-- Spinner wrapper -->
+      <div class="spinner-wrapper d-flex justify-content-center my-3">
+        <div class="spinner-grow text-primary" role="status">
+          <span class="visually-hidden">Loading…</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+</div>
+{% if config.user_accounts  %}
+<script>
+  const mlGateway = {{ config.ML_GATEWAY | default(None) | tojson }};
+  let easyMDE = null;
+  let SCHEMA = null;
+  let COMMENTS = {};
+
+  function getSelectValues(select) {
+    var tags = [];
+    var options = select && select.options;
+    var opt;
+
+    for (var i=0, iLen=options.length; i<iLen; i++) {
+      opt = options[i];
+
+      if (opt.selected) {
+        if (opt.parentNode.getAttribute("exclusive") == "true") {
+          options1 = document.getElementById("select-tags").options;
+          for (var j=0, jLen=options1.length; j<jLen; j++) {
+            opt1 = options1[j];
+            if (opt1.parentNode.getAttribute("exclusive") == "true") {
+              opt1.selected = false;
+            }
+          }
+          opt.selected = true;
+        }
+        tags.push(opt.value || opt.text);
+      }
+    }
+    var json = jsoneditor.getValue();
+
+    if (!("meta" in json)) {
+      json["meta"] = [{"tags": tags}];
+    } else {
+      json["meta"].forEach(function(value, index, array) {
+      if ("tags" in value) {
+        obj = {"tags": tags}
+        json["meta"] = [];
+        json["meta"] = [obj];
+      }
+    })
+    }
+
+    jsoneditor.setValue(json);
+  }
+
+  document.getElementById("select-tags").onclick= function (e) {
+    getSelectValues(document.getElementById("select-tags"));
+  };
+
+  function formatNumberWithPrecision(value, precision) {
+    const formattedValue = parseFloat(value.toFixed(precision));
+    return formattedValue;
+  }
+
+  function RoundNumber(value) {
+    return Math.round(value);
+  }
+
+  document.addEventListener("DOMContentLoaded", function() {
+    // Enable tootips
+    var tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'))
+    var tooltipList = tooltipTriggerList.map(function (tooltipTriggerEl) {
+      return new bootstrap.Tooltip(tooltipTriggerEl)
+    })
+
+    // Enable Popovers
+    const popoverTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="popover"]'));
+    popoverTriggerList.map(function (popoverTriggerEl) {
+      return new bootstrap.Popover(popoverTriggerEl);
+    });
+
+    // Chevrons
+    const collapses = document.querySelectorAll(".collapse");
+    collapses.forEach(collapse => {
+      collapse.addEventListener("shown.bs.collapse", function () {
+        const chevron = document.querySelector(`.chevron[data-target="${collapse.id}"]`);
+        if (chevron) chevron.innerHTML = {{ render_icon('chevron-contract') | tojson | safe }};
+      });
+
+      collapse.addEventListener("hidden.bs.collapse", function () {
+        const chevron = document.querySelector(`.chevron[data-target="${collapse.id}"]`);
+        if (chevron) chevron.innerHTML = {{ render_icon('chevron-expand') | tojson | safe }};
+      });
+    });
+
+    // Pretty print of JSON data in JSON containers
+    var jsonContainers = document.querySelectorAll(".json-container");
+    jsonContainers.forEach(function(jsonContainer) {
+      const obj = JSON.parse(jsonContainer.innerText);
+      jsonContainer.innerHTML = prettyPrintJson.toHtml(obj, { quoteKeys: true });
+    });
+
+
+    // Open the tab specified with an anchor in the URL.
+    const hash = window.location.hash;
+    const tabButton = document.querySelector(`button[data-bs-target="${hash}"]`);
+    if (tabButton) {
+      const tab = new bootstrap.Tab(tabButton);
+      tab.show();
+      selected_tab = tabButton.getAttribute("id");
+      switch (selected_tab) {
+        case "comments-tab":
+          loadComments();
+          break;
+        case "bundles-tab":
+          loadBundles();
+          break;
+        case "sightings-tab":
+          loadSightings();
+          break;
+        case "sightingsCorrelations-tab":
+          loadSightingsCorrelations();
+          break;
+        case "cwes-tab":
+          loadCWEs();
+          break;
+        case "detection-rules-tab":
+          loadDetectionRules()
+          break;
+        case "emb3d-tab":
+          loadEmb3d()
+          break;
+        default:
+          openTabById("#related");
+          break;
+      }
+    } else {
+      openTabById("#related");
+    }
+    // Update the URL when a tab is clicked, for consistent behavior
+    document.querySelectorAll('.nav-link[data-bs-toggle="tab"]').forEach(tabLink => {
+      tabLink.addEventListener("shown.bs.tab", function(event) {
+        history.replaceState(null, null, event.target.getAttribute("href"));
+      });
+    });
+
+    // Retrieve the JSON schema for the comment and initialize the editor.
+    fetch("{{ url_for('static', filename='schemas/CIRCL/Security_Advisory_Comment.json') }}")
+    .then(response => response.json())
+    .then(result => {
+      // initialize the JSON editor
+      SCHEMA = result;
+      initialize_editor(SCHEMA, {});
+    }).catch((error) => {
+      console.error('Error:', error);
+    });
+
+
+    // Retrieve EPSS score
+    function updateEpssScore(vulnerabilityId) {
+      const epssScoreElem = document.getElementById("epss-score");
+      const epssPercentileElem = document.getElementById("epss-percentile");
+
+      if (!epssScoreElem || !epssPercentileElem) return;
+
+      const container = epssScoreElem.parentNode?.parentNode;
+
+      fetch(`{{ url_for('apiv1.epss_epss_item', vulnerability_id='__VID__') }}`.replace("__VID__", vulnerabilityId))
+        .then(response => response.json())
+        .then(result => {
+          if (container) container.removeAttribute("hidden");
+
+          if (result.total >= 1) {
+            const epss = (result.data[0].epss * 100).toFixed(2) + "%";
+            const percentile = `(${formatNumberWithPrecision(Number(result.data[0].percentile), 5)})`;
+
+            epssScoreElem.innerText = epss;
+            epssPercentileElem.innerText = percentile;
+          } else {
+            epssScoreElem.innerText = "Not yet available from FIRST.";
+            epssPercentileElem.innerText = "";
+          }
+        })
+        .catch(error => {
+          console.error("Error:", error);
+          if (container) container.remove();
+        });
+    }
+    updateEpssScore("{{ vulnerability_id }}");
+
+
+    // Retrieve VLAI Severity score
+    if (mlGateway) {
+      function updateSeverityScore() {
+        const aiSeverityElement = document.getElementById("ai-severity-score");
+        const descriptionElement = document.getElementById("vulnerability-description");
+
+        if (!aiSeverityElement || !descriptionElement) return;
+
+        const modelName = descriptionElement.getAttribute("model-name");
+        const content = {
+          description: descriptionElement.innerText
+        };
+        if (modelName) {
+          content.model = modelName;
+        }
+
+        fetch("{{ url_for('apiv1.vlai_vlai_severity_classification') }}", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(content)
+        })
+        .then(response => response.json())
+        .then(result => {
+          const severity = result["severity"];
+          const confidence = formatNumberWithPrecision(result["confidence"], 4);
+
+          // Show result container
+          aiSeverityElement.parentNode.classList.remove("d-none");
+
+          // Translate Chinese severity if needed
+          let severityText = severity;
+          if (modelName === "CIRCL/vulnerability-severity-classification-chinese-macbert-base") {
+            const translations = { "低": "Low 低", "中": "Medium 中", "高": "High 高" };
+            severityText = translations[severity] || severity;
+          }
+
+          aiSeverityElement.innerText = `${severityText} (confidence: ${confidence})`;
+
+          // Styling based on severity
+          const styleMap = {
+            "Low": ["bg-success", "text-dark"],
+            "低": ["bg-success", "text-dark"],
+            "Medium": ["bg-warning", "text-dark"],
+            "中": ["bg-warning", "text-dark"],
+            "High": ["bg-danger", "text-light"],
+            "高": ["bg-danger", "text-light"],
+            "Critical": ["bg-danger", "text-light"]
+          };
+
+          const [background = "bg-secondary", textcolor = "text-white"] = styleMap[severity] || [];
+
+          aiSeverityElement.classList.add("rounded", "px-1", background, textcolor);
+        })
+        .catch(error => {
+          // console.error("Error:", error);
+          aiSeverityElement.parentNode.remove();
+        });
+      }
+
+      updateSeverityScore();
+    }
+
+
+    // Retrieve the detection rules
+    loadDetectionRules();
+  }) // End DOMContentLoaded listener
+
+
+  if (document.getElementById("deleteVulnerability")) {
+    document.getElementById("deleteVulnerability").onclick = function(event) {
+      if (!confirm('You are going to delete the vulnerability. Are you sure?')) {
+          return;
+      }
+      var csrf_token = "{{ csrf_token() }}";
+      fetch("{{ url_for('apiv1.vulnerability_vulnerability', vulnerability_id=vulnerability_id) }}", {
+        method: "DELETE",
+            headers: {
+              'Content-Type': 'application/json',
+              'X-CSRFToken': csrf_token
+            }
+      })
+      .then(response => {
+        if (!response.ok) {
+          console.log(response);
+        } else {
+          window.location="{{ url_for('home_bp.recent') }}";
+        }
+      })
+      .catch((error) => {
+        console.log(error);
+      });
+    };
+  }
+
+  function addSighting(originalEvent, source) {
+    const clickedItem = originalEvent.target;
+    var csrf_token = "{{ csrf_token() }}";
+    var json = {};
+    json["type"] = clickedItem.getAttribute("value");
+    json["vulnerability"] = "{{ vulnerability_id }}";
+    json["source"] = source;
+    data = JSON.stringify(json);
+    fetch("{{ url_for('apiv1.sighting_sightings_list') }}", {
+      method: "POST",
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': csrf_token
+      },
+      body: data
+    })
+    .then(res => {
+      if (!res.ok) {
+        res.json().then(json => {
+          document.getElementById("modal-error-text").innerText = "Problem when saving sighting.";
+          var modal = new bootstrap.Modal(document.getElementById('modalError'), {});
+          modal.show();
+        });
+      } else {
+        loadSightings();
+        showToast("Success", "Sighting added successfully!");
+        openTabById("#sightings");
+      }
+    })
+    .catch((error) => {
+      console.log(error);
+    });
+  };
+
+  // Function to display the modal
+  function showModal(title, message, confirmCallback, event) {
+  // Get modal elements
+  const modal = new bootstrap.Modal(document.getElementById('sightingModal'));
+  const modalTitle = document.getElementById('sightingModalLabel');
+  const modalMessage = document.getElementById('modalMessage');
+  const confirmButton = document.getElementById('sightingModalConfirm');
+  const sourceInput = document.getElementById('sourceInput');
+
+  // Set modal title and body message
+  modalTitle.textContent = title;
+  modalMessage.textContent = message;
+
+  // Clear previous input value
+  sourceInput.value = '';
+
+  // Remove any previous click event to avoid duplication
+  confirmButton.replaceWith(confirmButton.cloneNode(true));
+
+  // Attach new event listener for confirmation button
+  document.getElementById('sightingModalConfirm').addEventListener('click', () => {
+    const source = sourceInput.value.trim();
+    confirmCallback(event, source); // Pass the source to the callback
+    modal.hide();
+  });
+
+  // Show the modal
+  modal.show();
+}
+
+
+  // Attach click event listener to sightings list
+  const sightings_list = document.getElementById('sighting-list');
+  if (sightings_list) {
+    sightings_list.addEventListener('click', function (event) {
+      showModal(
+        'New Sighting',
+        'Are you sure you want to add this sighting?',
+        addSighting,
+        event
+      );
+    });
+  }
+
+  document.getElementById("savecomment").addEventListener("click", function(event) {
+    var csrf_token = "{{ csrf_token() }}";
+    var json = jsoneditor.getValue();
+    json["description"] = easyMDE.value();
+    json["vulnerability"] = "{{ vulnerability_id }}";
+    json["uuid"] = crypto.randomUUID();
+    data = JSON.stringify(json);
+    fetch("{{ url_for('apiv1.comment_comments_list') }}", {
+      method: "POST",
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': csrf_token
+      },
+      body: data
+    })
+    .then(res => {
+      if (!res.ok) {
+        res.json().then(json => {
+          document.getElementById("modal-error-text").innerText = json['message'];
+          var modal = new bootstrap.Modal(document.getElementById('modalError'), {});
+          modal.show();
+        });
+      } else {
+        res.json().then(json => {
+          if (json.data.length == 0) {
+            showToast("Success", "Comment added successfully and pending moderation!");
+          }
+        });
+        // reinitializes the form
+        window.jsoneditor.setValue({});
+        easyMDE.value("");
+        // collapse the view which is containing the form
+        new bootstrap.Collapse(document.getElementById("newComment{{vulnerability_id}}"));
+        // load the updated list of comments
+        loadComments();
+      }
+    })
+    .catch((error) => {
+      console.log(error);
+    });
+  });
+
+  function loadComments() {
+  COMMENTS = {};
+  const DateTime = luxon.DateTime;
+  const converter = new showdown.Converter({tables: true, moreStyling: true});
+
+  // Skeleton template (no untrusted interpolation here)
+  const cardTemplate = `
+    <div class="card markdown-description">
+      <div class="card-body">
+        <h5 class="card-title"></h5>
+        <p class="card-title tags"></p>
+        <h6 class="card-subtitle mb-2 text-body-secondary"></h6>
+        <p class="card-text"></p>
+        <div class="btn-group" role="group">
+          <a role="button" class="btn btn-primary dropdown-toggle"
+             data-bs-toggle="collapse"
+             aria-expanded="false">JSON</a>
+        </div>
+        <div class="collapse"><br /><pre class="json-container"></pre></div>
+      </div>
+    </div>
+  `;
+
+  fetch("{{ url_for('apiv1.comment_comments_list', vuln_id=vulnerability_id) }}")
+    .then(response => response.json())
+    .then(result => {
+      const list = document.getElementById("list-comments");
+      list.innerHTML = "";
+      document.getElementById("nb-comments").innerText = result.metadata.count;
+
+      if (result.metadata.count === 0) {
+        list.innerHTML =
+          "No comment for this vulnerability. Browse " +
+          "<a href='/comments'>all the comments</a>.";
+        return;
+      }
+
+      result.data
+        .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+        .forEach(comment => {
+          const author = comment.author;
+          delete comment.author;
+
+          let tags = [];
+          if (Array.isArray(comment.meta) && comment.meta.length > 0) {
+            const itemWithTags = comment.meta.find(item => item.tags);
+            tags = itemWithTags ? itemWithTags.tags : [];
+          }
+
+          // Markdown → HTML → sanitize
+          let descriptionHtml = converter.makeHtml(comment.description);
+          descriptionHtml = linkifySecurityIdentifiers(descriptionHtml);
+
+          // Build DOM from safe skeleton
+          const wrapper = document.createElement("div");
+          wrapper.innerHTML = cardTemplate;
+          const card = wrapper.firstElementChild;
+
+          // Title
+          const h5 = card.querySelector("h5.card-title");
+          const titleLink = document.createElement("a");
+          titleLink.href = "/comment/" + comment.uuid;
+          titleLink.textContent = comment.title;
+          h5.appendChild(titleLink);
+
+          // Tags
+          const tagContainer = card.querySelector("p.tags");
+          tags.forEach(tag => {
+            const span = document.createElement("span");
+            span.className = "badge bg-primary me-1";
+            const link = document.createElement("a");
+            link.className = "link-light";
+            link.href = "/comments/?meta=" + encodeURIComponent(JSON.stringify([{tags: [tag]}]));
+            link.textContent = tag;
+            span.appendChild(link);
+            tagContainer.appendChild(span);
+          });
+
+          // Subtitle
+          const h6 = card.querySelector("h6.card-subtitle");
+          h6.textContent = DateTime.fromISO(comment.timestamp).toRelative() + " by ";
+          const authorLink = document.createElement("a");
+          authorLink.href = "/user/" + author.login;
+          authorLink.textContent = author.name;
+          h6.appendChild(authorLink);
+
+          // Description
+          const p = card.querySelector("p.card-text");
+          p.innerHTML = descriptionHtml;
+
+          // JSON
+          const pre = card.querySelector("pre.json-container");
+          pre.textContent = JSON.stringify(comment, null, 2);
+
+          // Collapse handling
+          const collapseId = "collapseJsonComment" + comment.uuid;
+          const collapse = card.querySelector("div.collapse");
+          const collapseBtn = card.querySelector("a.dropdown-toggle");
+          collapse.id = collapseId;
+          collapseBtn.setAttribute("data-bs-target", "#" + collapseId);
+          collapseBtn.setAttribute("aria-controls", collapseId);
+
+          COMMENTS[comment.uuid] = comment;
+          list.appendChild(card);
+          list.appendChild(document.createElement("br"));
+        });
+    })
+    .then(_ => {
+      setTimeout(() => {
+        formatMarkdownOutput();
+
+        if (easyMDE === null) {
+          easyMDE = new EasyMDE({
+            element: document.getElementById("root[description]"),
+            autoRefresh: { delay: 300 },
+            toolbarButtonClassPrefix: "mde",
+            toolbar: [
+              "bold", "italic", "heading", "|", "quote", "code", "table",
+              "unordered-list", "ordered-list", "|", "link", "image", "|",
+              "preview", "side-by-side", "fullscreen", "|"
+            ]
+          });
+        }
+      }, 0);
+      return COMMENTS;
+    })
+    .catch(err => console.error("Error:", err));
+  }
+
+  function initialize_editor(schema, json_object) {
+    // Default starting schema
+    if(!schema) {
+      schema = {}
+    }
+
+    // Divs/textareas on the page
+    var $schema = schema;
+    var $output = document.getElementById('output');
+    var $editor = document.getElementById('editor');
+
+    // Default theme
+    JSONEditor.defaults.options.theme = 'bootstrap5';
+
+    window.startval = json_object;
+
+    var jsoneditor;
+
+    var reload = function(keep_value) {
+      var startval = (jsoneditor && keep_value)? jsoneditor.getValue() : window.startval;
+      window.startval = undefined;
+
+      if (jsoneditor) {
+        jsoneditor.destroy();
+      }
+      jsoneditor = new JSONEditor($editor, {
+        // The schema for the editor
+        schema: schema,
+        // Remove collapse button
+        disable_collapse: true,
+        // Seed the form with a starting value
+        startval: startval,
+        // Enable fetching schemas via ajax
+        ajax: true,
+        // Disable additional properties
+        no_additional_properties: false,
+        // Require all properties by default
+        required_by_default: true,
+        show_opt_in: false,
+        disable_edit_json: true,
+        theme: "bootstrap5",
+        object_background: document.documentElement.getAttribute("data-bs-theme") == "dark" ? "bg-dark" : "bg-light",
+      });
+      window.jsoneditor = jsoneditor;
+
+      // When the value of the editor changes, update the JSON output and validation message
+      jsoneditor.on('change',function() {
+        var json = jsoneditor.getValue();
+      });
+    };
+    // Start the schema and output textareas with initial values
+    $schema.value = JSON.stringify(schema, null, 2);
+    reload();
+  };
+
+  function loadBundles() {
+    const DateTime = luxon.DateTime;
+    const converter = new showdown.Converter({ tables: true, moreStyling: true });
+
+    fetch("{{ url_for('apiv1.bundle_bundles_list', vuln_id=vulnerability_id) }}")
+        .then(response => response.json())
+        .then(result => {
+            const listContainer = document.getElementById("list-bundles");
+            listContainer.innerHTML = "<p>Bundles referring to this vulnerability.</p>";
+
+            if (result.metadata.count === 0) {
+                listContainer.innerHTML = "<p>This vulnerability is not linked to any bundle.</p>";
+                return;
+            }
+
+            // Sort newest first
+            result.data.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+
+            result.data.forEach(bundle => {
+                const author = bundle.author;
+                delete bundle.author;
+
+                // Safely render description through showdown + post-processing
+                let description = converter.makeHtml(bundle.description || "");
+                description = linkifySecurityIdentifiers(description);
+
+                // Card container
+                const card = document.createElement("div");
+                card.className = "card markdown-description mb-3";
+
+                const body = document.createElement("div");
+                body.className = "card-body";
+
+                // Title
+                const title = document.createElement("h5");
+                title.className = "card-title";
+                const titleLink = document.createElement("a");
+                titleLink.href = "/bundle/" + encodeURIComponent(bundle.uuid);
+                titleLink.textContent = bundle.name;
+                title.appendChild(titleLink);
+
+                // Subtitle
+                const subtitle = document.createElement("h6");
+                subtitle.className = "card-subtitle mb-2 text-body-secondary";
+                subtitle.innerHTML = `${DateTime.fromISO(bundle.timestamp).toRelative()} by
+                    <a href="/user/${encodeURIComponent(author.login)}">${author.name}</a>`;
+
+                // Description (trusted markdown conversion + sanitization)
+                const desc = document.createElement("p");
+                desc.className = "card-text";
+                desc.innerHTML = description;
+
+                // Related vulnerabilities
+                const vulnTitle = document.createElement("h5");
+                vulnTitle.className = "card-text";
+                vulnTitle.textContent = "Related vulnerabilities";
+
+                const vulnCard = document.createElement("div");
+                vulnCard.className = "card";
+
+                const vulnList = document.createElement("ul");
+                vulnList.className = "list-group list-group-flush";
+
+                (bundle.related_vulnerabilities || []).forEach(v => {
+                    const li = document.createElement("li");
+                    li.className = "list-group-item";
+                    const vulnLink = document.createElement("a");
+                    vulnLink.href = "/vuln/" + encodeURIComponent(v.toLowerCase());
+                    vulnLink.textContent = v.toLowerCase();
+                    li.appendChild(vulnLink);
+                    vulnList.appendChild(li);
+                });
+
+                vulnCard.appendChild(vulnList);
+
+                // Assemble card
+                body.appendChild(title);
+                body.appendChild(subtitle);
+                body.appendChild(desc);
+                body.appendChild(vulnTitle);
+                body.appendChild(vulnCard);
+                card.appendChild(body);
+
+                listContainer.appendChild(card);
+            });
+        })
+        .then(() => {
+            // Defer markdown formatting until DOM is updated
+            setTimeout(() => {
+                formatMarkdownOutput();
+            }, 0);
+        })
+        .catch(error => {
+            console.error("Error loading bundles:", error);
+        });
+  }
+
+  function loadSightings() {
+    fetch("{{ url_for('apiv1.sighting_sightings_list', vuln_id=vulnerability_id) }}&date_from=1970-01-01")
+    .then(response => response.json())
+    .then(result => {
+      const data = result.data;
+      if (result.metadata.count === 0) {
+        document.getElementById("sightings-pane-top").style.display = "none";
+        return;
+      }
+      document.getElementById("chart-sightings").style.display = "none";
+
+      // Draw visualizations
+      drawBarChart(data); // Bar chart for the first tab
+      drawHeatmap(data, data); // Heat map for the second tab. Pass data twice: once for counts, once for filtering references
+
+      // Initial table render
+      renderTable(data);
+
+      // Setup reset button
+      const resetBtn = document.getElementById('reset-table');
+      resetBtn.onclick = () => {
+          renderTable(data);
+          resetBtn.style.display = 'none';
+      };
+    });
+  }
+
+  function renderTable(data) {
+    const tableBody = document.getElementById("sighting-table-body");
+    tableBody.innerHTML = ""; // Clear existing
+
+    // Sort newest first
+    const sortedData = [...data].sort((a, b) => new Date(b.creation_timestamp) - new Date(a.creation_timestamp));
+
+    sortedData.forEach(sighting => {
+        const row = document.createElement("tr");
+        // Author cell
+        const authorCell = document.createElement("td");
+        const authorLink = document.createElement("a");
+        authorLink.href = "/user/" + encodeURIComponent(sighting.author.login);
+        authorLink.textContent = sighting.author.login;
+        authorCell.appendChild(authorLink);
+        row.appendChild(authorCell);
+
+        // Source cell
+        const sourceCell = document.createElement("td");
+        if (isValidURL(sighting.source)) {
+            const sourceLink = document.createElement("a");
+            sourceLink.href = sighting.source;
+            sourceLink.target = "_blank";
+            sourceLink.rel = "noreferrer";
+            sourceLink.textContent = sighting.source;
+            sourceCell.appendChild(sourceLink);
+        } else {
+            sourceCell.textContent = sighting.source || "";
+        }
+
+        // Add correlations link safely
+        sourceCell.appendChild(document.createTextNode(" ("));
+        const corrLink = document.createElement("a");
+        corrLink.href = "/sighting/" + encodeURIComponent(sighting.uuid) + "/correlations";
+        corrLink.textContent = "correlations";
+        sourceCell.appendChild(corrLink);
+        sourceCell.appendChild(document.createTextNode(")"));
+
+        row.appendChild(sourceCell);
+
+        // Type cell
+        const typeCell = document.createElement("td");
+        typeCell.textContent = sighting.type;
+        row.appendChild(typeCell);
+
+        // Date cell
+        const dateCell = document.createElement("td");
+        dateCell.classList.add("datetime");
+        dateCell.textContent = sighting.creation_timestamp;
+        dateCell.title = sighting.creation_timestamp;
+        row.appendChild(dateCell);
+
+        tableBody.appendChild(row);
+    });
+
+    // Re-apply relative time
+    const DateTime = luxon.DateTime;
+    document.querySelectorAll(".datetime").forEach(element => {
+        element.textContent = DateTime.fromISO(element.getAttribute('title')).toRelative();
+    });
+  }
+
+function loadDetectionRules() {
+  const ruleTemplate = _.template(`
+    <div class="card markdown-description mb-3">
+      <div class="card-body">
+        <h5 class="card-title">
+          <a href="<%= detail_url %>" rel="noreferrer" target="_blank"><%= _.escape(title) %></a>
+        </h5>
+        <% if (description) { %>
+          <p class="card-text"><%= _.escape(description) %></p>
+        <% } %>
+        <p class="card-text"><strong>Format:</strong> <%= _.escape(format) %></p>
+        <p class="card-text"><strong>Created:</strong> <%= _.escape(creation_date) %></p>
+        <% if (raw) {
+             const rawId = 'raw-' + _.uniqueId();
+        %>
+          <div class="d-flex align-items-start">
+            <pre id="<%= rawId %>" class="card-text flex-grow-1"><%= _.escape(raw) %></pre>
+            <button class="btn btn-sm btn-outline-secondary ms-2" onclick="copyToClipboard('<%= rawId %>')" title="Copy to clipboard">
+              {{ render_icon('clipboard') }}
+            </button>
+          </div>
+        <% } %>
+      </div>
+    </div>
+  `);
+
+  fetch("{{ url_for('apiv1.rulezet_rulezet_item', vulnerability_id=vulnerability_id) }}")
+    .then(response => response.json())
+    .then(result => {
+      const container = document.getElementById("list-detection-rules");
+      container.innerHTML = "";
+
+      if (!result.data || result.data.length === 0) {
+        container.innerHTML = "<p>This vulnerability is not linked to any detection rule.</p>";
+        document.getElementById("count-detection-rules").innerText = 0;
+        return;
+      }
+
+      document.getElementById("count-detection-rules").innerText = result.metadata.count;
+
+      result.data.forEach(rule => {
+        const cardHTML = ruleTemplate({
+          title: rule.title,
+          description: rule.description,
+          format: rule.format,
+          creation_date: rule.creation_date,
+          raw: rule.raw,
+          detail_url: rule.detail_url || "#"
+        });
+
+        container.insertAdjacentHTML("beforeend", cardHTML);
+      });
+    });
+}
+
+
+
+  function parseMitigationDescription(raw) {
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw !== "string") return [String(raw)];
+
+    try {
+      const parsed = JSON5.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    } catch (err) {
+      console.warn("Failed to parse mitigation with JSON5", raw);
+    }
+
+    return [raw];
+  }
+
+function loadCWEs() {
+  const cweTemplate = _.template(
+    '<div class="card markdown-description">' +
+      '<div class="card-body">' +
+        '<h5 class="card-title"><a href="/cwes/<%= id %>"><%= name %></a></h5>' +
+        '<p class="card-text"><%- description %></p>' +
+        '<h6 class="card-title"><a href="/cwes/<%= id %>#mitigations">Mitigations</a></h6>' +
+        '<% potential_mitigations.forEach(function(mitigation) { %>' +
+          '<div class="mb-3">' +
+            '<strong><%- mitigation.id %></strong>' +
+            '<ul>' +
+              '<% mitigation.descriptions.forEach(function(desc) { %>' +
+                '<li><%- desc %></li>' +
+              '<% }); %>' +
+            '</ul>' +
+          '</div>' +
+        '<% }); %>' +
+      '</div>' +
+    '</div>'
+  );
+
+  function escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  fetch("{{ url_for('apiv1.cwe_cwe_list', vuln_id=vulnerability_id) }}")
+    .then(response => response.json())
+    .then(result => {
+      const container = document.getElementById("list-cwes");
+      container.innerHTML = "";
+
+      if (result.metadata.count === 0) {
+        container.innerHTML = "<p>This vulnerability is not linked to any CWE.</p>";
+        return;
+      }
+
+      result.data.forEach(cwe => {
+        const rawMitigations = cwe.Potential_Mitigations?.Mitigation || [];
+
+        const mitigations = rawMitigations.map(m => {
+          const descList = parseMitigationDescription(m.Description);
+          return {
+            id: m["@Mitigation_ID"] || "Mitigation",
+            descriptions: descList.map(escapeHtml)
+          };
+        });
+
+        const cardHTML = cweTemplate({
+          id: "CWE-" + cwe["@ID"],
+          name: cwe["@Name"],
+          description: escapeHtml(cwe.Description),
+          potential_mitigations: mitigations
+        });
+
+        const element = document.createElement("div");
+        element.innerHTML = cardHTML;
+        container.appendChild(element.firstChild);
+        container.appendChild(document.createElement("br"));
+      });
+    });
+}
+
+
+  function loadSightingsCorrelations() {
+  // Clear any existing graph in the container
+  d3.select("#graph-container").selectAll("svg").remove();
+  d3.select("#graph-container").selectAll(".zoom-controls").remove();
+
+  // Fetch data from API and create the graph
+  fetch("{{ url_for('apiv1.sighting_sightings_list', vuln_id=vulnerability_id) }}&date_from=1970-01-01", {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/json'
+    }
+  })
+  .then(response => response.json())
+  .then(apiData => {
+    // Extract the central node (vulnerability ID) and sightings
+    const centralNode = "{{ vulnerability_id }}".toUpperCase(); // Convert to uppercase
+    const nodes = [{ id: centralNode, group: 1 }];
+    const links = [];
+
+    // Add initial group 2 nodes and links
+    apiData.data.forEach((entry) => {
+      const sighting_source = entry.source || `no-source-${entry.uuid}`;
+      if (!nodes.some(node => node.id === sighting_source)) {
+        nodes.push({ id: sighting_source, group: 2 });
+      }
+      links.push({ source: sighting_source, target: centralNode });
+    });
+
+    const width = document.getElementById("graph-container").offsetWidth;
+    const height = document.getElementById("graph-container").offsetHeight || 600;
+
+    const svg = d3
+      .select("#graph-container")
+      .append("svg")
+      .attr("width", width)
+      .attr("height", height);
+
+    const svgGroup = svg.append("g");
+
+    svg.append("defs").append("marker")
+      .attr("id", "arrow")
+      .attr("viewBox", "0 -5 10 10")
+      .attr("refX", 22)
+      .attr("refY", 0)
+      .attr("markerWidth", 6)
+      .attr("markerHeight", 6)
+      .attr("orient", "auto")
+      .append("path")
+      .attr("d", "M0,-5L10,0L0,5")
+      .attr("fill", "#999");
+
+    const simulation = d3
+      .forceSimulation(nodes)
+      .force("link", d3.forceLink(links).id(d => d.id).distance(100))
+      .force("charge", d3.forceManyBody().strength(-300))
+      .force("center", d3.forceCenter(width / 2, height / 2));
+
+    const linkGroup = svgGroup.append("g").attr("class", "links");
+    const nodeGroup = svgGroup.append("g").attr("class", "nodes");
+    const labelGroup = svgGroup.append("g").attr("class", "labels");
+
+    function updateGraph() {
+      // Bind data for links
+      const link = linkGroup
+        .selectAll("line")
+        .data(links, d => `${d.source.id || d.source}-${d.target.id || d.target}`);
+
+      link.enter()
+        .append("line")
+        .attr("stroke-width", 2)
+        .attr("stroke", "#999")
+        .attr("marker-end", "url(#arrow)")
+        .merge(link)
+        .attr("x1", d => d.source.x)
+        .attr("y1", d => d.source.y)
+        .attr("x2", d => d.target.x)
+        .attr("y2", d => d.target.y);
+
+      // Bind data for nodes
+      const node = nodeGroup
+        .selectAll("circle")
+        .data(nodes, d => d.id);
+
+      node.enter()
+        .append("circle")
+        .attr("r", d => d.group === 1 ? 15 : 10) // Larger size for central node
+        .attr("fill", d => d.group === 2 ? "#4caf50" : "#ff0000")
+        .attr("stroke", d => d.group === 1 ? "#000000" : "none") // Border for central node
+        .attr("stroke-width", d => d.group === 1 ? 2 : 0) // Border width for central node
+        .on("mouseover", function (event, d) {
+          d3.select(this).attr("fill", "#446d80");
+
+          if (d.group === 3) {
+            const tooltip = d3.select("#tooltip");
+            tooltip
+              .style("opacity", 1)
+              .style("left", (event.pageX + 10) + "px")
+              .style("top", (event.pageY + 10) + "px")
+              .html("Loading...");
+
+            // Wrap async call in IIFE
+            (async () => {
+              try {
+                const vendorProduct = await getVulnVendorProduct(d.id);
+                tooltip.html(`<strong>${d.id}</strong><br>${vendorProduct}`);
+              } catch (error) {
+                tooltip.html(`<strong>${d.id}</strong><br><em>Error loading details</em>`);
+              }
+            })();
+          }
+        })
+        .on("mousemove", function (event) {
+          d3.select("#tooltip")
+            .style("left", (event.pageX + 10) + "px")
+            .style("top", (event.pageY + 10) + "px");
+        })
+        .on("mouseout", function (event, d) {
+          d3.select(this).attr("fill", d => d.group === 2 ? "#4caf50" : "#ff0000");
+
+          if (d.group === 3) {
+            d3.select("#tooltip").style("opacity", 0);
+          }
+        })
+        .on("dblclick", function (event, d) {
+          if (d.group === 3) {
+            window.location.href = `/vuln/${d.id}`;
+          }
+        })
+        .call(
+          d3.drag()
+            .on("start", (event, d) => {
+              if (!event.active) simulation.alphaTarget(0.3).restart();
+              d.fx = d.x;
+              d.fy = d.y;
+            })
+            .on("drag", (event, d) => {
+              d.fx = event.x;
+              d.fy = event.y;
+            })
+            .on("end", (event, d) => {
+              if (!event.active) simulation.alphaTarget(0);
+              d.fx = null;
+              d.fy = null;
+            })
+        )
+        .merge(node)
+        .attr("cx", d => d.x)
+        .attr("cy", d => d.y);
+
+      // Bind data for labels
+      const label = labelGroup
+        .selectAll("text")
+        .data(nodes, d => d.id);
+
+      label.enter()
+        .append("a")
+        .attr("xlink:href", d => (d.id.startsWith("http") ? d.id : null)) // Make label clickable if URL
+        .attr("target", "_blank") // Open link in new tab
+        .append("text")
+        .text(d => (d.group === 1 || d.group === 3) ? d.id : (d.group === 2 ? d.id : ""))
+        .attr("font-size", 12)
+        .attr("dx", 18)
+        .attr("dy", 4)
+        .merge(label)
+        .attr("x", d => d.x)
+        .attr("y", d => d.y);
+
+      // Restart simulation
+      simulation.nodes(nodes);
+      simulation.force("link").links(links);
+      simulation.alpha(1).restart();
+    }
+
+    // Add zoom in and zoom out buttons
+    const zoom = d3.zoom().on("zoom", (event) => {
+      svgGroup.attr("transform", event.transform);
+    });
+
+    svg.call(zoom);
+
+    const zoomControls = d3.select("#graph-container")
+      .append("div")
+      .attr("class", "zoom-controls")
+      .style("position", "relative")
+      .style("top", "10px")
+      .style("right", "10px");
+
+    zoomControls.append("button")
+      .attr("class", "btn btn-primary m-1 mb-2")
+      .text("+")
+      .on("click", () => {
+        svg.transition().call(zoom.scaleBy, 1.2);
+      });
+
+    zoomControls.append("button")
+      .attr("class", "btn btn-primary m-1 mb-2")
+      .text("-")
+      .on("click", () => {
+        svg.transition().call(zoom.scaleBy, 0.8);
+      });
+
+    // Automatically fetch vulnerabilities for all group 2 nodes
+    const group2Nodes = nodes.filter(node => node.group === 2);
+
+    group2Nodes.forEach(node => {
+      fetch(`/api/sighting?source=${encodeURIComponent(node.id)}`, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' }
+      })
+        .then(response => response.json())
+        .then(expandData => {
+          expandData.data.forEach((entry) => {
+            const vuln = entry.vulnerability.toUpperCase(); // Convert to uppercase
+            if (vuln !== centralNode && !nodes.some(n => n.id === vuln)) {
+              const newNode = { id: vuln, group: 3 };
+              nodes.push(newNode);
+              links.push({ source: node, target: newNode }); // Use node object as source
+            }
+          });
+          updateGraph();
+        })
+        .catch(error => console.error('Error fetching vulnerabilities:', error));
+    });
+
+    simulation.on("tick", () => {
+      linkGroup.selectAll("line")
+        .attr("x1", d => d.source.x)
+        .attr("y1", d => d.source.y)
+        .attr("x2", d => d.target.x)
+        .attr("y2", d => d.target.y);
+
+        nodeGroup.selectAll("circle")
+        .attr("cx", d => d.x)
+        .attr("cy", d => d.y);
+
+      labelGroup.selectAll("text,a")
+        .attr("x", d => d.x)
+        .attr("y", d => d.y);
+    });
+
+    updateGraph();
+  })
+  .catch(error => console.error('Error fetching initial data:', error));
+}
+
+
+function loadEmb3d() {
+  var emb3DTemplate = _.template(
+        '<div class="card markdown-description">' +
+        '<div class="card-body">' +
+        '<h5 class="card-title"><a href="https://emb3d.mitre.org/threats/<%= technique_id %>" class="card-link"  rel="noreferrer" target="_blank"><%= technique_id %></a></h5>' +
+        '<h6 class="card-subtitle mb-2 text-body-secondary">Type: <%= type %></h6>' +
+        '<p class="card-text"><%= description %></p>' +
+        '<h5 class="card-text">CWE</h5>' +
+        '<div class="card" >' +
+        '<ul class="list-group list-group-flush">' +
+        '<% _.forEach(CWEs[0], function(value, key) { %>' +
+          '<li class="list-group-item"><%= value %></li>' +
+        '<% }); %>' +
+        '</ul>' +
+        '</div>' +
+        '</div>');
+
+  fetch("{{ url_for('apiv1.emb3d_emb3_d_list', vuln_id=vulnerability_id) }}")
+  .then(response => response.json())
+  .then(result => {
+    if (result.metadata.count == 0) {
+      document.getElementById("list-EMB3D").innerHTML = "<p>This vulnerability is not linked to any EMB3D MITRE adversarial technique.</p>";
+    } else {
+      document.getElementById("list-EMB3D").innerHTML = "";
+      result.data.map(function(technique) {
+        console.log(technique.CWE);
+        var cardHTML = emb3DTemplate({
+          'technique_id': technique.id.toUpperCase(),
+          'type': technique.Type,
+          'description': technique.description,
+          'CWEs': technique.CWE,
+        });
+        var element = document.createElement("div");
+        var element_br = document.createElement("br");
+        element.innerHTML = cardHTML;
+        document.getElementById("list-EMB3D").appendChild(element.firstChild);
+        document.getElementById("list-EMB3D").append(element_br);
+      })
+    }
+  })
+}
+
+
+document.getElementById("btnThemeSwitch").addEventListener("click",()=>{
+    if (document.documentElement.getAttribute("data-bs-theme") == "dark") {
+      Array.from(document.getElementsByClassName("card")).forEach(container => {
+        container.classList.remove("bg-dark");
+        container.classList.add("bg-light");
+      });
+    } else {
+      Array.from(document.getElementsByClassName("card")).forEach(container => {
+        container.classList.remove("bg-light");
+        container.classList.add("bg-dark");
+      });
+    }
+  })
+</script>
+{% endif %}
+{% endblock %}

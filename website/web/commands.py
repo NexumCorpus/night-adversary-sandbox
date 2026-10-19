@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+
+import asyncio
+import os
+import signal
+import subprocess
+import sys
+from datetime import datetime, timezone
+from types import FrameType
+from typing import Optional
+
+import click
+from pymispwarninglists import tools
+from sqlalchemy import text
+
+import website.models
+import website.scripts
+from vulnerabilitylookup.default import get_homedir, safe_create_dir
+from website.lib.gcve_utils import sync_organizations, update_local_gcve_registry
+from website.models import Sighting, User
+from website.web.bootstrap import application, db
+
+
+@application.cli.command("db_init")
+def db_init() -> None:
+    "Will create the database from conf parameters."
+    with application.app_context():
+        website.models.db_init(db)
+
+
+@application.cli.command("db_create")
+def db_create() -> None:
+    "Will create the database."
+    with application.app_context():
+        website.models.db_create(
+            db,
+            application.config["DB_CONFIG_DICT"],
+            application.config["DATABASE_NAME"],
+        )
+
+
+@application.cli.command("db_diagram")
+def db_diagram() -> None:
+    """Will generate a diagram of the models."""
+    with application.app_context():
+        homedir = get_homedir()
+        png_file = os.path.join(homedir, "docs", "_static", "img", "model_diagram.png")
+        website.models.generate_models_diagram(png_file)
+
+
+@application.cli.command("db_backup")
+def db_backup() -> None:
+    "Will backup the database."
+    with application.app_context():
+        homedir = get_homedir()
+        db_name = application.config["DATABASE_NAME"]
+
+        # Set up the environment variables for pg_dump
+        os.environ["PGPASSWORD"] = application.config["DB_CONFIG_DICT"]["password"]
+
+        # Construct the backup filename with timestamp
+        backup_path = homedir / "data" / "backup" / "postgresql"
+        safe_create_dir(backup_path)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        backup_file = os.path.join(backup_path, f"{db_name}_backup_{timestamp}.sql")
+
+        # Construct the pg_dump command
+        command = [
+            "pg_dump",
+            "-U",
+            application.config["DB_CONFIG_DICT"]["user"],
+            "-h",
+            application.config["DB_CONFIG_DICT"]["host"],
+            "-p",
+            str(application.config["DB_CONFIG_DICT"]["port"]),
+            "-F",
+            "c",  # Custom format
+            "-f",
+            backup_file,
+            db_name,
+        ]
+
+        try:
+            # Run the pg_dump command
+            subprocess.run(command, check=True)
+            print(f"Database backup completed successfully: {backup_file}")
+        except subprocess.CalledProcessError as e:
+            print(f"Error during backup: {e}")
+        finally:
+            # Clean up the environment variable
+            os.environ.pop("PGPASSWORD", None)
+
+
+@application.cli.command("create_user")
+@click.option("--login", default="admin", help="Login")
+@click.option("--email", default="admin@admin.localhost", help="Email")
+@click.option("--password", default="password", help="Password")
+def create_user(login: str, email: str, password: str) -> None:
+    "Initializes a user."
+    print(f"Creation of the user {login}…")
+    with application.app_context():
+        website.scripts.create_user(
+            login,
+            email,
+            password,
+            True,
+            True,
+            False,
+            False,
+        )
+
+
+@application.cli.command("create_admin")
+@click.option("--login", default="admin", help="Login")
+@click.option("--email", default="admin@admin.localhost", help="Email")
+@click.option("--password", default="password", help="Password")
+def create_admin(login: str, email: str, password: str) -> None:
+    "Initializes an admin user."
+    print(f"Creation of the admin user {login}…")
+    with application.app_context():
+        website.scripts.create_user(
+            login,
+            email,
+            password,
+            True,
+            True,
+            True,
+            True,
+        )
+
+
+@application.cli.command("user_get_api_key")
+@click.option("--login", default="admin", help="Login")
+def user_get_api_key(
+    login: str,
+) -> None:
+    "Returns the API key of a user."
+    user = User.query.filter(User.login == login).first()
+    if user:
+        print(user.apikey)
+    else:
+        print("No such user.")
+
+
+@application.cli.command("user_list")
+def user_list() -> None:
+    """List all users."""
+    for user in User.query.all():
+        print(user)
+        print()
+
+
+@application.cli.command("user_delete")
+@click.option("--login", default="", help="Login of the user to delete.")
+@click.option(
+    "-y",
+    "--yes",
+    is_flag=True,
+    help="Automatically reply yes to the confirmation message.",
+)
+def user_delete(login: str, yes: str) -> None:
+    """Delete the user specified with its login."""
+    if yes or click.confirm("Delete the user?"):
+        try:
+            user = User.query.filter(User.login == login).first()
+            if user:
+                db.session.delete(user)
+                db.session.commit()
+            else:
+                print("No such user.", file=sys.stderr)
+        except Exception as e:
+            print(e)
+
+
+@application.cli.command("update_warninglists")
+def update_warninglists() -> None:
+    """Update MISP warning lists."""
+    homedir = get_homedir()
+    homedir = homedir.joinpath("data")
+    safe_create_dir(homedir)
+    os.environ["XDG_DATA_HOME"] = homedir.absolute().as_posix()
+    tools.update_warninglists()  # type: ignore[no-untyped-call]
+    print(f"Warning lists updated successfully: {homedir}")
+
+
+@application.cli.command("update_gcve_registry")
+def update_gcve_registry() -> None:
+    """Update the local copy of the GCVE registry."""
+    update_local_gcve_registry()
+
+
+@application.cli.command("sync_organizations")
+@click.option("--login", default="admin", help="Login")
+def sync_gcve_organizations(login: str) -> None:
+    """Synchronize the organizations against the GCVE registry."""
+    sync_organizations(login)
+
+
+@application.cli.command("clean_sightings")
+@click.option(
+    "--source",
+    required=True,
+    help="Delete in bulk the sightings associated to the same specified source or matching a regex.",
+)
+@click.option(
+    "--regex",
+    is_flag=True,
+    default=False,
+    help="Interpret the source parameter as a regex pattern (PostgreSQL only).",
+)
+def clean_sightings(source: str, regex: bool) -> None:
+    """Delete sightings by exact source or by regex pattern."""
+    try:
+        if regex:
+            # Regex deletion using PostgreSQL ~ operator
+            stmt = (
+                Sighting.__table__.delete()
+                .where(text("source ~ :pattern"))
+                .execution_options(synchronize_session=False)
+            )
+            db.session.execute(stmt, {"pattern": source})
+        else:
+            # Exact match deletion
+            Sighting.query.filter(Sighting.source == source).delete(
+                synchronize_session=False
+            )
+
+        db.session.commit()
+        click.echo(
+            f"Deleted sightings for {'pattern' if regex else 'source'}: {source}"
+        )
+    except Exception as e:
+        print(e)
+        db.session.rollback()
+
+
+@application.cli.command("import_languages")
+@click.option(
+    "--json_file",
+    default="etc/languages.json",
+    help="Import languages from a JSON file.",
+)
+def import_languages(json_file: str) -> None:
+    "Import programming languages from a JSON file"
+    print(f"Importing programming languages from {json_file}…")
+    website.scripts.import_languages(json_file)
+
+
+@application.cli.command("import_osi_approved_licenses")
+def import_osi_approved_licenses() -> None:
+    "Import OSI approved licenses."
+    print("Importing OSI approved licenses…")
+    website.scripts.import_osi_approved_licenses()
+
+
+@application.cli.command("retrieve_first_teams")
+def retrieve_first_teams() -> None:
+    "Retrieve FIRST teams from api.first.org."
+    print("Retrieve FIRST teams…")
+    print(website.scripts.retrieve_first_teams())
+
+
+@application.cli.command("import_organizations")
+@click.option(
+    "--json_file",
+    default="etc/organizations.json",
+    help="Import organizations from a JSON file.",
+)
+@click.option("--user-id", default=1, help="Id of the user used to import.")
+def import_organizations(json_file: str, user_id: int) -> None:
+    "Import organizations from a JSON file"
+    print(f"Importing organizations from {json_file}…")
+    website.scripts.import_organizations(json_file, user_id)
+
+
+@application.cli.command("notify_users")
+@click.option("--interval", default=10, help="Sleep interval.")
+def notify_users(interval: int) -> None:
+    """Launches the notification daemon with graceful shutdown."""
+    print("Launching notification daemon…")
+    shutdown_event = asyncio.Event()
+
+    # Signal handler to set the shutdown event
+    def handle_signal(signal_number: int, frame: Optional[FrameType]) -> None:
+        print(f"Received signal {signal_number}. Shutting down gracefully…")
+        shutdown_event.set()
+
+    # Register signals for graceful shutdown
+    signal.signal(signal.SIGINT, handle_signal)  # Handle Ctrl+C
+    signal.signal(signal.SIGTERM, handle_signal)  # Handle termination signals
+
+    with application.app_context():
+        try:
+            asyncio.run(
+                website.scripts.notify.launch_notification_scheduler(
+                    shutdown_event, interval
+                )
+            )
+        except KeyboardInterrupt:
+            print("KeyboardInterrupt received. Exiting…")

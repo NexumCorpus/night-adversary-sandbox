@@ -1,0 +1,1124 @@
+#!/usr/bin/env python3
+
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, TypeVar, Union
+
+import markdown  # type: ignore[import-untyped]
+import pycountry
+from feedgen.feed import FeedGenerator  # type: ignore[import-untyped]
+from flask import (
+    Blueprint,
+    Response,
+    abort,
+    flash,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
+from flask_login import (  # type: ignore[import-untyped]
+    current_user,
+    login_required,
+    logout_user,
+)
+from flask_paginate import (  # type: ignore[import-untyped]
+    Pagination,
+    get_page_args,
+    get_parameter,
+)
+from sqlalchemy import func, or_
+from werkzeug import Response as WerkzeugResponse
+from werkzeug.security import generate_password_hash
+
+from vulnerabilitylookup.default import get_config
+from website.decorators import auth_feedkey_func
+from website.lib.sanitizers import sanitize_html_fragment
+from website.lib.user_utils import confirm_token
+from website.lib.utils import inject_xslt, top_contributors
+from website.models import (
+    Bundle,
+    Comment,
+    Notification,
+    Organization,
+    Product,
+    Sighting,
+    User,
+    VulnerabilityDisclosure,
+)
+from website.notifications import notifications
+from website.web.bootstrap import application, limiter, db, vulnerabilitylookup
+from website.web.forms import (
+    AccountConfirmationForm,
+    AccountRecoveryForm,
+    NotificationOrganizationProductForm,
+    NotificationVendorProductForm,
+    ProfileForm,
+)
+from website.web.permissions import admin_permission, reporter_permission
+
+user_bp = Blueprint("user_bp", __name__, url_prefix="/user", template_folder="user")
+users_bp = Blueprint("users_bp", __name__, url_prefix="/users", template_folder="user")
+
+
+# Type variable for a view function
+F = TypeVar("F", bound=Callable[..., Union[str, WerkzeugResponse]])
+
+
+def maybe_login_required(func: F) -> F:
+    """Wraps the function in login_required only if the config flag is True."""
+    if application.config.get("PROTECT_USER_PAGES", False):
+        return login_required(func)
+    return func
+
+
+@users_bp.route("/", methods=["GET"])
+@maybe_login_required
+def list_users() -> str:
+    """Returns a page with a list of users (directory)."""
+    users_sorted_by_contributions = [
+        (elem[1], elem[2]) for elem in top_contributors(-1) if elem[2] > 0
+    ]
+    # Users who have never contributed are sorted by last_seen
+    contributors_login = [user[0] for user in users_sorted_by_contributions]
+    non_contributors = (
+        User.query.filter(
+            User.is_active == True,  # noqa: E712
+            User.is_confirmed == True,  # noqa: E712
+            User.is_two_factor_authentication_enabled == True,  # noqa: E712
+        )
+        .order_by(User.last_seen.desc())
+        .filter(~User.login.in_(contributors_login))
+    )
+
+    users = []
+    for user in contributors_login:
+        users.append(User.query.filter(User.login == user).first())
+    users.extend(non_contributors.all())
+
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=len(users),
+        record_name="users",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    users = users[offset : offset + per_page]
+    return render_template("user/users.html", users=users, pagination=pagination)
+
+
+@user_bp.route("/<string:login>", methods=["GET"])
+@user_bp.route("/<uuid:user_uuid>", methods=["GET"])
+@maybe_login_required
+def profile(login: str = "", user_uuid: str = "") -> str:
+    """Returns a page with some information about the user given in parameter."""
+    if login:
+        user = User.query.filter(User.login == login).first()
+    elif user_uuid:
+        user = User.query.filter(User.uuid == user_uuid).first()
+    else:
+        abort(404)
+
+    if None is user:
+        abort(404)
+
+    if user.bio:
+        raw_html = markdown.markdown(user.bio)
+        user.bio = sanitize_html_fragment(raw_html)
+
+    try:
+        user_country = pycountry.countries.get(alpha_3=user.country_code).name
+    except Exception:
+        user_country = ""
+
+    top_5_contributors = top_contributors(limit=5)
+
+    return render_template(
+        "user/user.html",
+        user=user,
+        user_country=user_country,
+        nb_contributions=user.nb_contributions(),
+        top_contributor=True if user.id is top_5_contributors[0][0] else False,
+        top_3_contributors=(
+            True if user.id in [elem[0] for elem in top_5_contributors[:3]] else False
+        ),
+        top_5_contributors=(
+            True if user.id in [elem[0] for elem in top_5_contributors] else False
+        ),
+    )
+
+
+@user_bp.route("/profile", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+def form() -> str:
+    """Returns the form to edit the current user."""
+    user = User.query.filter(User.id == current_user.id).first()
+    form = ProfileForm(obj=user)
+    action = "Edit user"
+    head_titles = [action]
+    head_titles.append(user.login)
+    return render_template(
+        "user/edit_user.html",
+        action=action,
+        head_titles=head_titles,
+        form=form,
+        user=user,
+    )
+
+
+@user_bp.route("/profile", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+def process_form() -> str | WerkzeugResponse:
+    """Process the form for the user edition."""
+    form = ProfileForm()
+    user = User.query.filter(User.id == current_user.id).first()
+
+    # Form validation (login, email adress, etc.)
+    if not form.validate():
+        return render_template("user/edit_user.html", form=form, user=user)
+
+    # Check if new password submitted
+    if form.password.data:
+        # Password update from the user (validated via the ProfileForm)
+        user.pwdhash = generate_password_hash(form.password.data)
+        # Regenerate session ID without logging the user out
+        session.modified = True
+        session.new = True  # tells Flask to issue a new SID
+
+    # Check if new email submitted
+    if form.email.data != user.email:
+        # After an email change the user has to re-confirm the account.
+        current_user.is_confirmed = False
+        try:
+            # send a notification email to the current email with a token
+            notifications.account_recovery(user)
+        except Exception as error:
+            flash(
+                f"Problem while sending activation email: {error}",
+                "danger",
+            )
+
+    # Populate the user object with data from the form
+    try:
+        form.populate_obj(user)
+    except AssertionError as e:
+        flash(f"{e}", "danger")
+        return render_template("user/edit_user.html", form=form, user=user)
+
+    # Save in database
+    try:
+        db.session.commit()
+    except Exception:
+        flash("Problem when updating your profile.", "danger")
+        db.session.rollback()
+
+    flash(
+        f"User {form.login.data} successfully updated.",
+        "success",
+    )
+    return redirect(url_for("user_bp.form"))
+
+
+@user_bp.route("/generate_apikey", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+def generate_apikey() -> WerkzeugResponse:
+    """Generate a new API key for the current user after verifying their password."""
+    user = User.query.filter(User.id == current_user.id).first()
+    if user is None:
+        abort(404)
+
+    password = request.form.get("password")
+    if not password or not current_user.check_password(password):
+        flash("Incorrect password. API key was not regenerated.", "danger")
+        return redirect(url_for("user_bp.form"))
+
+    user.generate_apikey()
+    db.session.commit()
+    flash("New API key generated.", "success")
+    return redirect(url_for("user_bp.form"))
+
+
+@user_bp.route("/generate_feedkey", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+def generate_feedkey() -> WerkzeugResponse:
+    """Generate a new feed key for the current user after verifying their password."""
+    user = User.query.filter(User.id == current_user.id).first()
+    if user is None:
+        abort(404)
+
+    password = request.form.get("password")
+    if not password or not current_user.check_password(password):
+        flash("Incorrect password. Feed key was not regenerated.", "danger")
+        return redirect(url_for("user_bp.form"))
+
+    user.generate_feedkey()
+    db.session.commit()
+    flash("New feed key generated.", "success")
+    return redirect(url_for("user_bp.form"))
+
+
+@user_bp.route("/toggle_2fa", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+def toggle_2FA() -> WerkzeugResponse:
+    """
+    Toggle Two-Factor Authentication.
+    If 2FA is not enforced, let the user disable it."""
+    if application.config["ENFORCE_2FA"]:
+        flash("Impossible to disable Two-Factor Authentication.", "success")
+        return redirect(url_for("user_bp.form"))
+
+    user = User.query.filter(User.id == current_user.id).first()
+
+    if user is None:
+        abort(404)
+
+    if not user.is_two_factor_authentication_enabled:
+        session["username"] = user.login
+        flash(
+            "Configure Two-Factor Authentication.",
+            "info",
+        )
+        return redirect(url_for("user_bp.setup_two_factor_auth"))
+    else:
+        user.is_two_factor_authentication_enabled = False
+        db.session.commit()
+        flash("Two-Factor Authentication disabled.", "success")
+        return redirect(url_for("user_bp.form"))
+
+
+@user_bp.route("/delete_account", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+def delete_account() -> WerkzeugResponse:
+    """
+    Delete the account of the authenticated user.
+    In fact, it sets the value of is_active to False and deletes the session."""
+    user = User.query.filter(User.id == current_user.id).first()
+    if user is None:
+        abort(404)
+
+    password = request.form.get("password")
+    if not password or not current_user.check_password(password):
+        flash("Incorrect password. Your account was not deleted.", "danger")
+        return redirect(url_for("user_bp.form"))
+
+    user.is_active = False
+    db.session.commit()
+    logout_user()
+    flash("Account deleted.", "success")
+    return redirect(url_for("home_bp.index"))
+
+
+@user_bp.route("/confirm_account/<string:token>", methods=["GET", "POST"])
+def confirm_account(token: str = "") -> str | WerkzeugResponse:
+    """
+    Confirm the account of a user with the token that the user has received
+    previously by email.
+    """
+    # Check the token
+    user, login = None, None
+    if token != "":
+        login = confirm_token(token)
+    if login:
+        user = User.query.filter(User.login == login).first()
+    if user is None:
+        flash("Impossible to activate this account.", "danger")
+        return redirect(url_for("user_bp.login"))
+
+    # Management of the Web form
+    form = AccountConfirmationForm()
+
+    if request.method == "GET":
+        # Asks the user to provide a new password, in the case the token is
+        # valid
+        if user is not None:
+            return render_template("user/account_recovery_set_password.html", form=form)
+        else:
+            flash("Impossible to activate this account.", "danger")
+    else:
+        # Update the password of the user (if the token is valid and if the
+        # two passwards are equal)
+        if form.password1.data == form.password2.data:
+            user.pwdhash = generate_password_hash(form.password1.data)
+            user.is_confirmed = True
+            db.session.add(user)
+            db.session.commit()
+            flash("Your password has been updated.", "success")
+        else:
+            flash("Password must be the same.", "danger")
+            return render_template("user/account_recovery_set_password.html", form=form)
+
+        if (
+            application.config["ENFORCE_2FA"]
+            and not user.is_two_factor_authentication_enabled
+        ):
+            session["username"] = user.login
+            return redirect(url_for("user_bp.setup_two_factor_auth"))
+
+    return redirect(url_for("user_bp.login"))
+
+
+@limiter.limit("3 per hour")  # limit to 3 account recovery/hour per IP
+@user_bp.route("/account_recovery", methods=["GET", "POST"])
+def account_recovery() -> str | WerkzeugResponse:
+    """Returns a form for the account recovery."""
+    form = AccountRecoveryForm()
+
+    if not form.validate_on_submit():
+        return render_template("user/account_recovery.html", form=form)
+
+    user = User.query.filter(
+        func.lower(User.login) == func.lower(form.login.data),
+        User.is_active.is_(True),
+    ).first()
+    if user:
+        try:
+            notifications.account_recovery(user)
+        except Exception as error:
+            flash(f"Problem while sending activation email: {error}", "danger")
+            return redirect(url_for("home_bp.index"))
+
+    flash(
+        "If the account exists, an email with a recovery link has been sent.", "success"
+    )
+    return redirect(url_for("home_bp.index"))
+
+
+@user_bp.route("/submit", methods=["GET"])
+@user_bp.route("/edit/<string:vulnerability_id>", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+@reporter_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def vulnogram(vulnerability_id: str = "") -> str | WerkzeugResponse:
+    """Returns a form using vulnogram in order to edit or create a new vulnerability (CVE list v5)."""
+    vulnerability = vulnerabilitylookup.get_vulnerability(
+        vulnerability_id, with_meta=True
+    )
+    if vulnerability_id and None is vulnerability:
+        flash(f"Nothing found in the database for {vulnerability_id}.", "warning")
+        return redirect(url_for("home_bp.search"))
+
+    local_instance_name = get_config("generic", "local_instance_name").lower()
+    local_instance_vulnid_pattern = get_config(
+        "generic", "local_instance_vulnid_pattern"
+    )
+    local_instance_vulnid_example = get_config(
+        "generic", "local_instance_vulnid_example"
+    )
+    gcve_vulnid_pattern = "^GCVE-[0-9]+-[\x22-\x7e]+$"
+    source = vulnerabilitylookup.get_vulnerability_source(vulnerability_id)
+    return render_template(
+        "vulnogram/index.html",
+        vulnerability_id=vulnerability_id,
+        source=source,
+        local_instance_name=local_instance_name,
+        local_instance_vulnid_pattern=local_instance_vulnid_pattern,
+        local_instance_vulnid_example=local_instance_vulnid_example,
+        gcve_vulnid_pattern=gcve_vulnid_pattern,
+    )
+
+
+@user_bp.route("/comments", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+def list_comments() -> str:
+    comments = Comment.query.filter(Comment.author_id == current_user.id).order_by(
+        Comment.creation_timestamp.desc()
+    )
+
+    # Pagination
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=comments.count(),
+        record_name="comments",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    comments = comments.offset(offset).limit(per_page)
+
+    return render_template(
+        "user/comments.html", comments=comments, pagination=pagination
+    )
+
+
+@user_bp.route("/bundles", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def list_bundles() -> str:
+    """List the bundles created by the authenticated user.
+    Only administrators can create bundles."""
+    bundles = Bundle.query.filter(Bundle.author_id == current_user.id).order_by(
+        Bundle.creation_timestamp.desc()
+    )
+
+    # Pagination
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=bundles.count(),
+        record_name="bundles",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    bundles = bundles.offset(offset).limit(per_page)
+
+    return render_template("user/bundles.html", bundles=bundles, pagination=pagination)
+
+
+@user_bp.route("/sightings", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+def list_sightings() -> str:
+    """List the sightings created by the authenticated user."""
+    sightings = Sighting.query.filter(Sighting.author_id == current_user.id).order_by(
+        Sighting.creation_timestamp.desc()
+    )
+
+    # Pagination
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=sightings.count(),
+        record_name="sightings",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    sightings = sightings.offset(offset).limit(per_page)
+
+    return render_template(
+        "user/sightings.html", sightings=sightings, pagination=pagination
+    )
+
+
+@user_bp.route("/sightings/<uuid:sighting_uuid>/delete", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+def delete_sighting(sighting_uuid: str = "") -> WerkzeugResponse:
+    """Delete the sighting specified by its UUID."""
+    sighting = Sighting.query.filter(Sighting.uuid == sighting_uuid).first_or_404()
+
+    if current_user.is_admin or current_user.id == sighting.author_id:
+        db.session.delete(sighting)
+        db.session.commit()
+        flash("Sighting deleted.", "success")
+    else:
+        flash("You cannot delete this sighting.", "danger")
+
+    return redirect(request.referrer or url_for("user_bp.list_sightings"))
+
+
+@user_bp.route(
+    "/<string:login>.<string:format>", defaults={"per_page": 10}, methods=["GET"]
+)
+@maybe_login_required
+def feed_activity(
+    login: str = "", per_page: int = 10, format: str = "atom"
+) -> Response:
+    """RSS/ATOM feed for the recent activity of a user. In this context activity is
+    the creation of a comment or a bundle."""
+    public_domain = get_config("generic", "public_domain")
+    _, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    feed_max_per_page = application.config.get("FEED_MAX_PER_PAGE", 50)
+    if per_page > feed_max_per_page:
+        per_page = feed_max_per_page
+
+    fg = FeedGenerator()
+    fg.id(f"https://{public_domain}/comment/feed")
+    fg.title("Most recent activity.")
+    fg.author(
+        {
+            "name": "Vulnerability-Lookup",
+            "email": application.config.get("ADMIN_EMAIL", ""),
+        }
+    )
+    fg.link(href=f"https://{public_domain}", rel="alternate")
+    fg.subtitle(f"Contains the recent activity for {login}.")
+    fg.language("en")
+
+    query = Comment.query.filter(Comment.is_published == True)  # noqa: E712
+    query = query.filter(Comment.author.has(login=login))
+    query = query.order_by(Comment.timestamp.desc())
+    comments = query.offset(offset).limit(per_page)
+    for comment in comments:
+        fe = fg.add_entry()
+        fe.id(f"https://{public_domain}/comment/{comment.uuid}")
+        fe.title(comment.title)
+        fe.link(href=f"https://{public_domain}/comment/{comment.uuid}")
+        fe.content(comment.description)
+        fe.description(comment.description)
+        fe.published(comment.timestamp.replace(tzinfo=timezone.utc))
+
+    query = Bundle.query
+    query = query.filter(Bundle.author.has(login=login))
+    query = query.order_by(Bundle.timestamp.desc())
+    bundles = query.offset(offset).limit(per_page)
+    for bundle in bundles:
+        fe = fg.add_entry()
+        fe.id(f"https://{public_domain}/bundle/{bundle.uuid}")
+        fe.title(bundle.name)
+        fe.link(href=f"https://{public_domain}/bundle/{bundle.uuid}")
+        fe.content(bundle.description)
+        fe.description(bundle.description)
+        fe.published(bundle.timestamp.replace(tzinfo=timezone.utc))
+
+    # Generate feed with XSLT
+    feed_bytes = inject_xslt(
+        fg.atom_str(pretty=True) if format == "atom" else fg.rss_str(pretty=True)
+    )
+    return Response(feed_bytes, mimetype="application/xml")
+
+
+#
+# Notifications
+#
+
+
+@user_bp.route("/notifications", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+def list_notifications() -> str:
+    """Lists the notifications of the authenticated user."""
+    notifications = Notification.query.filter(
+        Notification.user_id == current_user.id,
+        or_(
+            Notification.notification_type == "",
+            Notification.notification_type == None,  # noqa: E711
+            Notification.notification_type == "vulnerability_cpe",
+        ),
+    ).order_by(Notification.last_execution_time.desc())
+
+    notifications_organizations = Notification.query.filter(
+        Notification.user_id == current_user.id,
+        Notification.notification_type == "vulnerability_organization",
+    ).order_by(Notification.last_execution_time.desc())
+    notifications_organizations = notifications_organizations.all()
+    for notif in notifications_organizations:
+        notif.org_object = Organization.query.filter(
+            Organization.id == notif.organization_id
+        ).first()
+        notif.product_object = Product.query.filter(
+            Product.id == notif.product_id
+        ).first()
+
+    # Pagination
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=notifications.count(),
+        record_name="notifications",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    notifications = notifications.offset(offset).limit(per_page)
+
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination_organizations = Pagination(
+        total=len(notifications_organizations),
+        record_name="notifications_organizations",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    notifications_organizations = notifications_organizations[
+        offset : offset + per_page
+    ]
+
+    return render_template(
+        "user/notifications.html",
+        notifications=notifications,
+        notifications_organizations=notifications_organizations,
+        pagination=pagination,
+        pagination_organizations=pagination_organizations,
+    )
+
+
+@user_bp.route("/notifications/create", methods=["GET"])
+@user_bp.route("/notifications/edit/<int:notification_id>", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+def new_notification(notification_id: int = 0) -> str | WerkzeugResponse:
+    action = "Create a notification"
+    head_titles = [action]
+    form_vendor_product = NotificationVendorProductForm()
+    form_organization_product = NotificationOrganizationProductForm()
+
+    # Create a new notification
+    if notification_id == 0:
+        # Check for optional arguments 'vendor' and 'product'
+        arg_vendor = request.args.get("vendor", "")
+        arg_product = request.args.get("product", "")
+        # Check for optional arguments 'organization_uuid' and 'product_uuid'
+        organization_uuid = request.args.get("organization_uuid", "")
+        product_uuid = request.args.get("product_uuid", "")
+        # Update the form appropirately
+        if arg_vendor and arg_product:
+            # New notification matching vendor/product
+            form_vendor_product.vendor.data = arg_vendor
+            form_vendor_product.product.data = arg_product
+            form_organization_product = None  # type: ignore
+        elif organization_uuid and product_uuid:
+            # New notification matching organization_uuid/product_uuid
+            linked_org = Organization.query.filter(
+                Organization.uuid == organization_uuid
+            ).first()
+            linked_product = Product.query.filter(Product.uuid == product_uuid).first()
+            if linked_org and linked_product:
+                form_organization_product.organization.data = linked_org.name
+                form_organization_product.organization_uuid.data = linked_org.uuid
+                form_organization_product.product.data = linked_product.name
+                form_organization_product.product_uuid.data = linked_product.uuid
+                form_vendor_product = None  # type: ignore
+
+        return render_template(
+            "user/edit_notification.html",
+            action=action,
+            head_titles=head_titles,
+            form_vendor_product=form_vendor_product,
+            form_organization_product=form_organization_product,
+        )
+
+    # Edit an existing notification
+    notification = Notification.query.filter(
+        Notification.id == notification_id, Notification.user_id == current_user.id
+    ).first()
+    if not notification:
+        flash("Impossible to access to this notification.", "warning")
+        return redirect(url_for("user_bp.list_notifications"))
+    if notification.notification_type == "vulnerability_organization":
+        organization = Organization.query.filter(
+            Organization.id == notification.organization_id
+        ).first()
+        product = Product.query.filter(Product.id == notification.product_id).first()
+        form_vendor_product = None  # type: ignore
+        form_organization_product = NotificationOrganizationProductForm(
+            obj=notification
+        )
+        form_organization_product.organization.data = (
+            Organization.query.filter(Organization.id == notification.organization_id)
+            .first()
+            .name
+        )
+        form_organization_product.organization.value = (
+            Organization.query.filter(Organization.id == notification.organization_id)
+            .first()
+            .uuid
+        )
+        form_organization_product.product.data = (
+            Product.query.filter(Product.id == notification.product_id).first().name
+        )
+        form_organization_product.product.value = (
+            Product.query.filter(Product.id == notification.product_id).first().uuid
+        )
+        form_organization_product.organization_uuid.data = organization.uuid
+        form_organization_product.product_uuid.data = product.uuid
+    else:
+        form_vendor_product = NotificationVendorProductForm(obj=notification)
+        form_organization_product = None  # type: ignore
+    action = "Edit the notification"
+    head_titles = [action]
+    return render_template(
+        "user/edit_notification.html",
+        form_vendor_product=form_vendor_product,
+        form_organization_product=form_organization_product,
+        action=action,
+        head_titles=head_titles,
+    )
+
+
+@user_bp.route("/notifications/create", methods=["POST"])
+@user_bp.route("/notifications/edit/<int:notification_id>", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+def process_notification(notification_id: int = 0) -> str | WerkzeugResponse:
+    """Process the form for the notification edition."""
+    action = "Create a notification"
+    head_titles = [action]
+    form_vendor_product = NotificationVendorProductForm()
+    form_organization_product = NotificationOrganizationProductForm()
+
+    if form_vendor_product.validate():
+        # Edit a notification
+        if notification_id != 0:
+            notification = Notification.query.filter(
+                Notification.id == notification_id,
+                Notification.user_id == current_user.id,
+            ).first()
+            if not notification:
+                flash("Impossible to access to this notification.", "warning")
+                return redirect(url_for("user_bp.list_notifications"))
+            try:
+                form_vendor_product.populate_obj(notification)
+            except AssertionError as e:
+                flash(f"{e}", "danger")
+                return render_template(
+                    "user/edit_notification.html",
+                    form_vendor_product=form_vendor_product,
+                    form_organization_product=None,
+                )
+            db.session.commit()
+            flash("Notification successfully updated.", "success")
+            return redirect(
+                url_for("user_bp.new_notification", notification_id=notification.id)
+            )
+
+        # Create a new notification
+        if Notification.query.filter(
+            Notification.vendor == form_vendor_product.vendor.data.lower(),
+            Notification.product == form_vendor_product.product.data.lower(),
+            Notification.user_id == current_user.id,
+        ).count():
+            flash("You are already subscribed to this notification.", "warning")
+            return redirect(url_for("user_bp.list_notifications"))
+        try:
+            new_notification = Notification(
+                vendor=form_vendor_product.vendor.data.lower(),
+                product=form_vendor_product.product.data.lower(),
+                frequency=form_vendor_product.frequency.data,
+                is_active=form_vendor_product.is_active.data,
+                notification_type="vulnerability_cpe",
+                user_id=current_user.id,
+            )
+        except AssertionError as e:
+            flash(f"{e}", "danger")
+            return render_template(
+                "user/edit_notification.html",
+                form_vendor_product=form_vendor_product,
+                form_organization_product=form_organization_product,
+            )
+        db.session.add(new_notification)
+        db.session.commit()
+        flash("Notification successfully created.", "success")
+
+        return redirect(
+            url_for("user_bp.new_notification", notification_id=new_notification.id)
+        )
+
+    elif form_organization_product.validate():
+        try:
+            linked_org = Organization.query.filter(
+                Organization.uuid == form_organization_product.organization_uuid.data
+            ).first()
+            linked_product = Product.query.filter(
+                Product.uuid == form_organization_product.product_uuid.data
+            ).first()
+        except Exception:
+            flash("Organization or product not found.", "warning")
+            return redirect(url_for("user_bp.new_notification"))
+
+        if linked_org.id not in [org.id for org in linked_product.organizations]:
+            flash("Product not related to the organization.", "warning")
+            return redirect(url_for("user_bp.new_notification"))
+
+        # Edit a notification
+        if notification_id != 0:
+            notification = Notification.query.filter(
+                Notification.id == notification_id,
+                Notification.user_id == current_user.id,
+            ).first()
+            if not notification:
+                flash("Impossible to access to this notification.", "warning")
+                return redirect(url_for("user_bp.list_notifications"))
+            try:
+                notification.vendor = linked_org.name
+                notification.product = linked_product.name
+                notification.organization_id = linked_org.id
+                notification.product_id = linked_product.id
+                notification.frequency = form_organization_product.frequency.data
+                notification.is_active = form_organization_product.is_active.data
+                notification.notification_type = "vulnerability_organization"
+            except AssertionError as e:
+                flash(f"{e}", "danger")
+                return render_template(
+                    "user/edit_notification.html",
+                    form_vendor_product=form_vendor_product,
+                    form_organization_product=form_organization_product,
+                )
+            db.session.commit()
+            flash("Notification successfully updated.", "success")
+            return redirect(
+                url_for("user_bp.new_notification", notification_id=notification.id)
+            )
+
+        # Create a new notification
+        if linked_org and linked_product:
+            try:
+                new_notification = Notification(
+                    vendor=linked_org.name,  # only for display
+                    product=linked_product.name,  # only for display
+                    organization_id=linked_org.id,
+                    product_id=linked_product.id,
+                    frequency=form_organization_product.frequency.data,
+                    is_active=form_organization_product.is_active.data,
+                    notification_type="vulnerability_organization",
+                    user_id=current_user.id,
+                )
+            except AssertionError as e:
+                flash(f"{e}", "danger")
+                return render_template(
+                    "user/edit_notification.html",
+                    form_vendor_product=form_vendor_product,
+                    form_organization_product=form_organization_product,
+                )
+            db.session.add(new_notification)
+            db.session.commit()
+            flash("Notification successfully created.", "success")
+            return redirect(
+                url_for("user_bp.new_notification", notification_id=new_notification.id)
+            )
+        else:
+            flash("Organization or product not found.", "warning")
+            return redirect(url_for("user_bp.new_notification"))
+    else:
+        return render_template(
+            "user/edit_notification.html",
+            action=action,
+            head_titles=head_titles,
+            form_vendor_product=form_vendor_product,
+            form_organization_product=form_organization_product,
+        )
+
+
+@user_bp.route("/notifications/<int:notification_id>/delete", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+def delete_notification(notification_id: int) -> WerkzeugResponse:
+    """Delete a notification."""
+    notification = Notification.query.filter(
+        Notification.id == notification_id, Notification.user_id == current_user.id
+    ).first()
+    if notification is None:
+        abort(404)
+    if current_user.is_admin or current_user.id == notification.user_id:
+        db.session.delete(notification)
+        db.session.commit()
+        flash("Notification deleted.", "success")
+    else:
+        flash("You cannot delete this notification.", "danger")
+    return redirect(url_for("user_bp.list_notifications"))
+
+
+def get_vulnerabilities_for_notification(
+    notification: Notification, date_since: datetime
+) -> dict[str, list[tuple[str, dict[str, Any]]]]:
+    notif_result: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+
+    sources = ["cvelistv5", "ghsa"]
+
+    if notification.notification_type == "vulnerability_organization":
+        product = Product.query.filter_by(id=notification.product_id).first()
+        if product:
+            for cpe_vendor, cpe_product in product.get_vendors_products_combinations():
+                vulns = vulnerabilitylookup.get_vendor_product_vulnerabilities_since(
+                    cpe_vendor,
+                    cpe_product,
+                    date_since=date_since,
+                    number=30,
+                    sources=sources,
+                )
+                for source, vuln_list in vulns.items():
+                    notif_result[source].extend(vuln_list)
+    else:
+        vulns = vulnerabilitylookup.get_vendor_product_vulnerabilities_since(
+            notification.vendor,
+            notification.product,
+            date_since=date_since,
+            number=30,
+            sources=sources,
+        )
+        for source, vuln_list in vulns.items():
+            notif_result[source].extend(vuln_list)
+
+    return notif_result
+
+
+@user_bp.route("/notifications/watchlist", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+def watchlist() -> str:
+    """Watchlist for vulnerabilities related to the products the user is monitoring."""
+    date_since = datetime.now() - timedelta(days=5)
+
+    notifications = sorted(
+        Notification.query.filter(
+            Notification.user_id == current_user.id,
+        ).all(),
+        key=lambda n: f"{n.vendor} - {n.product}".lower(),
+    )
+
+    result = {}
+    for notification in notifications:
+        notif_result = get_vulnerabilities_for_notification(notification, date_since)
+        if notif_result:
+            result[f"{notification.vendor} - {notification.product}"] = notif_result
+
+    # Pagination
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    total = len(result)
+    pagination = Pagination(
+        page=page, per_page=per_page, total=total, css_framework="bootstrap5"
+    )
+    sliced_keys = list(result.keys())[offset : offset + per_page]
+    paginated_result = {key: result[key] for key in sliced_keys}
+
+    return render_template(
+        "user/watchlist.html",
+        nb_notifications=len(notifications),
+        date_since=date_since,
+        vulnerabilities=paginated_result,
+        pagination=pagination,
+    )
+
+
+@user_bp.route("/notifications/watchlist/feed.<format>")
+@auth_feedkey_func
+def watchlist_feed(format: str) -> WerkzeugResponse:
+    """Watchlist RSS/Atom feed.
+    The authentication is managed with the auth_feedkey_func decorator
+    which is involving a dedicated token for use only with the RSS/Atom
+    endpoints requiring authentication.
+    """
+
+    def get_flattened_watchlist_vulnerabilities(
+        user: User, date_since: datetime
+    ) -> list[tuple[str, dict[str, Any]]]:
+        notifications = Notification.query.filter_by(user_id=user.id).all()
+        flat_vulns: list[tuple[str, dict[str, Any]]] = []
+
+        for notification in sorted(
+            notifications, key=lambda n: f"{n.vendor} - {n.product}".lower()
+        ):
+            notif_result = get_vulnerabilities_for_notification(
+                notification, date_since
+            )
+            for source in notif_result:
+                flat_vulns.extend(notif_result[source])
+
+        return flat_vulns
+
+    public_domain = get_config("generic", "public_domain")
+    date_since = datetime.now() - timedelta(days=17)
+    vulns = get_flattened_watchlist_vulnerabilities(current_user, date_since)
+
+    fg = FeedGenerator()
+    fg.id(f"https://{public_domain}/notifications/watchlist/feed.{format}")
+    fg.title("Your Watchlist - Vulnerability Feed")
+    fg.author(
+        {
+            "name": "Vulnerability-Lookup",
+            "email": application.config.get("ADMIN_EMAIL", ""),
+        }
+    )
+    fg.link(href="https://www.vulnerability-lookup.org", rel="alternate")
+    fg.description("Vulnerabilities related to the products you're monitoring.")
+    fg.subtitle("Vulnerabilities related to the products you're monitoring.")
+    fg.language("en")
+
+    for vuln in vulns:
+        fe = fg.add_entry()
+        fe.id(f"https://{public_domain}/vuln/{vuln[0]}")
+        fe.title(f"{vuln[0]}")
+        fe.link(href=f"https://{public_domain}/vuln/{vuln[0]}")
+        # fe.published(vuln.get("published"))
+        # fe.updated(vuln.get("last-modified", vuln.get("published")))
+
+    # Generate feed with XSLT
+    feed_bytes = inject_xslt(
+        fg.atom_str(pretty=True) if format == "atom" else fg.rss_str(pretty=True)
+    )
+    return Response(feed_bytes, mimetype="application/xml")
+
+
+#
+# Organizations
+#
+
+
+@user_bp.route("/organizations", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+def list_organizations() -> str:
+    """Lists the organizations of the authenticated user."""
+    organizations = current_user.organizations
+
+    # Pagination
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=len(organizations),
+        record_name="organizations",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    organizations = organizations[offset : offset + per_page]
+
+    return render_template(
+        "user/organizations.html",
+        organizations=organizations,
+        pagination=pagination,
+    )
+
+
+@user_bp.route("/organization/<int:organization_id>/leave", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+def leave_organization(organization_id: int) -> WerkzeugResponse:
+    organization = Organization.query.filter(Organization.id == organization_id).first()
+    if not organization:
+        return abort(404)
+
+    organizations = current_user.organizations
+    current_user.organizations = []
+    for org in organizations:
+        if org.id != organization_id:
+            current_user.organizations.append(org)
+
+    db.session.commit()
+
+    return redirect(url_for("user_bp.list_organizations"))
+
+
+#
+# Vulnerability Disclosure
+#
+@user_bp.route("/vulnerability_disclosures", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+def list_vulnerability_disclosures() -> str:
+    disclosures = VulnerabilityDisclosure.query.filter(
+        VulnerabilityDisclosure.reporter_id == current_user.id
+    ).order_by(VulnerabilityDisclosure.updated_timestamp.desc())
+
+    # Pagination
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=disclosures.count(),
+        record_name="disclosures",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    disclosures = disclosures.offset(offset).limit(per_page)
+
+    return render_template(
+        "user/vulnerability_disclosures.html",
+        vulnerability_disclosures=disclosures,
+        pagination=pagination,
+    )

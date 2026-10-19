@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+
+import json
+from datetime import timezone
+from urllib.parse import unquote
+
+import markdown  # type: ignore[import-untyped]
+from feedgen.feed import FeedGenerator  # type: ignore[import-untyped]
+from flask import (
+    Blueprint,
+    Response,
+    abort,
+    flash,
+    redirect,
+    render_template,
+    request,
+    url_for,
+)
+from flask_login import (  # type: ignore[import-untyped]
+    current_user,
+    login_required,
+)
+from flask_paginate import (  # type: ignore[import-untyped]
+    Pagination,
+    get_page_args,
+    get_parameter,
+)
+from markdown.extensions.tables import TableExtension  # type: ignore[import-untyped]
+from werkzeug import Response as WerkzeugResponse
+
+from vulnerabilitylookup.default import get_config
+from website.lib.sanitizers import sanitize_html_fragment
+from website.lib.utils import escape_ilike, inject_xslt
+from website.models import Comment
+from website.web.bootstrap import application, db
+from website.web.permissions import commenter_permission
+
+comment_bp = Blueprint(
+    "comment_bp", __name__, url_prefix="/comment", template_folder="comments"
+)
+comments_bp = Blueprint(
+    "comments_bp", __name__, url_prefix="/comments", template_folder="comments"
+)
+
+local_instance_name = get_config("generic", "local_instance_name").lower()
+
+
+@comments_bp.route("/", methods=["GET"])
+def list_comments() -> str:
+    meta_query = request.args.get("meta", "")
+    comments = Comment.query.filter(Comment.is_published)
+    if meta_query:
+        try:
+            decoded_meta = unquote(unquote(meta_query))
+            meta_query_data = json.loads(decoded_meta)
+            comments = comments.filter(Comment.meta.contains(meta_query_data))
+        except json.JSONDecodeError:
+            meta_query = ""
+    comments = comments.order_by(Comment.creation_timestamp.desc())
+
+    # Pagination
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=comments.count(),
+        record_name="comments",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    comments = comments.offset(offset).limit(per_page)
+
+    return render_template(
+        "comments/comments.html",
+        comments=comments,
+        meta_query=meta_query,
+        pagination=pagination,
+    )
+
+
+@comment_bp.route("/<uuid:comment_uuid>", methods=["GET"])
+def get(comment_uuid: str = "") -> str:
+    """Return details about the comment."""
+    elem = Comment.query.filter(Comment.uuid == comment_uuid).first()
+    if elem is None:
+        abort(404)
+    html_from_markdown = markdown.markdown(
+        elem.description,
+        extensions=["fenced_code", TableExtension(use_align_attribute=True)],
+    )
+    html_from_markdown = sanitize_html_fragment(html_from_markdown)
+    return render_template(
+        "comments/comment.html", comment=elem, description=html_from_markdown
+    )
+
+
+@comment_bp.route("/create", methods=["GET"])
+@comment_bp.route("/edit/<uuid:comment_uuid>", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+@commenter_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def form(comment_uuid: str = "") -> str:
+    """Returns a page in order to create or edit a comment."""
+    action = "Create a comment"
+    head_titles = [action]
+
+    if not comment_uuid:
+        # Creation of a new comment
+        return render_template(
+            "comments/edit_comment.html",
+            action=action,
+            head_titles=head_titles,
+            comment={},
+        )
+
+    # Edition of an existing comment
+    comment = Comment.query.filter(Comment.uuid == comment_uuid).first()
+    action = "Edit a comment"
+    head_titles = [action]
+    head_titles.append(comment.title)
+    return render_template(
+        "comments/edit_comment.html",
+        action=action,
+        head_titles=head_titles,
+        comment=comment,
+    )
+
+
+@comment_bp.route("/delete/<uuid:comment_uuid>", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@commenter_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def delete_comment(comment_uuid: str) -> WerkzeugResponse:
+    """Delete a comment via POST."""
+    comment = Comment.query.filter(Comment.uuid == comment_uuid).first()
+    if comment is None:
+        abort(404)
+
+    if current_user.is_admin or current_user.id == comment.author_id:
+        db.session.delete(comment)
+        db.session.commit()
+        flash("Comment deleted.", "success")
+        return redirect(url_for("comments_bp.list_comments"))
+    else:
+        flash("You cannot delete this comment.", "danger")
+        next_url = request.referrer or url_for("comments_bp.list_comments")
+        return redirect(next_url)
+
+
+@comments_bp.route("/feed.<string:format>", defaults={"per_page": 10}, methods=["GET"])
+def feed_comments(per_page: int = 10, format: str = "atom") -> Response:
+    """RSS/ATOM feed for the recent comments."""
+    vulnerability = request.args.get("vulnerability", "")
+    user = request.args.get("user", "")
+    public_domain = get_config("generic", "public_domain")
+    _, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    feed_max_per_page = application.config.get("FEED_MAX_PER_PAGE", 50)
+    if per_page > feed_max_per_page:
+        per_page = feed_max_per_page
+    fg = FeedGenerator()
+    fg.id(f"https://{public_domain}/comments/feed")
+    fg.title("Most recent comments.")
+    fg.author(
+        {
+            "name": "Vulnerability-Lookup",
+            "email": application.config.get("ADMIN_EMAIL", ""),
+        }
+    )
+    fg.link(href=f"https://{public_domain}", rel="alternate")
+    fg.subtitle(f"Contains only the most {per_page} recent comments.")
+    fg.language("en")
+
+    query = Comment.query.filter(Comment.is_published == True)  # noqa: E712
+    if vulnerability:
+        escaped_query = escape_ilike(vulnerability)
+        query = query.filter(
+            Comment.vulnerability.ilike(f"%{escaped_query}%", escape="\\")
+        )
+    if user:
+        query = query.filter(Comment.author.has(login=user))
+    query = query.order_by(Comment.timestamp.desc())
+
+    comments = query.offset(offset).limit(per_page)
+
+    for comment in comments:
+        fe = fg.add_entry()
+        fe.author(
+            [
+                {
+                    "name": comment.author.name,
+                    "uri": url_for(
+                        "user_bp.profile", login=comment.author.login, _external=True
+                    ),
+                }
+            ]
+        )
+        fe.id(f"https://{public_domain}/comment/{comment.uuid}")
+        fe.title(comment.title)
+        fe.link(href=f"https://{public_domain}/comment/{comment.uuid}")
+        fe.content(comment.description)
+        fe.description(comment.description)
+        fe.published(comment.timestamp.replace(tzinfo=timezone.utc))
+
+    # Generate feed with XSLT
+    feed_bytes = inject_xslt(
+        fg.atom_str(pretty=True) if format == "atom" else fg.rss_str(pretty=True)
+    )
+    return Response(feed_bytes, mimetype="application/xml")

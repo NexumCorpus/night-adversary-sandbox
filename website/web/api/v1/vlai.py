@@ -1,0 +1,122 @@
+import logging
+from typing import Any, Tuple
+
+import requests
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+    reqparse,
+)
+from requests.exceptions import ConnectionError
+
+from website.web.bootstrap import application
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+vlai_ns = Namespace(
+    "vlai", description="AI and NLP-driven services provided via the ML-Gateway."
+)
+
+# Argument Parsing
+
+parser = reqparse.RequestParser()
+parser.add_argument(
+    "description",
+    type=str,
+    default="",
+    help="Description of the vulnerability.",
+    location="json",
+)
+parser.add_argument(
+    "model",
+    type=str,
+    default="CIRCL/vulnerability-severity-classification-RoBERTa-base",
+    help="AI model to use.",
+    location="json",
+)
+
+
+@vlai_ns.route("/severity-classification")
+class VLAISeverityClassification(Resource):  # type: ignore[misc]
+    @typed(
+        vlai_ns.doc(
+            description="Classify vulnerabilities by severity based on their descriptions."
+        )
+    )
+    @typed(
+        vlai_ns.doc(
+            responses={
+                200: "Success.",
+                500: "Unexpected error.",
+                502: "Bad content: Invalid response from ML-Gateway.",
+                503: "Connection Error: Unable to reach ML-Gateway.",
+            }
+        )
+    )
+    @typed(vlai_ns.expect(parser))
+    def post(self) -> Tuple[dict[Any, Any], int]:
+        args = parser.parse_args()
+        description = args.pop("description", "")
+        model = args.pop("model", "")
+
+        ml_gateway = application.config.get("ML_GATEWAY", False)
+        if not ml_gateway:
+            return {"message": "ML-Gateway not found."}, 500
+
+        url_api = ml_gateway + "/classify/severity"
+        query = {"description": description, "model": model}
+
+        try:
+            r = requests.post(url_api, json=query, timeout=10)
+        except ConnectionError:
+            return {"message": "Connection Error: Unable to reach ML-Gateway."}, 503
+        except Exception as e:
+            return {"message": f"Unexpected error: {str(e)}"}, 500
+
+        try:
+            classification = r.json()
+        except Exception:
+            return {"message": "Bad content: Unable to decode response as JSON."}, 502
+
+        # Validate keys
+        expected_keys = {"severity", "confidence"}
+        if set(classification.keys()) != expected_keys:
+            return {"message": "Bad content: Unexpected keys in response."}, 502
+
+        # Validate types
+        severity = classification.get("severity")
+        confidence = classification.get("confidence")
+        if not isinstance(severity, str):
+            return {"message": "Bad content: 'severity' must be a string."}, 502
+        if not isinstance(confidence, float):
+            # Allow int as float
+            if isinstance(confidence, int):
+                classification["confidence"] = float(confidence)
+            else:
+                return {"message": "Bad content: 'confidence' must be a float."}, 502
+
+        # Validate severity values based on model with default
+        severity_map = {
+            "CIRCL/vulnerability-severity-classification-RoBERTa-base": [
+                "Low",
+                "Medium",
+                "High",
+                "Critical",
+            ],
+            "CIRCL/vulnerability-severity-classification-chinese-macbert-base": [
+                "低",
+                "中",
+                "高",
+            ],
+        }
+        default_severities = ["Low", "Medium", "High", "Critical"]
+        allowed_severities = severity_map.get(model, default_severities)
+
+        if severity not in allowed_severities:
+            return {
+                "message": f"Bad content: 'severity' value '{severity}' not allowed for model '{model}'."
+            }, 502
+
+        return classification, 200

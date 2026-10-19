@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+
+from typing import Any
+
+from flask import (
+    Blueprint,
+    abort,
+    flash,
+    redirect,
+    render_template,
+    request,
+    url_for,
+)
+from flask_login import (  # type: ignore[import-untyped]
+    current_user,
+    login_required,
+)
+from flask_paginate import (  # type: ignore[import-untyped]
+    Pagination,
+    get_page_args,
+    get_parameter,
+)
+from sqlalchemy import asc, delete, desc, func, or_
+from sqlalchemy.sql.elements import ColumnElement
+from werkzeug import Response as WerkzeugResponse
+from werkzeug.datastructures import MultiDict
+from werkzeug.security import generate_password_hash
+
+from website.lib.utils import escape_ilike
+from website.models import (
+    Bundle,
+    Comment,
+    Notification,
+    User,
+    VulnerabilityDisclosure,
+)
+from website.web.bootstrap import application, db
+from website.web.forms import (
+    UserForm,
+)
+from website.web.permissions import admin_permission
+
+admin_user_bp = Blueprint("admin_user_bp", __name__, url_prefix="/admin/user")
+admin_users_bp = Blueprint("admin_users_bp", __name__, url_prefix="/admin/users")
+
+
+@admin_users_bp.route("/", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def list_users() -> str:
+    user_query = request.args.get("query", "")
+    request_sort = request.args.get("sort", "")
+    request_sort_dir = request.args.get("sort_order", "desc")  # default to descending
+    request_is_admin = request.args.get("is_admin", "")
+    request_is_active = request.args.get("is_active", "")
+    request_is_confirmed = request.args.get("is_confirmed", "")
+    request_is_2fa_active = request.args.get("is_2fa_active", "")
+    request_permission = request.args.get("permission", "")
+    request_country = request.args.get("country", "")
+    request_organisation = request.args.get("organisation", "")
+
+    def sort_order(column: ColumnElement[Any]) -> ColumnElement[Any]:
+        return desc(column) if request_sort_dir == "desc" else asc(column)
+
+    total_nb_users = User.query.count()
+    nb_admins = User.query.filter(User.is_admin == True).count()  # noqa: E712
+    nb_users_without_2fa = User.query.filter(
+        User.is_two_factor_authentication_enabled == False  # noqa: E712
+    ).count()
+    nb_users_not_confirmed = User.query.filter(
+        User.is_confirmed == False  # noqa: E712
+    ).count()
+    nb_users_not_active = User.query.filter(
+        User.is_active == False  # noqa: E712
+    ).count()
+
+    # Load normal users and configure the associated pagination element
+    users = User.query
+    if user_query:
+        escaped_query = escape_ilike(user_query)
+        users = users.filter(
+            or_(
+                User.login.ilike(f"%{escaped_query}%", escape="\\"),
+                User.name.ilike(f"%{escaped_query}%", escape="\\"),
+                User.email.ilike(f"%{escaped_query}%", escape="\\"),
+                User.organisation.ilike(f"%{escaped_query}%", escape="\\"),
+                User.country_code.ilike(f"%{escaped_query}%", escape="\\"),
+            )
+        )
+    if request_is_admin == "1":
+        users = users.filter(User.is_admin == True)  # noqa: E712
+    if request_is_active == "0":
+        users = users.filter(User.is_active == False)  # noqa: E712
+    if request_is_confirmed == "0":
+        users = users.filter(User.is_confirmed == False)  # noqa: E712
+    if request_is_2fa_active == "0":
+        users = users.filter(
+            User.is_two_factor_authentication_enabled == False  # noqa: E712
+        )
+    match request_permission:
+        case "A":
+            users = users.filter(User.is_admin)
+        case "C":
+            users = users.filter(User.is_commenter)
+        case "R":
+            users = users.filter(User.is_reporter)
+        case _:
+            pass
+    if request_country:
+        users = users.filter(User.country_code == request_country)
+    if request_organisation:
+        users = users.filter(User.organisation == request_organisation)
+
+    match request_sort:
+        case "last_seen":
+            users = users.order_by(sort_order(User.last_seen))
+        case "member_since":
+            users = users.order_by(sort_order(User.created_at))
+        case "organisation":
+            users = users.order_by(sort_order(User.organisation))
+        case "notifications":
+            users = (
+                users.outerjoin(Notification, Notification.user_id == User.id)
+                .group_by(User.id)
+                .order_by(
+                    desc(func.count(Notification.id))
+                    if request_sort_dir == "desc"
+                    else asc(func.count(Notification.id))
+                )
+            )
+        case _:
+            users = users.order_by(sort_order(User.last_seen))
+
+    # Pagination
+    page, per_page, offset = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    page_name = get_parameter()
+    per_page_name = get_parameter(default="per_page")
+    pagination = Pagination(
+        total=users.count(),
+        record_name="users",
+        css_framework="bootstrap5",
+        **{page_name: page, per_page_name: per_page},
+    )
+    users = users.offset(offset).limit(per_page)
+
+    return render_template(
+        "admin/users.html",
+        total_nb_users=total_nb_users,
+        nb_admins=nb_admins,
+        nb_users_without_2fa=nb_users_without_2fa,
+        nb_users_not_confirmed=nb_users_not_confirmed,
+        nb_users_not_active=nb_users_not_active,
+        users=users,
+        pagination=pagination,
+    )
+
+
+@admin_user_bp.route("/create", methods=["GET"])
+@admin_user_bp.route("/edit/<int:user_id>", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def form_user(user_id: int = 0) -> str:
+    """Return a form to create and edit a user."""
+    action = "Create a user"
+    head_titles = [action]
+    form = UserForm()
+    if user_id == 0:
+        return render_template(
+            "admin/edit_user.html", action=action, head_titles=head_titles, form=form
+        )
+
+    user = User.query.filter(User.id == user_id).first()
+    form = UserForm(obj=user)
+    action = f"Edit user {user.login}"
+    head_titles = [action]
+    head_titles.append(user.login)
+    return render_template(
+        "admin/edit_user.html",
+        action=action,
+        head_titles=head_titles,
+        form=form,
+        user=user,
+    )
+
+
+@admin_user_bp.route("/create", methods=["POST"])
+@admin_user_bp.route("/edit/<int:user_id>", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def process_user_form(user_id: int = 0) -> str | WerkzeugResponse:
+    """Create or edit a user."""
+    form = UserForm()
+
+    if not form.validate():
+        return render_template("admin/edit_user.html", form=form)
+
+    # Edit an existing user
+    if user_id != 0:
+        user = User.query.filter(User.id == user_id).first()
+        try:
+            form.populate_obj(user)
+        except AssertionError as e:
+            flash(f"{e}", "danger")
+            return render_template("admin/edit_user.html", form=form)
+
+        if form.password.data:
+            user.pwdhash = generate_password_hash(form.password.data)
+
+        db.session.commit()
+        flash(
+            f"User {form.login.data} successfully updated.",
+            "success",
+        )
+        return redirect(url_for("admin_user_bp.form_user", user_id=user.id))
+
+    # Create a new user
+    try:
+        new_user = User(
+            login=form.login.data,
+            email=form.email.data,
+            name=form.name.data,
+            organisation=form.organisation.data,
+            country_code=form.country_code.data,
+            is_active=form.is_active.data,
+            is_confirmed=form.is_confirmed.data,
+            is_admin=form.is_admin.data,
+            pwdhash=generate_password_hash(form.password.data),
+            last_seen=None,
+        )
+    except AssertionError as e:
+        flash(f"{e}", "danger")
+        return render_template("admin/edit_user.html", form=form)
+    db.session.add(new_user)
+    db.session.commit()
+    flash(
+        f"User {new_user.login} successfully created.",
+        "success",
+    )
+    return redirect(url_for("admin_user_bp.form_user", user_id=new_user.id))
+
+
+@admin_user_bp.route("/batch_action", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def batch_action() -> WerkzeugResponse:
+    """Perform batch actions on selected users."""
+    action = request.form.get("action", "").strip()
+    raw_ids = request.form.getlist("user_ids")
+    password = request.form.get("password", "")
+
+    # Basic validation
+    if not action or not raw_ids:
+        flash("No action or users selected.", "danger")
+        return redirect(url_for("admin_users_bp.list_users"))
+
+    # Parse and sanitize IDs (ignore non-ints silently)
+    user_ids = []
+    for v in raw_ids:
+        try:
+            user_ids.append(int(v))
+        except (TypeError, ValueError):
+            continue
+
+    if not user_ids:
+        flash("No valid user IDs received.", "danger")
+        return redirect(url_for("admin_users_bp.list_users"))
+
+    # Check admin password
+    if not current_user.check_password(password):
+        flash("Incorrect password. No users were modified.", "danger")
+        return redirect(url_for("admin_users_bp.list_users"))
+
+    if action == "delete":
+        deleted = 0
+
+        for uid in user_ids:
+            user = User.query.get(uid)
+            if not user:
+                continue
+
+            if user.id == current_user.id:
+                flash(f"You cannot delete your own user: {user.login}", "warning")
+                continue
+
+            # Delete related records
+            db.session.execute(delete(Comment).where(Comment.author_id == uid))
+            db.session.execute(delete(Bundle).where(Bundle.author_id == uid))
+            db.session.execute(delete(Notification).where(Notification.user_id == uid))
+            db.session.execute(
+                delete(VulnerabilityDisclosure).where(
+                    VulnerabilityDisclosure.reporter_id == uid
+                )
+            )
+
+            db.session.delete(user)
+            deleted += 1
+
+        db.session.commit()
+        flash(f"Deleted {deleted} user(s).", "success")
+        return redirect(url_for("admin_users_bp.list_users"))
+
+    elif action == "reset2FA":
+        reset_count = 0
+        for uid in user_ids:
+            user = User.query.get(uid)
+            if not user:
+                continue
+
+            if user.id == current_user.id:
+                flash(
+                    f"You cannot reset 2FA for your own user: {user.login}", "warning"
+                )
+                continue
+
+            user.is_two_factor_authentication_enabled = False
+            user.secret_token = None
+            reset_count += 1
+
+        db.session.commit()
+        flash(f"Reset 2FA for {reset_count} user(s).", "success")
+        return redirect(url_for("admin_users_bp.list_users"))
+
+    else:
+        flash(f"Unknown action: {action}", "danger")
+        return redirect(url_for("admin_users_bp.list_users"))
+
+
+@admin_user_bp.route("/delete/<int:user_id>", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def delete_user(user_id: int) -> WerkzeugResponse:
+    """Redirects a single user delete to the batch_action endpoint."""
+    # Just forward the request to batch_action with a single ID
+    # form_data = request.form.to_dict(flat=True)
+    form_data = MultiDict(request.form)
+    form_data.setlist("user_ids", [str(user_id)])
+    form_data["action"] = "delete"
+
+    # Manually call batch_action with a fake request context
+    with application.test_request_context(
+        path=url_for("admin_user_bp.batch_action"), method="POST", data=form_data
+    ):
+        return batch_action()

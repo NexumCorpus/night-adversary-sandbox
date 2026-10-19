@@ -1,0 +1,139 @@
+{% import 'admin/template_responsive_table_users.html' as users_templates with context %}
+{% extends "main.html" %}
+{% block head %}
+{{ super() }}
+<style>
+.table-nowrap td,
+.table-nowrap th {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+</style>
+{% endblock %}
+{% block title %}Users management{% endblock %}
+{% block content %}
+<h1>Users</h1>
+<div class="row">
+  <div class="col-md-4">
+    <ul class="list-group">
+      <li class="list-group-item">Two-Factor Authentication: {% if config["ENFORCE_2FA"] %}Enforced{% else %}Not enforced{% endif %}</li>
+      <li class="list-group-item">Number of users: <a href="{{ url_for('admin_users_bp.list_users') }}">{{ total_nb_users }}</a></li>
+      <li class="list-group-item">Number of admins: <a href="{{ url_for('admin_users_bp.list_users', is_admin=1) }}">{{ nb_admins }}</a></li>
+    </ul>
+  </div>
+  <div class="col-md-4">
+    <ul class="list-group">
+      <li class="list-group-item">Not active: <a href="{{ url_for('admin_users_bp.list_users', is_active=0) }}">{{ nb_users_not_active }}</a></li>
+      <li class="list-group-item">Not confirmed (via email): <a href="{{ url_for('admin_users_bp.list_users', is_confirmed=0) }}">{{ nb_users_not_confirmed }}</a></li>
+      <li class="list-group-item">Not using Two-Factor Authentication: <a href="{{ url_for('admin_users_bp.list_users', is_2fa_active=0) }}">{{ nb_users_without_2fa }}</a></li>
+    </ul>
+  </div>
+  <div class="col-md-3 ms-auto">
+    <form class="align-items-center" method="GET">
+        <label class="visually-hidden" for="userInput">Search term</label>
+        <div class="input-group">
+          <input type="text" class="form-control" id="userInput" name="query" placeholder="Search term" />
+          <button type="submit" class="btn btn-primary input-group-text">Submit</button>
+        </div>
+    </form>
+  </div>
+</div>
+
+<br />
+
+<div class="row">
+  <div class="col">
+    {{ users_templates.table_users(users=users) }}
+  </div>
+</div>
+
+<div class="row">
+    <div class="col">
+        {{ pagination.links }}
+    </div>
+</div>
+<div class="row">
+    <div class="col">
+        {{ pagination.info }}
+    </div>
+</div>
+
+<br />
+
+<p>Permissions: A: Admin, C: Commenter, R: Reporter.</p>
+<p>Removing a user will not impact any of the contributions they have previously made.</p>
+<a class="btn btn-primary" href="{{ url_for('admin_user_bp.form_user') }}">Create a new user</a>
+<br /><br />
+
+<!-- Shared Delete User Modal -->
+<div class="modal fade" id="deleteUserModal" tabindex="-1" aria-labelledby="deleteUserModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+
+      <!-- Header -->
+      <div class="modal-header bg-danger text-white">
+        <h5 class="modal-title" id="deleteUserModalLabel">Confirm Deletion</h5>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+
+      <!-- Body -->
+      <form id="deleteUserForm" method="post" action="">
+        <div class="modal-body">
+          <p id="deleteUserText" class="fw-bold text-danger"></p>
+          <ul id="deleteUserList" class="mt-2"></ul>
+
+          <div class="mb-3 mt-3">
+            <label for="deleteUserPassword" class="form-label">Enter your password to confirm:</label>
+            <input type="password" id="deleteUserPassword" name="password" class="form-control" focus required>
+          </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-danger">Delete</button>
+        </div>
+      </form>
+
+    </div>
+  </div>
+</div>
+
+
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  const deleteUserModal = document.getElementById("deleteUserModal");
+  deleteUserModal.addEventListener("show.bs.modal", function (event) {
+    const button = event.relatedTarget;
+    if (!button) return; // Safely ignore if modal opened via JS
+
+    const userLogin = button.getAttribute("data-user-login");
+    const actionUrl = button.getAttribute("data-url");
+
+    const modalUserLogin = deleteUserModal.querySelector("#modal-user-login");
+    const form = deleteUserModal.querySelector("form");
+
+    modalUserLogin.textContent = userLogin;
+    form.action = actionUrl;
+
+    // Clear password field each time modal is shown
+    form.querySelector("input[name='password']").value = "";
+  });
+
+
+  // === Select All functionality ===
+  const selectAllCheckbox = document.getElementById('selectAll');
+  if (selectAllCheckbox) {
+    selectAllCheckbox.addEventListener('change', function () {
+      const checked = selectAllCheckbox.checked;
+      document.querySelectorAll('.user-checkbox').forEach(cb => {
+        cb.checked = checked;
+      });
+    });
+  }
+});
+</script>
+{% endblock %}

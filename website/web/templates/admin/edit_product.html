@@ -1,0 +1,37 @@
+{% extends "main.html" %}
+{% from 'bootstrap5/form.html' import render_form %}
+{% block head %}
+{{ super() }}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/choices.min.css') }}" />
+<script src="{{ url_for('static', filename='js/choices.min.js') }}"></script>
+{% endblock %}
+{% block title %}{{ action }}{% endblock %}
+{% block content %}
+<h1>{{ action }}</h1>
+{{ render_form(form, extra_classes="form-control") }}
+<br />
+<script>
+  document.addEventListener("DOMContentLoaded", function () {
+    const organizationsList = document.getElementById("organizations");
+    const choice_organizations = new Choices(organizationsList, {
+      shouldSort: true,
+      removeItems: true,
+      removeItemButton: true,
+    });
+
+    const licensesList = document.getElementById("licenses");
+    const choice_licenses = new Choices(licensesList, {
+      shouldSort: true,
+      removeItems: true,
+      removeItemButton: true,
+    });
+
+    const languagesList = document.getElementById("languages");
+    const choice_languages = new Choices(languagesList, {
+      shouldSort: true,
+      removeItems: true,
+      removeItemButton: true,
+    });
+  });
+</script>
+{% endblock %}

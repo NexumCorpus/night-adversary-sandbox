@@ -1,0 +1,43 @@
+Prerequisites
+=============
+
+Software
+--------
+
+Generally speaking, requirements are the following:
+
+- A GNU/Linux distribution. Tested on Debian Trixie.
+- Python version >= 3.10. Tested with Python 3.13 and 3.14
+- `Kvrocks <https://github.com/apache/kvrocks>`_ database.
+- `Poetry <https://python-poetry.org>`_.
+- PostgreSQL server for storage.
+- An email server — outgoing email for the accounts confirmation (password recovery, etc.).
+
+Postfix, or an equivalent software, is required for the email notifications.
+
+For the Web server you can use Gunicorn, uWSGI, Apache or Nginx.
+
+
+Hardware
+--------
+
+For the core of the Vulnerability-Lookup service, we recommend the following baseline specifications for a public-facing deployment (running Kvrocks and PostgreSQL):
+
+- 16 CPU cores
+- 64 GB RAM
+- 2 TB NVMe storage
+
+The new VLAI capabilities are straightforward to set up, as we intentionally avoided adding complexity to the core Vulnerability-Lookup software or its dependencies. Instead, we developed a separate component called `ML-Gateway <https://github.com/vulnerability-lookup/ML-Gateway>`_, which is queried by the core service.
+
+The requirements for ML-Gateway are currently minimal. For VLAI Severity, no GPU or specialized hardware is needed, as it uses `a lightweight NLP model <https://huggingface.co/CIRCL/vulnerability-severity-classification-roberta-base>`_ that is loaded at runtime. ML-Gateway requires:
+
+- 4 GB of memory
+- 200 GB of disk space
+- At least 4 vCPU cores
+
+These requirements may increase depending on the VLAI features added in the future.
+
+Network
+-------
+
+Deployment on the different servers requires an Internet connection, as updates are retrieved from the GitHub repository. The feeders also need Internet access to various locations, including Git repositories, HTTP endpoints, and specific APIs.

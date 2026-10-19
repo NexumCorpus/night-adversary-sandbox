@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+from vulnerabilitylookup.default import get_config
+from website.stream import listeners, subscriber
+from website.web import commands
+from website.web.api.v1 import apiv1_blueprint
+from website.web.bootstrap import application
+
+# ##### Registering Blueprints
+with application.app_context():
+    from website.web import views
+
+    application.register_blueprint(views.home_bp)
+    application.register_blueprint(views.assigners_bp)
+    application.register_blueprint(views.documentation_bp)
+    application.register_blueprint(views.stats_bp)
+    application.register_blueprint(views.kev_catalog_bp)
+
+    if get_config("generic", "user_accounts"):
+        application.config["user_accounts"] = True
+
+        application.register_blueprint(views.admin.admin_bp)
+        application.register_blueprint(views.admin.user.admin_user_bp)
+        application.register_blueprint(views.admin.user.admin_users_bp)
+        application.register_blueprint(views.admin.comment.admin_comment_bp)
+        application.register_blueprint(views.admin.comment.admin_comments_bp)
+        application.register_blueprint(views.admin.bundle.admin_bundle_bp)
+        application.register_blueprint(views.admin.bundle.admin_bundles_bp)
+        application.register_blueprint(views.admin.sighting.admin_sighting_bp)
+        application.register_blueprint(views.admin.sighting.admin_sightings_bp)
+        application.register_blueprint(views.admin.kev.admin_kev_bp)
+        application.register_blueprint(views.admin.kev.admin_kevs_bp)
+        application.register_blueprint(views.admin.organization.admin_organization_bp)
+        application.register_blueprint(views.admin.organization.admin_organizations_bp)
+        application.register_blueprint(views.admin.product.admin_product_bp)
+        application.register_blueprint(views.admin.product.admin_products_bp)
+        application.register_blueprint(views.admin.notification.admin_notification_bp)
+        application.register_blueprint(views.admin.notification.admin_notifications_bp)
+        application.register_blueprint(views.admin.monitoring.admin_monitoring_bp)
+        application.register_blueprint(
+            views.admin.vulnerability_disclosure.admin_vulnerability_disclosure_bp
+        )
+        application.register_blueprint(
+            views.admin.vulnerability_disclosure.admin_vulnerability_disclosures_bp
+        )
+
+        application.register_blueprint(views.user_bp)
+        application.register_blueprint(views.users_bp)
+        application.register_blueprint(views.comment_bp)
+        application.register_blueprint(views.comments_bp)
+        application.register_blueprint(views.bundle_bp)
+        application.register_blueprint(views.bundles_bp)
+        application.register_blueprint(views.sighting_bp)
+        application.register_blueprint(views.sightings_bp)
+        application.register_blueprint(views.organization_bp)
+        application.register_blueprint(views.organizations_bp)
+        application.register_blueprint(views.product_bp)
+        if application.config["WEB_MODULES"].get("vulnerability_disclosure", True):
+            application.register_blueprint(views.vulnerability_disclosure_bp)
+            application.register_blueprint(views.vulnerability_disclosures_bp)
+        application.register_blueprint(views.CWEs_bp)
+
+    # API v1
+    application.register_blueprint(apiv1_blueprint)
+
+    # Pub/Sub
+    if get_config("stream", "pubsub_bp"):
+        application.register_blueprint(views.pubsub_bp)
+
+
+# ##### Registering listeners for the Pub/Sub Streaming service (for comments, bundles, and sightings)
+if get_config("stream", "register_listeners"):
+    listeners.register_listeners()
+
+# ##### Global subsciption mechanism for server-side processing of messages
+if get_config("stream", "global_subscription"):
+    subscriber.start_thread()
+
+
+# ##### Registering commands
+
+application.cli.add_command(commands.db_init)
+application.cli.add_command(commands.db_backup)
+application.cli.add_command(commands.create_admin)
+application.cli.add_command(commands.create_user)
+application.cli.add_command(commands.user_list)
+application.cli.add_command(commands.user_delete)
+application.cli.add_command(commands.user_get_api_key)
+application.cli.add_command(commands.update_warninglists)

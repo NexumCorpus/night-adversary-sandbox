@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import json
+import os
+from functools import lru_cache
+from pathlib import Path
+
+from flask import Request
+
+from vulnerabilitylookup.default import get_homedir
+
+
+def src_request_ip(request: Request) -> str:
+    """Returns the IP of the user: first, try to get it from the value passed by the
+    reverse proxy; if this fails, fall back to using Flask's request.remote_addr."""
+    x_forwarded_for = request.headers.get("X-Forwarded-For", "")
+    ip_list = [ip.strip() for ip in x_forwarded_for.split(",")]
+    real_ip = ip_list[0] if ip_list else None
+    if not real_ip:
+        real_ip = request.remote_addr if request.remote_addr else ""
+    return real_ip
+
+
+@lru_cache(64)
+def get_secret_key() -> bytes:
+    secret_file_path: Path = get_homedir() / "secret_key"
+    if not secret_file_path.exists() or secret_file_path.stat().st_size < 64:
+        if not secret_file_path.exists() or secret_file_path.stat().st_size < 64:
+            with secret_file_path.open("wb") as f:
+                f.write(os.urandom(64))
+    with secret_file_path.open("rb") as f:
+        return f.read()
+
+
+@lru_cache(64)
+def get_security_password_salt() -> bytes:
+    secret_file_path: Path = get_homedir() / "security_password_salt"
+    if not secret_file_path.exists() or secret_file_path.stat().st_size < 64:
+        if not secret_file_path.exists() or secret_file_path.stat().st_size < 64:
+            with secret_file_path.open("wb") as f:
+                f.write(os.urandom(64))
+    with secret_file_path.open("rb") as f:
+        return f.read()
+
+
+@lru_cache(64)
+def sri_load() -> dict[str, dict[str, str]]:
+    with (get_homedir() / "website" / "web" / "sri.txt").open() as f:
+        return json.load(f)

@@ -1,0 +1,303 @@
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Tuple
+
+from flask_login import current_user  # type: ignore[import-untyped]
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+    abort,
+    fields,
+    reqparse,
+)
+from flask_restx.inputs import date_from_iso8601  # type: ignore[import-untyped]
+from sqlalchemy import String, cast, func
+
+from vulnerabilitylookup.default import get_config
+from website.lib.utils import find_cve_ids, find_ghsa_ids, find_pysec_ids
+from website.models import Bundle
+from website.validators import validate_json
+from website.web.api.v1.common import (
+    auth_func,
+    metada_params_model,
+    user_params_model,
+    uuid_type,
+)
+from website.web.api.v1.types import ResultType
+from website.web.bootstrap import db
+from website.web.permissions import admin_permission
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+bundle_ns = Namespace("bundle", description="Bundle related operations.")
+
+local_instance_uuid = get_config("generic", "local_instance_uuid").lower()
+
+# Argument Parsing
+parser = reqparse.RequestParser()
+parser.add_argument(
+    "page",
+    type=int,
+    default=1,
+    help="Number of the page.",
+)
+parser.add_argument(
+    "per_page",
+    type=int,
+    default=100,
+    help="Maximum number of elements to return.",
+)
+parser.add_argument("uuid", type=uuid_type, help="UUID of the bundle.")
+parser.add_argument(
+    "author",
+    type=str,
+    help="Author (login) of the bundle.",
+)
+parser.add_argument(
+    "vuln_id",
+    type=str,
+    help="Id of a vulnerability referenced by the bundle.",
+)
+parser.add_argument(
+    "meta",
+    type=str,
+    help="Query for the meta JSON field. Example: meta=[{'tags': ['tcp']}]",
+)
+parser.add_argument(
+    "date_from",
+    type=date_from_iso8601,
+    required=False,
+    help="The date of the bundles must be bigger or equal than this value. Format: YYYY-MM-DD",
+)
+parser.add_argument(
+    "date_to",
+    type=date_from_iso8601,
+    required=False,
+    help="The date of the bundles must be smaller or equal than this value. Format: YYYY-MM-DD",
+)
+
+# Response marshalling
+bundle_params_model = {
+    "uuid": fields.String(description="Bundle id."),
+    "vulnerability_lookup_origin": fields.String(
+        description="UUID of the Vulnerability-Lookup origin instance.",
+        readonly=True,
+        default=local_instance_uuid,
+    ),
+    "name": fields.String(description="Bundle name."),
+    "description": fields.String(description="Description."),
+    "creation_timestamp": fields.DateTime(
+        description="Creation time of the bundle.", readonly=True
+    ),
+    "timestamp": fields.DateTime(
+        description="Updated time of the bundle.", readonly=True
+    ),
+    "related_vulnerabilities": fields.List(
+        fields.String,
+        description="One or more vulnerability references (CVE ID, GHSA-ID, PYSEC ID, etc.) for this bundle.",
+    ),
+    "meta": fields.Raw(description="Zero or more meta-fields."),
+}
+bundle = bundle_ns.model("Bundle", bundle_params_model, skip_none=True)
+metadata = bundle_ns.model("metadata", metada_params_model)
+
+bundle["author"] = fields.Nested(
+    bundle_ns.model("User", user_params_model), readonly=True
+)
+
+bundle_list_fields = bundle_ns.model(
+    "BundlesList",
+    {
+        "metadata": fields.Nested(
+            metadata, description="Metada related to the result."
+        ),
+        "data": fields.List(
+            fields.Nested(bundle, skip_none=True), description="List of bundles."
+        ),
+    },
+)
+
+
+@bundle_ns.route("/<string:bundle_uuid>")
+class BundleItem(Resource):  # type: ignore[misc]
+    @typed(bundle_ns.doc(description="Get a bundle with its UUID."))
+    @typed(
+        bundle_ns.doc(
+            responses={200: "Success.", 404: "Bundle not found."},
+        )
+    )
+    @typed(bundle_ns.marshal_with(bundle, skip_none=True))
+    def get(self, bundle_uuid: str) -> Tuple[dict[Any, Any], int]:
+        result = Bundle.query.filter(Bundle.uuid == bundle_uuid).first()
+        if not result:
+            return {"message": "Bundle not found."}, 404
+        return result, 200
+
+    @typed(bundle_ns.doc(description="Delete a bundle."))
+    @typed(
+        bundle_ns.doc(
+            responses={
+                204: "Success.",
+                403: "Administrator permission required or not the author of the bundle.",
+                404: "Bundle not found.",
+            }
+        )
+    )
+    @typed(auth_func)
+    @typed(admin_permission.require(http_exception=403))
+    def delete(self, bundle_uuid: str) -> Tuple[dict[Any, Any], int]:
+        """Endpoint for deleting a bundle. Only an admin can delete a bundle."""
+        obj = Bundle.query.filter(Bundle.uuid == bundle_uuid).first()
+        if obj:
+            db.session.delete(obj)
+            db.session.commit()
+            return {}, 204
+        return {"message": "Bundle not found."}, 404
+
+
+@bundle_ns.route("/")
+class BundlesList(Resource):  # type: ignore[misc]
+    @typed(bundle_ns.doc("list_bundles"))
+    @typed(bundle_ns.expect(parser))
+    @typed(bundle_ns.marshal_list_with(bundle_list_fields))
+    def get(self) -> Tuple[ResultType, int]:
+        """List all bundles."""
+        args = parser.parse_args()
+        page = args.pop("page", 1)  # 1-based page index
+        per_page = args.pop("per_page", 10)  # Number of records per page
+
+        # Enforce maximum per_page limit
+        if per_page not in [1, ..., 200]:
+            per_page = 100
+
+        # Calculate the offset based on page and per_page
+        offset = (page - 1) * per_page
+
+        result: ResultType = {
+            "data": [],
+            "metadata": {
+                "count": 0,  # Total number of records matching the filters
+                "page": page,  # Current page number
+                "per_page": per_page,  # Number of records per page
+            },
+        }
+
+        query = Bundle.query
+
+        # Apply filters
+        if args.get("uuid"):
+            query = query.filter(Bundle.uuid == args["uuid"])
+        if args.get("author"):
+            query = query.filter(Bundle.author.has(login=args["author"]))
+        if args.get("vuln_id"):
+            query = query.filter(
+                func.lower(cast(Bundle.related_vulnerabilities, String)).contains(
+                    args["vuln_id"].lower()
+                )
+            )
+        if args.get("date_from"):
+            query = query.filter(
+                func.date(Bundle.creation_timestamp) >= args["date_from"]
+            )
+        if args.get("date_to"):
+            query = query.filter(
+                func.date(Bundle.creation_timestamp) <= args["date_to"]
+            )
+        if args.get("meta"):
+            query = query.filter(Bundle.meta.contains(args["meta"]))
+
+        # Order the query by timestamp, descending
+        query = query.order_by(Bundle.timestamp.desc())
+
+        # Get total record count
+        total = query.count()
+
+        # Apply pagination
+        results = query.offset(offset).limit(per_page).all()
+
+        # Populate the result
+        result["data"] = results
+        result["metadata"]["count"] = total
+
+        return result, 200
+
+    @typed(bundle_ns.doc(description="Create a bundle."))
+    @typed(
+        bundle_ns.doc(
+            responses={
+                201: "Success.",
+                400: "JSON validation failed or incorrect payload to instantiate a bundle.",
+                403: "Administrator permission required.",
+            }
+        )
+    )
+    @typed(bundle_ns.expect(bundle))
+    @typed(bundle_ns.marshal_list_with(bundle_list_fields, code=201))
+    @typed(auth_func)
+    @typed(admin_permission.require(http_exception=403))
+    def post(self) -> Tuple[ResultType, int]:
+        result: ResultType = {
+            "data": [],
+            "metadata": {
+                "count": 0,
+                "page": 0,
+                "per_page": 10,
+            },
+        }
+        current_time = datetime.now(timezone.utc)
+        bundle = bundle_ns.payload
+        bundle["uuid"] = bundle.get("uuid", str(uuid.uuid4()))
+        bundle["vulnerability_lookup_origin"] = local_instance_uuid
+        bundle["creation_timestamp"] = current_time.isoformat()
+        bundle["timestamp"] = current_time.isoformat()
+        # Find security advisories IDs in the description and add the result to the related vulnerabilities
+        bundle.setdefault("related_vulnerabilities", [])
+        bundle.get("related_vulnerabilities", []).extend(
+            find_cve_ids(bundle.get("description", ""))
+        )
+        bundle.get("related_vulnerabilities", []).extend(
+            find_ghsa_ids(bundle.get("description", ""))
+        )
+        bundle.get("related_vulnerabilities", []).extend(
+            find_pysec_ids(bundle.get("description", ""))
+        )
+        # Remove duplicates
+        bundle["related_vulnerabilities"] = list(set(bundle["related_vulnerabilities"]))
+        # Strip leading, trailing, and inner spaces
+        bundle["related_vulnerabilities"] = list(
+            map(lambda s: "".join(s.split()), bundle["related_vulnerabilities"])
+        )
+
+        try:
+            validate_json(bundle, "circl_bundle")
+        except Exception:
+            logger.warning("JSON validation failed.")
+            return abort(400, "JSON validation failed.")
+
+        obj = Bundle.query.filter(Bundle.uuid == bundle["uuid"]).first()
+        if obj:
+            # edit an existing bundle
+            obj.name = bundle["name"]
+            obj.description = bundle["description"]
+            obj.description_format = bundle.get("description_format", "markdown")
+            obj.related_vulnerabilities = bundle.get("related_vulnerabilities", [])
+            obj.meta = bundle.get("meta", {})
+            obj.timestamp = bundle["timestamp"]
+            result["data"] = obj
+            result["metadata"]["count"] = 1
+        else:
+            # creation of a new bundle
+            try:
+                new_bundle = Bundle(**bundle, author_id=current_user.id)
+                result["data"] = new_bundle
+                result["metadata"]["count"] = 1
+            except Exception:
+                db.session.rollback()
+                return abort(400, "Bundle creation failed.")
+            db.session.add(new_bundle)
+        db.session.commit()
+
+        return result, 201

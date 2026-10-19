@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import time
+
+from vulnerabilitylookup.default import AbstractManager
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description='Shutdown the processes, and wait for them to finish.')
+    parser.add_argument('--force', action='store_true', help='Wait a bit and send SIGKILL to the processes.')
+    args = parser.parse_args()
+
+    AbstractManager.force_shutdown()
+    time.sleep(5)
+    loop_count = 0
+    while True:
+        try:
+            running = AbstractManager.is_running()
+        except FileNotFoundError:
+            print('Redis is already down.')
+            break
+        if not running:
+            break
+        print(running)
+        loop_count += 1
+        time.sleep(1)
+        if args.force:
+            if loop_count < 5:
+                print('Waiting a bit longer...')
+                time.sleep(5)
+            else:
+                AbstractManager.force_kill(running)
+
+
+if __name__ == '__main__':
+    main()

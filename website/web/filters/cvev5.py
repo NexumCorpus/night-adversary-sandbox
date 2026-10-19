@@ -1,0 +1,374 @@
+from typing import Any, Dict
+
+import cvss  # type: ignore[import-untyped]
+
+
+def cvss_base_score(vector: str, version: str) -> str:
+    """Returns the base score from a CVSS vector."""
+    try:
+        v = detect_cvss_version(vector)
+
+        if v == "4.0":
+            return str(cvss.CVSS4(vector).base_score)
+
+        if v == "3.0":
+            return str(cvss.CVSS3(vector).base_score)
+
+    except Exception:
+        return "N/A"
+
+    return "N/A"
+
+
+def cvss_severity(vector: str, version: str) -> str:
+    """Returns the severity from a CVSS vector."""
+    try:
+        v = detect_cvss_version(vector)
+
+        if v == "4.0":
+            return str(cvss.CVSS4(vector).severity)
+
+        if v == "3.0":
+            c = cvss.CVSS3(vector)
+            return c.severities()[0]
+
+    except Exception:
+        return "UNKNOWN"
+
+    return "UNKNOWN"
+
+
+def cvss_clean_vector(vector: str, version: str) -> str:
+    """Returns a clean version of a vector."""
+    try:
+        v = detect_cvss_version(vector)
+
+        if v == "4.0":
+            return cvss.CVSS4(vector).clean_vector()
+
+        if v == "3.0":
+            return cvss.CVSS3(vector).clean_vector()
+
+    except Exception:
+        return vector
+
+    return vector
+
+
+def detect_cvss_version(vector: str) -> str | None:
+    if not isinstance(vector, str):
+        return None
+    if vector.startswith("CVSS:4."):
+        return "4.0"
+    if vector.startswith("CVSS:3."):
+        return "3.0"
+    return None
+
+
+def extract_cvss_metrics(vuln_data: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """
+    Returns a list of dicts:
+    [
+        {
+            'score': 9.8,
+            'severity': 'CRITICAL',
+            'vector': 'CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H',
+            'version': '3.1'
+        },
+        ...
+    ]
+    """
+    all_metrics = []
+
+    containers = vuln_data.get("containers", {})
+
+    # 1. CNA
+    if "cna" in containers and "metrics" in containers["cna"]:
+        all_metrics = containers["cna"]["metrics"]
+
+    # 2. ADP
+    elif "adp" in containers:
+        for elem in containers["adp"]:
+            if "metrics" in elem:
+                all_metrics = elem["metrics"]
+                break
+
+    # 3. NVD
+    else:
+        nvd_data = vuln_data.get("vulnerability-lookup:meta", {}).get("nvd")
+        if nvd_data:
+            if isinstance(nvd_data, str):
+                import json
+
+                nvd_data = json.loads(nvd_data)
+            metrics = nvd_data.get("cve", {}).get("metrics", {})
+            all_metrics = (
+                metrics.get("cvssMetricV31")
+                or metrics.get("cvssMetricV30")
+                or metrics.get("cvssMetricV40")
+                or []
+            )
+
+    # Build simplified list for template
+    results = []
+    for metric in all_metrics:
+        vector = None
+        version = None
+        # CVSS v3.1
+        if "cvssV3_1" in metric and "vectorString" in metric["cvssV3_1"]:
+            vector = metric["cvssV3_1"]["vectorString"]
+            version = "3.1"
+            score = metric["cvssV3_1"].get("baseScore")
+            severity = metric["cvssV3_1"].get("baseSeverity")
+        # CVSS v3.0
+        elif "cvssV3_0" in metric and "vectorString" in metric["cvssV3_0"]:
+            vector = metric["cvssV3_0"]["vectorString"]
+            version = "3.0"
+            score = metric["cvssV3_0"].get("baseScore")
+            severity = metric["cvssV3_0"].get("baseSeverity")
+        # CVSS v4.0
+        elif "cvssV4_0" in metric and "vectorString" in metric["cvssV4_0"]:
+            vector = metric["cvssV4_0"]["vectorString"]
+            version = "4.0"
+            score = metric["cvssV4_0"].get("baseScore")
+            severity = metric["cvssV4_0"].get("baseSeverity")
+
+        if vector:
+            results.append(
+                {
+                    "score": score,
+                    "severity": severity.title() if severity else "Unknown",
+                    "vector": vector,
+                    "version": version,
+                }
+            )
+
+    return results
+
+
+def extract_cwe_list(vuln: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """
+    Extract a clean list of CWE entries from CNA/ADP.
+    Output format:
+    [
+        {"cwe": "CWE-79", "description": "XSS"},
+        {"cwe": "CWE-89", "description": "SQL Injection"},
+        ...
+    ]
+    """
+    results = []
+
+    # Prefer CNA → fallback to ADP if needed.
+    containers = vuln.get("containers", {})
+    problem_sources = []
+
+    if "cna" in containers and containers["cna"].get("problemTypes"):
+        problem_sources = containers["cna"].get("problemTypes", [])
+    elif "adp" in containers:
+        for elem in containers["adp"]:
+            if elem.get("problemTypes"):
+                problem_sources = elem.get("problemTypes", [])
+                break
+
+    # Process problemTypes → descriptions
+    for problem in problem_sources:
+        for desc in problem.get("descriptions", []):
+            cwe_id = desc.get("cweId", "").strip()
+            description = desc.get("description", "").strip()
+
+            # Normalize possible forms:
+            # - CWE-79: Cross-site Scripting → XSS
+            # - "CWE-79" alone
+            # - description only
+            cleaned_desc = description
+
+            if cwe_id:
+                # Remove "CWE-79:" prefix
+                if cleaned_desc.startswith(cwe_id):
+                    cleaned_desc = cleaned_desc[len(cwe_id) + 1 :].strip()
+
+                # Remove bare "CWE-79"
+                if cleaned_desc == cwe_id:
+                    cleaned_desc = ""
+
+                results.append({"cwe": cwe_id, "description": cleaned_desc})
+
+            else:
+                # No cweId but description might be "CWE-79: XSS"
+                if cleaned_desc.startswith("CWE-"):
+                    parts = cleaned_desc.split(":", 1)
+                    cwe = parts[0].strip()
+                    desc_part = parts[1].strip() if len(parts) > 1 else ""
+                    results.append({"cwe": cwe, "description": desc_part})
+                else:
+                    results.append({"cwe": None, "description": cleaned_desc})
+
+    return results
+
+
+def extract_references(vuln: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """
+    Extract and normalize references from a vulnerability object.
+    Returns a list of dictionaries: { 'url': str, 'tags': list }.
+    """
+
+    # Result container
+    refs = []
+
+    # --- CNA references ---
+    try:
+        cna = vuln.get("containers", {}).get("cna", {})
+        entries = cna.get("references", [])
+        for ref in entries:
+            url = ref.get("url")
+            if not url:
+                continue
+            tags = ref.get("tags", [])
+            refs.append({"url": url, "tags": tags})
+    except Exception:
+        pass
+
+    # --- NVD metadata references ---
+    meta = vuln.get("vulnerability-lookup:meta", {})
+    if meta and "nvd" in meta:
+        try:
+            nvd = meta["nvd"]
+            # If nvd is serialized, the template should already have used str_to_obj
+            if isinstance(nvd, str):
+                # Guard: avoid throwing inside filter
+                return refs
+            entries = nvd.get("cve", {}).get("references", [])
+
+            for ref in entries:
+                url = ref.get("url")
+                if not url:
+                    continue
+                tags = ref.get("tags", [])
+                refs.append({"url": url, "tags": tags})
+        except Exception:
+            pass  # fail-safe — return what we have so far
+
+    return refs
+
+
+def extract_impacted_products(vuln: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """
+    Extract impacted products from CNA → affected.
+    Returns a list of dicts with vendor, product, versions, cpes.
+    """
+
+    products = []
+
+    try:
+        cna = vuln.get("containers", {}).get("cna", {})
+        affected = cna.get("affected", []) or []
+
+        for entry in affected:
+            vendor = entry.get("vendor") or ""
+            product = entry.get("product") or ""
+            versions = entry.get("versions", [])
+            cpes = entry.get("cpes", [])
+
+            invalid = {"n/a", "n / a"}
+            if vendor in invalid and product in invalid:
+                continue
+
+            products.append(
+                {
+                    "vendor": vendor,
+                    "product": product,
+                    "versions": versions,
+                    "cpes": cpes,
+                }
+            )
+    except Exception:
+        return []
+
+    return products
+
+
+def extract_credits(vuln: Dict[str, Any]) -> list[Dict[str, Any]]:
+    """
+    Extract and normalize credits from CNA.
+    Returns a list of dicts with 'type' and 'value'.
+    """
+    try:
+        cna = vuln.get("containers", {}).get("cna", {})
+        credits = cna.get("credits", []) or []
+
+        # List of impacted products
+        impacted_products = extract_impacted_products(vuln)
+        vendors = [elem["vendor"] for elem in impacted_products]
+        products = [elem["product"] for elem in impacted_products]
+        normalized_vendors = {p.lower() for p in vendors}
+        normalized_products = {p.lower() for p in products}
+        credits_products = {
+            ("remediation developer", "Andras Iklody"): {"misp", "draugnet"},
+            ("remediation developer", "Sami Mokaddem"): {
+                "misp",
+                "misp-fleet-commander",
+                "cerebrate",
+            },
+            ("finder", "Jeroen Pinoy"): {"misp", "misp-fleet-commander"},
+        }
+        credits_vendors = {
+            ("coordinator", "Alexandre Dulaunoy"): {"circl", "misp", "cerebrate"},
+            ("finder", "Jeroen Pinoy"): {"circl", "misp", "cerebrate"},
+        }
+
+        normalized = []
+        for c in credits:
+            ctype = (c.get("type") or "").strip()
+            cvalue = (c.get("value") or "").strip()
+
+            if not ctype and not cvalue:
+                continue
+
+            match (ctype, cvalue):
+                case ("coordinator", "Alexandre Dulaunoy"):
+                    allowed = credits_vendors.get(
+                        ("coordinator", "Alexandre Dulaunoy"), set()
+                    )
+                    if normalized_vendors & allowed:
+                        cvalue = f"📸 {cvalue} 🎨"
+
+                case ("remediation developer", "Andras Iklody"):
+                    allowed = credits_products.get(
+                        ("remediation developer", "Andras Iklody"), set()
+                    )
+                    if normalized_products & allowed:
+                        cvalue += " (the Insomniac MISP lead dev)"
+
+                case ("remediation developer", "Sami Mokaddem"):
+                    allowed = credits_products.get(
+                        ("remediation developer", "Sami Mokaddem"), set()
+                    )
+                    if normalized_products & allowed:
+                        cvalue += " (aka Graphman)"
+
+                case ("finder", value):
+                    val_norm = value.lower().strip()
+                    jeroen_variants = {
+                        "jeroen pinoy",
+                        "Jeroen Pinoy - @Wachizungu",
+                        "@wachizungu",
+                    }
+                    if any(v.lower() in val_norm for v in jeroen_variants):
+                        allowed = credits_vendors.get(("finder", "Jeroen Pinoy"), set())
+                        if normalized_vendors & allowed:
+                            cvalue = f"🕵️‍♂️ {cvalue} 🐞"
+
+                case _:
+                    pass
+
+            normalized.append(
+                {
+                    "type": ctype,
+                    "value": cvalue,
+                }
+            )
+
+        return normalized
+
+    except Exception:
+        return []

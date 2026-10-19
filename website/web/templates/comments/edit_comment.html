@@ -1,0 +1,361 @@
+{% extends "main.html" %}
+{% block head %}
+{{ super() }}
+<script src="{{ url_for('static', filename='js/jsoneditor.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/pretty-print-json.min.js') }}"></script>
+<script src="{{ url_for('static', filename='js/easymde.min.js') }}"></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/easymde.min.css') }}" />
+<link rel="stylesheet" href="{{ url_for('static', filename='css/pretty-print-json.css') }}" />
+<style>
+  .optext {
+    background-color: #000 !important;
+  }
+  .multiselect-dropdown {
+    background-color: #343a40 !important;
+  }
+  .multiselect-dropdown-list {
+    background-color: #343a40 !important;
+  }
+</style>
+{% endblock %}
+{% block title %}{{ action }}{% endblock %}
+{% block content %}
+<div class="modal" id="modalError" tabindex="-1">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 id="modal-title" class="modal-title">Action not permitted</h5>
+      </div>
+      <div class="modal-body">
+        <p id="modal-error-text">Modal body text goes here.</p>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-primary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col">
+    <h2>{{ action | safe }}</h2>
+  </div>
+  <div class="col text-end">
+    <div class="btn-group" role="group">
+      <a type="button" id="savecomment" class="btn btn-primary" title="Save the comment" aria-label="Save">{{ render_icon('save') }}</a>
+      <a type="button" class="btn btn-primary" title="View" aria-label="View the comment" href="{{ url_for('comment_bp.get', comment_uuid=comment.uuid) }}">{{ render_icon('eye') }}</a>
+
+      <!-- Delete button triggers modal -->
+      <button type="button" class="btn btn-danger" id="deleteBtn" title="Delete" aria-label="Delete">
+        {{ render_icon('trash') }}
+      </button>
+    </div>
+  </div>
+</div>
+
+<br />
+<div class="row">
+  <div class="col-md-9">
+    <div id="editor"></div>
+  </div>
+  <div class="col">
+    <div class="card card-body my-3">
+      <h5>Tags</h5>
+      <select class="form-multi-select" id="select-tags" size="14" multiple>
+        <optgroup label="Exploitability" exclusive="true">
+          <option value="vulnerability:exploitability=industrialised">Industrialised</option>
+          <option value="vulnerability:exploitability=customised">Customised</option>
+          <option value="vulnerability:exploitability=documented">Documented</option>
+          <option value="vulnerability:exploitability=theoretical">Theoretical</option>
+        </optgroup>
+        <optgroup label="Information" exclusive="false">
+          <option value="vulnerability:information=PoC">Proof-of-Concept</option>
+          <option value="vulnerability:information=remediation">Remediation</option>
+          <option value="vulnerability:information=annotation">Annotation</option>
+        </optgroup>
+        <optgroup label="Origin" exclusive="false">
+          <option value="vulnerability:origin=hardware">Hardware</option>
+          <option value="vulnerability:origin=software">Software</option>
+          <option value="vulnerability:origin=service">Service</option>
+          <option value="vulnerability:origin=procedural-implementation">Procedural implementation</option>
+        </optgroup>
+      </select>
+      <a href="https://www.misp-project.org/taxonomies.html#_vulnerability_3" rel="noreferrer" target="_blank">Taxonomy of the tags.</a>
+    </div>
+  </div>
+</div>
+
+<!-- Delete Modal -->
+<div class="modal fade" id="deleteModal" tabindex="-1" aria-labelledby="deleteModalLabel" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="deleteModalLabel">Confirm Deletion</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        Are you sure you want to delete this comment?
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <!-- Hidden form for POST -->
+        <form id="deleteForm" method="POST" action="{{ url_for('comment_bp.delete_comment', comment_uuid=comment.uuid) }}" class="m-0 p-0">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button type="submit" class="btn btn-danger">Delete</button>
+        </form>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  function getSelectValues(select) {
+    var tags = [];
+    var options = select && select.options;
+    var opt;
+
+    for (var i=0, iLen=options.length; i<iLen; i++) {
+      opt = options[i];
+
+      if (opt.selected) {
+        if (opt.parentNode.getAttribute("exclusive") == "true") {
+          options1 = document.getElementById("select-tags").options;
+          for (var j=0, jLen=options1.length; j<jLen; j++) {
+            opt1 = options1[j];
+            if (opt1.parentNode.getAttribute("exclusive") == "true") {
+              opt1.selected = false;
+            }
+          }
+          opt.selected = true;
+        }
+        tags.push(opt.value || opt.text);
+      }
+    }
+    var json = jsoneditor.getValue();
+
+    if (!("meta" in json)) {
+      json["meta"] = [{"tags": tags}];
+    } else {
+      let found = false;
+      json["meta"].forEach(function(value, index, array) {
+        if ("tags" in value) {
+          obj = {"tags": tags}
+          json["meta"] = [];
+          json["meta"] = [obj];
+          found = true;
+        }
+      })
+      if (!found) {
+        json["meta"] = [{"tags": tags}];
+      }
+    }
+
+    jsoneditor.setValue(json);
+  }
+
+  document.getElementById("select-tags").onclick= function (e) {
+    getSelectValues(document.getElementById("select-tags"));
+  };
+
+
+  let easyMDE = null;
+  document.addEventListener("DOMContentLoaded", function() {
+
+    var settings = {
+      plugins: {
+        remove_button:{
+          title:'Remove this item.',
+        }
+      },
+      sortField: 'text',
+    };
+
+    let exclude_list = [];
+    // Retrieve the comment
+    fetch("{{ url_for('apiv1.comment_comment_item', comment_uuid=comment.uuid) }}")
+    .then(response => response.json())
+    .then(comment => {
+
+      // initializes the multi-selct component for the tags in the meta field of the comment
+      var element = document.getElementById('select-tags');
+      if (Array.isArray(comment["meta"]) && comment["meta"].length > 0) {
+        var itemWithTags = comment.meta.find(item => item.tags);
+        var tags = itemWithTags ? itemWithTags.tags : [];
+      } else {
+        var tags = [];
+      }
+      tags.forEach(function(value, index, array) {
+        for (var i = 0; i < element.options.length; i++) {
+          element.options[i].selected = tags.indexOf(element.options[i].value) >= 0;
+        }
+      })
+
+      // initilize the list of exclusive tags
+      options = document.getElementById("select-tags").options;
+      for (var j=0, jLen=options.length; j<jLen; j++) {
+        opt = options[j];
+        if (opt.parentNode.getAttribute("exclusive") == "true") {
+          exclude_list.push(opt.value);
+        }
+      }
+
+
+      // Retrieve the schema for the comment
+      fetch("{{ url_for('static', filename='schemas/CIRCL/Security_Advisory_Comment.json') }}")
+      .then(response => response.json())
+      .then(schema => {
+        // Initialize the JSON editor
+        initialize_editor(schema, comment);
+      })
+      .catch((error) => {
+        console.error('Error:', error);
+      });
+    })
+    .catch((error) => {
+      console.error('Error:', error);
+    });
+
+
+    const deleteBtn = document.getElementById('deleteBtn');
+    const deleteModal = new bootstrap.Modal(document.getElementById('deleteModal'));
+    deleteBtn.addEventListener('click', function() {
+      deleteModal.show();
+    });
+  });
+
+  function initialize_editor(schema, json_object) {
+    // Default starting schema
+    if(!schema) {
+      schema = {}
+    }
+
+    // Divs/textareas on the page
+    var $schema = schema;
+    var $output = document.getElementById('output');
+    var $editor = document.getElementById('editor');
+
+    window.startval = json_object;
+
+    var jsoneditor;
+
+    var reload = function(keep_value) {
+      var startval = (jsoneditor && keep_value)? jsoneditor.getValue() : window.startval;
+      window.startval = undefined;
+
+      if (jsoneditor) {
+        jsoneditor.destroy();
+      }
+      jsoneditor = new JSONEditor($editor, {
+        // The schema for the editor
+        schema: schema,
+        // Remove collapse button
+        disable_collapse: true,
+        // Seed the form with a starting value
+        startval: startval,
+        // Enable fetching schemas via ajax
+        ajax: true,
+        // Disable additional properties
+        no_additional_properties: false,
+        // Require all properties by default
+        required_by_default: true,
+        show_opt_in: false,
+        disable_edit_json: true,
+        theme: "bootstrap5",
+        object_background: document.documentElement.getAttribute("data-bs-theme") == "dark" ? "bg-dark" : "bg-light",
+      });
+      window.jsoneditor = jsoneditor;
+
+      // When the value of the editor changes, update the JSON output and validation message
+      jsoneditor.on('change',function() {
+        var json = jsoneditor.getValue();
+      });
+
+      jsoneditor.on('ready', async () => {
+        if (easyMDE  === null) {
+          easyMDE = new EasyMDE({
+            element: document.getElementById('root[description]'),
+            autoRefresh: { delay: 300 },
+            toolbarButtonClassPrefix: "mde",
+            toolbar: [
+              "bold", "italic", "heading", "|", "quote", "code", "table", "unordered-list", "ordered-list", "|", "link", "image", "|", "preview", "side-by-side", "fullscreen", "|",
+              {
+                name: "findCVE",
+                action: (editor) => {
+                  var cves = findCVEIdentifiers(editor.value());
+                  var json = jsoneditor.getValue();
+                  json["related_vulnerabilities"].push(...cves);
+                  json["related_vulnerabilities"] = json["related_vulnerabilities"].filter(item => item !== "");
+                  json["related_vulnerabilities"] = [...new Set(json["related_vulnerabilities"])];
+                  jsoneditor.setValue(json);
+                },
+                className: "fa fa-bug",
+                text: "",
+                title: "Find CVEs",
+                attributes: { // for custom attributes
+                    id: "find-cve",
+                    "data-value": "find-cve" // HTML5 data-* attributes need to be enclosed in quotation marks ("") because of the dash (-) in its name.
+                }
+              }
+            ]
+          });
+        }
+      });
+    };
+
+    // Start the schema and output textareas with initial values
+    $schema.value = JSON.stringify(schema, null, 2);
+    reload();
+  };
+
+
+  document.getElementById("savecomment").onclick = function(event) {
+    var csrf_token = "{{ csrf_token() }}";
+    var json = jsoneditor.getValue();
+    json["description"] = easyMDE.value();
+    data = JSON.stringify(json);
+    fetch("{{ url_for('apiv1.comment_comments_list') }}", {
+      method: "POST",
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': csrf_token
+      },
+      body: data
+    })
+    .then(res => {
+      if (!res.ok) {
+        res.json().then(json => {
+          document.getElementById("modal-error-text").innerText = json['message'];
+          document.getElementById("modal-title").innerText = "Error";
+          var modal = new bootstrap.Modal(document.getElementById('modalError'), {});
+          modal.show();
+        });
+      } else {
+        // reinitializes the form
+        // window.jsoneditor.setValue({});
+        // easyMDE.value("");
+        document.getElementById("modal-error-text").innerText = "Comment successfully saved.";
+        document.getElementById("modal-title").innerText = "Success";
+        var modal = new bootstrap.Modal(document.getElementById('modalError'), {});
+        modal.show();
+      }
+    })
+    .catch((error) => {
+      console.log(error);
+    });
+  };
+
+  document.getElementById("btnThemeSwitch").addEventListener("click",()=>{
+    if (document.documentElement.getAttribute("data-bs-theme") == "dark") {
+      Array.from(document.getElementsByClassName("card")).forEach(container => {
+        container.classList.remove("bg-dark");
+        container.classList.add("bg-light");
+      });
+    } else {
+      Array.from(document.getElementsByClassName("card")).forEach(container => {
+        container.classList.remove("bg-light");
+        container.classList.add("bg-dark");
+      });
+    }
+  })
+</script>
+{% endblock %}

@@ -1,0 +1,446 @@
+import logging
+from typing import Any, Union
+from urllib.parse import quote_plus
+
+from flask import make_response
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+    reqparse,
+)
+from flask_restx.inputs import date_from_iso8601  # type: ignore[import-untyped]
+from sqlalchemy import distinct, func
+from werkzeug import Response as WerkzeugResponse
+
+from vulnerabilitylookup.default import get_config
+from website.models import Comment, Sighting
+from website.web.bootstrap import db, vulnerabilitylookup
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+stats_ns = Namespace("stats", description="Endpoint for retrieving various statistics.")
+
+
+# Argument Parsing
+parser_sighting = reqparse.RequestParser()
+parser_sighting.add_argument(
+    "date_from",
+    type=date_from_iso8601,
+    required=False,
+    help="The date of the sightings must be bigger or equal than this value. Format: YYYY-MM-DD",
+)
+parser_sighting.add_argument(
+    "date_to",
+    type=date_from_iso8601,
+    required=False,
+    help="The date of the sightings must be smaller or equal than this value. Format: YYYY-MM-DD",
+)
+parser_sighting.add_argument(
+    "sighting_type",
+    type=str,
+    default="",
+    choices=(
+        "seen",
+        "exploited",
+        "published-proof-of-concept",
+        "not-exploited",
+        "confirmed",
+        "not-confirmed",
+        "patched",
+        "not-patched",
+    ),
+    help="The type of the sighting.",
+)
+parser_sighting.add_argument(
+    "limit",
+    type=int,
+    default=10,
+    help="The top elements to take into account in the query.",
+)
+parser_sighting.add_argument(
+    "output",
+    type=str,
+    default="json",
+    choices=("json", "markdown"),
+    help="The format of the output.",
+)
+
+
+parser = reqparse.RequestParser()
+parser.add_argument(
+    "date_from",
+    type=date_from_iso8601,
+    required=False,
+    help="The date of the sightings must be bigger or equal than this value. Format: YYYY-MM-DD",
+)
+parser.add_argument(
+    "date_to",
+    type=date_from_iso8601,
+    required=False,
+    help="The date of the sightings must be smaller or equal than this value. Format: YYYY-MM-DD",
+)
+parser.add_argument(
+    "limit",
+    type=int,
+    default=10,
+    help="The top elements to take into account in the query.",
+)
+parser.add_argument(
+    "output",
+    type=str,
+    default="json",
+    choices=("json", "markdown"),
+    help="The format of the output.",
+)
+
+
+parser_cwe = reqparse.RequestParser()
+parser_cwe.add_argument(
+    "limit",
+    type=int,
+    default=10,
+    help="The top elements to take into account in the query.",
+)
+parser_cwe.add_argument(
+    "output",
+    type=str,
+    default="json",
+    choices=("json", "markdown"),
+    help="The format of the output.",
+)
+parser_cwe.add_argument(
+    "period",
+    type=str,
+    required=False,
+    default="",
+    help="The period of the stats. Format: YYYY[-MM]",
+)
+
+
+parser_vendor_ranking = reqparse.RequestParser()
+parser_vendor_ranking.add_argument(
+    "limit",
+    type=int,
+    default=10,
+    help="The top elements to take into account in the query.",
+)
+parser_vendor_ranking.add_argument(
+    "output",
+    type=str,
+    default="json",
+    choices=("json", "markdown"),
+    help="The format of the output.",
+)
+parser_vendor_ranking.add_argument(
+    "period",
+    type=str,
+    required=False,
+    default="",
+    help="The period of the stats. Format: YYYY[-MM]",
+)
+parser_vendor_ranking.add_argument(
+    "source",
+    type=str,
+    required=False,
+    default="cvelistv5",
+    choices=["cvelistv5", "certfr_avis", "certfr_alerte"],
+    help="The source of the vulnerability advisories.",
+)
+
+
+parser_vulnerabilities_count = reqparse.RequestParser()
+parser_vulnerabilities_count.add_argument(
+    "state",
+    type=str,
+    default="published",
+    choices=("published", "reserved"),
+    help="The state of the advisory.",
+)
+parser_vulnerabilities_count.add_argument(
+    "period",
+    type=str,
+    required=True,
+    default="",
+    help="The period of the stats. Format: YYYY[-MM]",
+)
+parser_vulnerabilities_count.add_argument(
+    "source",
+    type=str,
+    required=True,
+    default="cvelistv5",
+    choices=[
+        "cvelistv5",
+        "github",
+        "pysec",
+        "tailscale",
+        "ossf_malicious_packages",
+        "variot",
+    ],
+    help="The source of the vulnerability advisories.",
+)
+
+
+def generate_markdown_table(
+    data: list[dict[str, Any]] | list[tuple[Any, Any]],
+    headers: tuple[str, str] = ("Name", "Count"),
+) -> str:
+    """
+    Generate a Markdown table from a list of dictionaries or tuples containing name/count pairs.
+
+    :param data: List of dicts with keys 'vulnerability'/'name' and 'count',
+                 or list of tuples (name, count)
+    :param headers: Tuple containing the column headers
+    :return: Markdown-formatted table string
+    """
+    if not data:
+        return "No data available."
+
+    public_domain = get_config("generic", "public_domain")
+
+    # Markdown table header
+    markdown_table = f"| {' | '.join(headers)} |\n"
+    markdown_table += f"| {' | '.join(['-' * len(h) for h in headers])} |\n"
+
+    # Generate table rows
+    for item in data:
+        if isinstance(item, dict):
+            if vulnerability := item.get("vulnerability"):
+                name = f"https://{public_domain}/vuln/{vulnerability.upper()}"
+            elif cwe := item.get("cwe"):
+                name = f"https://{public_domain}/cwes/{cwe.upper()}"
+            elif vendor := item.get("vendor"):
+                name = f"https://{public_domain}/search?vendor={quote_plus(vendor)}"
+            elif assigner := item.get("assigner"):
+                name = f"http://{public_domain}/search?assigner={quote_plus(assigner)}"
+            else:
+                name = "N/A"
+            count = item.get("count", 0)
+        elif isinstance(item, tuple):
+            name, count = item
+            count = int(count) if isinstance(count, float) else count
+        else:
+            continue
+        markdown_table += f"| {name} | {count} |\n"
+
+    return markdown_table
+
+
+@stats_ns.route("/vulnerability/most_sighted")
+class VulnerabilityMostSighted(Resource):  # type: ignore[misc]
+    @typed(stats_ns.doc(description="Returns the most sighted vulnerabilities."))
+    @typed(stats_ns.expect(parser_sighting))
+    def get(self) -> Union[list[dict[str, Any]], str] | WerkzeugResponse:
+        args = parser_sighting.parse_args()
+        date_from = args.get("date_from")
+        date_to = args.get("date_to")
+        sighting_type = args.get("sighting_type")
+        limit = args.get("limit")
+        output = args.get("output")
+
+        if limit > 100:
+            limit = 100
+
+        query = db.session.query(
+            func.lower(Sighting.vulnerability).label(
+                "vulnerability"
+            ),  # Case-insensitive grouping
+            func.count(distinct(Sighting.uuid)).label("sightings_count"),
+        )
+
+        if sighting_type:
+            query = query.filter(Sighting.type == sighting_type)
+        if date_from:
+            query = query.filter(
+                func.date(Sighting.creation_timestamp) >= date_from,
+            )
+        if date_to:
+            query = query.filter(
+                func.date(Sighting.creation_timestamp) <= date_to,
+            )
+
+        query = query.group_by(
+            func.lower(Sighting.vulnerability)
+        )  # Group by case-insensitive vulnerability
+        query = query.order_by(
+            func.count(distinct(Sighting.uuid)).desc()
+        )  # Order by count
+        query = query.limit(limit)
+
+        # Convert results to a list of dictionaries
+        result = [
+            {"vulnerability": r.vulnerability, "count": r.sightings_count}
+            for r in query.all()
+        ]
+        if output == "markdown":
+            response = make_response(
+                generate_markdown_table(result, headers=("Vulnerability", "Count")),
+                200,
+            )
+            response.mimetype = "text/plain"
+            return response
+        return result
+
+
+@stats_ns.route("/vulnerability/most_commented")
+class VulnerabilityMostCommented(Resource):  # type: ignore[misc]
+    @typed(stats_ns.doc(description="Returns the most commented vulnerabilities."))
+    @typed(stats_ns.expect(parser))
+    def get(self) -> Union[list[dict[str, Any]], str] | WerkzeugResponse:
+        args = parser.parse_args()
+        date_from = args.get("date_from")
+        date_to = args.get("date_to")
+        limit = args.get("limit")
+        output = args.get("output")
+
+        if limit > 100:
+            limit = 100
+
+        query = db.session.query(
+            func.lower(Comment.vulnerability).label(
+                "vulnerability"
+            ),  # Case-insensitive
+            func.count(Comment.uuid).label("comments_count"),
+        )
+        if date_from:
+            query = query.filter(
+                func.date(Comment.creation_timestamp) >= date_from,
+            )
+        if date_to:
+            query = query.filter(
+                func.date(Comment.creation_timestamp) <= date_to,
+            )
+
+        query = query.group_by(
+            func.lower(Comment.vulnerability)
+        )  # Group by case-insensitive vulnerability
+        query = query.order_by(
+            func.count(distinct(Comment.uuid)).desc()
+        )  # Order by count
+        query = query.limit(limit)
+
+        # Convert results to a list of dictionaries
+        result = [
+            {"vulnerability": r.vulnerability, "count": r.comments_count}
+            for r in query.all()
+        ]
+        if output == "markdown":
+            response = make_response(
+                generate_markdown_table(result, headers=("Vulnerability", "Count")),
+                200,
+            )
+            response.mimetype = "text/plain"
+            return response
+        return result
+
+
+@stats_ns.route("/vulnerability/count")
+class VulnerabilityCount(Resource):  # type: ignore[misc]
+    @typed(
+        stats_ns.doc(
+            description="Returns the number of published/reserved vulnerabilities for a specific period."
+        )
+    )
+    @typed(stats_ns.expect(parser_vulnerabilities_count))
+    def get(self) -> int:
+        args = parser_vulnerabilities_count.parse_args()
+        state = args.get("state")
+        source = args.get("source")
+        period = args.get("period")
+        result = vulnerabilitylookup.get_count(
+            state=state, source=source, period=period
+        )
+        return result
+
+
+@stats_ns.route("/cwe/most_used")
+class CWEMostUsed(Resource):  # type: ignore[misc]
+    @typed(stats_ns.doc(description="Returns the most used CWEs based on sightings"))
+    @typed(stats_ns.expect(parser_cwe))
+    def get(self) -> list[dict[str, Any]] | WerkzeugResponse:
+        args = parser_cwe.parse_args()
+        limit = args.get("limit")
+        output = args.get("output")
+        period = args.get("period")
+
+        # Cap limit at 10
+        if not limit or limit > 10:
+            limit = 10
+
+        result = [
+            {"cwe": r[0], "count": r[1]}
+            for r in vulnerabilitylookup.get_top_cwe(top_n=limit, period=period)
+        ]
+
+        if output == "markdown":
+            response = make_response(
+                generate_markdown_table(result, headers=("CWE", "Count")), 200
+            )
+            response.mimetype = "text/plain"
+            return response
+        return result
+
+
+@stats_ns.route("/vendors/ranking")
+class VendorsRanking(Resource):  # type: ignore[misc]
+    @typed(stats_ns.doc(description="Returns the vendors ranking."))
+    @typed(stats_ns.expect(parser_vendor_ranking))
+    def get(self) -> list[dict[str, Any]] | WerkzeugResponse:
+        args = parser_vendor_ranking.parse_args()
+        limit = args.get("limit")
+        output = args.get("output")
+        period = args.get("period")
+        source = args.get("source", "cvelistv5")
+
+        # Cap limit at 10
+        if not limit or limit > 10:
+            limit = 10
+
+        result = [
+            {"vendor": r[0], "count": r[1]}
+            for r in vulnerabilitylookup.get_top_vendors(
+                top_n=limit, period=period, source=source
+            )
+        ]
+
+        if output == "markdown":
+            response = make_response(
+                generate_markdown_table(result, headers=("Vendor", "Count")),
+                200,
+            )
+            response.mimetype = "text/plain"
+            return response
+        return result
+
+
+@stats_ns.route("/assigners/ranking")
+class AssignersRanking(Resource):  # type: ignore[misc]
+    @typed(stats_ns.doc(description="Returns the assigners ranking."))
+    @typed(stats_ns.expect(parser_vendor_ranking))
+    def get(self) -> list[dict[str, Any]] | WerkzeugResponse:
+        args = parser_vendor_ranking.parse_args()
+        limit = args.get("limit")
+        output = args.get("output")
+        period = args.get("period")
+        source = args.get("source", "cvelistv5")
+
+        # Cap limit at 10
+        if not limit or limit > 10:
+            limit = 10
+
+        result = [
+            {"assigner": r[0], "count": r[1]}
+            for r in vulnerabilitylookup.get_top_assigners(
+                top_n=limit, period=period, source=source
+            )
+        ]
+
+        if output == "markdown":
+            response = make_response(
+                generate_markdown_table(result, headers=("Assigner", "Count")),
+                200,
+            )
+            response.mimetype = "text/plain"
+            return response
+        return result

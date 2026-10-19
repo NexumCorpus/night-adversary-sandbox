@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+from typing import Any
+
+from flask import current_app
+from flask_login import login_user  # type: ignore[import-untyped]
+from flask_principal import (  # type: ignore[import-untyped]
+    Identity,
+    Permission,
+    RoleNeed,
+    identity_changed,
+    session_identity_loader,
+)
+
+admin_role = RoleNeed("admin")
+commenter_role = RoleNeed("commenter")
+reporter_role = RoleNeed("reporter")
+
+admin_permission = Permission(admin_role)
+commenter_permission = Permission(commenter_role)
+reporter_permission = Permission(reporter_role)
+
+
+def login_user_bundle(user: Any) -> None:
+    login_user(user)
+    identity_changed.send(current_app, identity=Identity(user.id))
+    session_identity_loader()

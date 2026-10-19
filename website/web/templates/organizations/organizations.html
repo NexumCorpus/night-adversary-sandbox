@@ -1,0 +1,93 @@
+{% extends "main.html" %}
+{% block title %}Organizations{% endblock %}
+{% block content %}
+<div class="row align-items-center mb-3">
+  <div class="col-md-6">
+    <h1 class="mb-0">Organizations</h1>
+  </div>
+  <div class="col-md-3 d-flex align-items-center">
+    <div class="form-check form-switch">
+      <input class="form-check-input" type="checkbox" id="switchGNA" role="switch">
+      <label class="form-check-label ms-2" for="switchGNA" id="switchGNALabel">Show Only GNAs</label>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <form method="GET" class="d-flex">
+      <label for="organizationInput" class="visually-hidden">Search term</label>
+      <div class="input-group">
+        <input type="text" class="form-control" id="organizationInput" name="query" placeholder="Search term">
+        <button type="submit" class="btn btn-primary input-group-text">Submit</button>
+      </div>
+    </form>
+  </div>
+</div>
+<div class="row mt-4">
+  <div class="col">
+    <div class="list-group">
+      {% for organization in organizations %}
+        <nav aria-label="breadcrumb" class="mb-3">
+          <ol class="breadcrumb p-3 rounded shadow-sm d-flex justify-content-between align-items-center" style="background-color: #446d80; color: #fff;">
+            <li class="breadcrumb-item mb-0 text-white" aria-current="page">
+              <strong><a class="text-white" href="{{ url_for('organization_bp.get_by_uuid', organization_uuid=organization.uuid) }}">{{ organization.name }}</a></strong>
+            </li>
+            <li class="mb-0">
+              <a href="{{ url_for('organization_bp.export_cpe_information', organization_uuid=organization.uuid) }}" class="text-white" style="text-decoration: none;">
+                {{ render_icon('download', title='Export CPE information', color='white') }}
+              </a>
+            </li>
+          </ol>
+        </nav>
+        <div class="row g-4 mb-5">
+          {% for product in organization.products %}
+            <div class="col-12 col-md-6 col-lg-4">
+              <div class="card h-100 shadow">
+                <div class="card-body d-flex flex-column gap-2">
+                  <h5 class="card-title">{{ product.name }}</h5>
+                  <p class="card-text text-justify flex-grow-1">{{ product.description }}</p>
+                  <div class="mt-auto d-flex justify-content-between align-items-center">
+                    <a href="{{ url_for('product_bp.get', product_uuid=product.uuid) }}" class="card-link">More</a>
+                    <a href="{{ url_for('product_bp.export_cpe_information', product_uuid=product.uuid) }}" class="card-link">{{ render_icon('download', title='Export CPE information') }}</a>
+                  </div>
+                </div>
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+<div class="row">
+  <div class="col d-flex justify-content-center mb-2">
+    {{ pagination.links }}
+  </div>
+</div>
+<div class="row">
+  <div class="col d-flex justify-content-center text-muted small">
+    {{ pagination.info }}
+  </div>
+</div>
+<script>
+  // Helper to update query parameters
+  function updateURLParam(param, value) {
+    const url = new URL(window.location);
+    if (value) {
+      url.searchParams.set(param, value);
+    } else {
+      url.searchParams.delete(param);
+    }
+    window.location = url.toString();
+  }
+
+  // Handle switch change
+  document.getElementById("switchGNA").addEventListener("change", function () {
+    updateURLParam("only_gna", this.checked ? "1" : "");
+  });
+
+  // Initialize the switch state based on current URL
+  window.addEventListener("DOMContentLoaded", () => {
+    const urlParams = new URLSearchParams(window.location.search);
+    document.getElementById("switchGNA").checked = urlParams.get("only_gna") === "1";
+  });
+</script>
+{% endblock %}

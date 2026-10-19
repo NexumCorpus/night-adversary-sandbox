@@ -1,0 +1,112 @@
+import logging
+import re
+from datetime import datetime, timezone
+from typing import Any
+
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+)
+
+from vulnerabilitylookup import __version__
+from vulnerabilitylookup.default import get_config
+from website.models import get_db_info
+from website.notifications.emails import check_smtp_connection
+from website.web.api.v1.common import auth_func
+from website.web.bootstrap import application, vulnerabilitylookup
+from website.web.permissions import admin_permission
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+local_instance_name = get_config("generic", "local_instance_name").lower()
+local_instance_vulnid_pattern = get_config("generic", "local_instance_vulnid_pattern")
+
+system_ns = Namespace(
+    "system",
+    description="Endpoints for retrieving various information about the system's status.",
+)
+system_ns_legacy = Namespace("system_legacy", doc=False)
+
+
+@system_ns.route("/valkey_up")
+@system_ns.route(
+    "/redis_up",
+    doc={
+        "description": "Alias for /api/system/redis_up",
+        "deprecated": True,
+    },
+)
+@system_ns.doc(description="Check if Valkey/Redis is up and running.")
+class RedisUp(Resource):  # type: ignore[misc]
+    def get(self) -> bool:
+        """Check if Valkey/Redis is up and running."""
+        return vulnerabilitylookup.check_redis_up()
+
+
+@system_ns.route("/checkSMTP")
+@system_ns.doc(description="Checks the SMTP connection.")
+class CheckSMTP(Resource):  # type: ignore[misc]
+    @auth_func
+    @typed(admin_permission.require(http_exception=403))
+    def get(self) -> bool:
+        """Checks the SMTP connection."""
+        return check_smtp_connection()
+
+
+@system_ns.route("/dbInfo")
+@system_ns.doc(
+    description="Returns information about the current sources in the Kvrocks database in use and when it was updated."
+)
+@system_ns_legacy.route("dbInfo", doc=False)
+class Info(Resource):  # type: ignore[misc]
+    def get(self) -> dict[str, Any]:
+        """Returns information about the current sources in the Kvrocks database in use and when it was updated."""
+        return vulnerabilitylookup.get_info()
+
+
+@system_ns.route("/pgInfo")
+@system_ns.doc(description="Returns information about the PostgreSQL database.")
+class PgInfo(Resource):  # type: ignore[misc]
+    @auth_func
+    @typed(admin_permission.require(http_exception=403))
+    def get(self) -> dict[str, Any]:
+        """Returns information about the PostgreSQL database."""
+        return get_db_info()
+
+
+@system_ns.route("/configInfo")
+@system_ns.doc(
+    description="Returns non-sensitive information about the configuration of the system."
+)
+class ConfigInfo(Resource):  # type: ignore[misc]
+    def get(self) -> dict[str, Any]:
+        """Returns non-sensitive information about the configuration of the system."""
+        return {
+            "2FA_enforced": application.config["ENFORCE_2FA"],
+            "user_accounts": get_config("generic", "user_accounts"),
+            "local_instance_uuid": get_config("generic", "local_instance_uuid"),
+            "registration": application.config["SELF_REGISTRATION"],
+            "moderation": application.config["COMMENTS_MODERATION"],
+            "software_version": __version__,
+        }
+
+
+@system_ns.route("/checkProcess")
+@system_ns.doc(description="Checks the heartbeats of the various processes.")
+class CheckProcess(Resource):  # type: ignore[misc]
+    @auth_func
+    @typed(admin_permission.require(http_exception=403))
+    def get(self) -> dict[str, str]:
+        """Checks the heartbeats of the various processes."""
+        heartbeat_pattern = re.compile(r"^process_heartbeat_.*$")
+        _, keys = vulnerabilitylookup.redis_client.scan(match="process_heartbeat_*")
+        heartbeats = {}
+        for key in keys:
+            if heartbeat_pattern.match(key):
+                heartbeats[key] = datetime.fromtimestamp(
+                    float(vulnerabilitylookup.redis_client.get(key) or 0),
+                    tz=timezone.utc,
+                ).isoformat()
+        return heartbeats

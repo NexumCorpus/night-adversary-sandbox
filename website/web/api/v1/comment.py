@@ -1,0 +1,350 @@
+import logging
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Tuple
+
+from flask_login import current_user  # type: ignore[import-untyped]
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+    abort,
+    fields,
+    reqparse,
+)
+from flask_restx.inputs import date_from_iso8601  # type: ignore[import-untyped]
+from sqlalchemy import func
+
+from vulnerabilitylookup.default import get_config
+from website.lib.utils import find_cve_ids, find_ghsa_ids, find_pysec_ids
+from website.models import Comment
+from website.notifications import notifications
+from website.validators import validate_json
+from website.web.api.v1.common import (
+    auth_func,
+    metada_params_model,
+    user_params_model,
+    uuid_type,
+)
+from website.web.api.v1.types import ResultType
+from website.web.bootstrap import application, db
+from website.web.permissions import commenter_permission
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+comment_ns = Namespace("comment", description="Comment related operations.")
+
+local_instance_uuid = get_config("generic", "local_instance_uuid").lower()
+
+# Argument Parsing
+parser = reqparse.RequestParser()
+parser.add_argument(
+    "page",
+    type=int,
+    default=1,
+    help="Number of the page.",
+)
+parser.add_argument(
+    "per_page",
+    type=int,
+    default=100,
+    help="Maximum number of elements to return.",
+)
+parser.add_argument("uuid", type=uuid_type, help="UUID of the comment.")
+parser.add_argument(
+    "vuln_id",
+    type=str,
+    help="Vulnerability related to the comment.",
+)
+parser.add_argument(
+    "author",
+    type=str,
+    help="Author of the comment.",
+)
+parser.add_argument(
+    "meta",
+    type=str,
+    help="Query for the meta JSON field. Example: meta=[{'tags': ['PoC']}]",
+)
+parser.add_argument(
+    "date_from",
+    type=date_from_iso8601,
+    required=False,
+    help="The date of the comments must be bigger or equal than this value. Format: YYYY-MM-DD",
+)
+parser.add_argument(
+    "date_to",
+    type=date_from_iso8601,
+    required=False,
+    help="The date of the comments must be smaller or equal than this value. Format: YYYY-MM-DD",
+)
+
+# Response marshalling
+comment_params_model = {
+    "uuid": fields.String(description="Comment uuid."),
+    "vulnerability_lookup_origin": fields.String(
+        description="UUID of the Vulnerability-Lookup origin instance.",
+        readonly=True,
+        default=local_instance_uuid,
+    ),
+    "title": fields.String(description="Comment title."),
+    "description": fields.String(description="Description."),
+    "description_format": fields.String(
+        description="Description format (markdown or text)."
+    ),
+    "vulnerability": fields.String(description="Vulnerability id."),
+    "creation_timestamp": fields.DateTime(
+        description="Creation time of the comment.", readonly=True
+    ),
+    "timestamp": fields.DateTime(
+        description="Updated time of the comment.", readonly=True
+    ),
+    "related_vulnerabilities": fields.List(
+        fields.String,
+        description="One or more vulnerability references (CVE ID, GHSA-ID, PYSEC ID, etc.) for this comment.",
+    ),
+    "meta": fields.Raw(description="Zero or more meta-fields."),
+}
+comment = comment_ns.model("Comment", comment_params_model)
+metadata = comment_ns.model("metadata", metada_params_model)
+
+comment["author"] = fields.Nested(
+    comment_ns.model("User", user_params_model), readonly=True
+)
+
+comment_list_fields = comment_ns.model(
+    "CommentsList",
+    {
+        "metadata": fields.Nested(
+            metadata, description="Metada related to the result."
+        ),
+        "data": fields.List(
+            fields.Nested(comment, skip_none=True), description="List of comments."
+        ),
+    },
+)
+
+
+@comment_ns.route("/<string:comment_uuid>")
+class CommentItem(Resource):  # type: ignore[misc]
+    @typed(comment_ns.doc(description="Get a comment with its UUID."))
+    @typed(
+        comment_ns.doc(
+            responses={
+                200: "Success.",
+                404: "Comment not found.",
+            }
+        )
+    )
+    @typed(comment_ns.marshal_with(comment, skip_none=True))
+    def get(self, comment_uuid: str) -> Tuple[dict[Any, Any], int]:
+        result = Comment.query.filter(
+            Comment.is_published == True, Comment.uuid == comment_uuid  # noqa: E712
+        ).first()
+        if not result:
+            return {"message": "Comment not found."}, 404
+        return result, 200
+
+    @typed(comment_ns.doc(description="Delete a comment."))
+    @typed(
+        comment_ns.doc(
+            responses={
+                204: "Success.",
+                403: "Commenter permission required or not the author of the comment.",
+                404: "Comment not found.",
+            }
+        )
+    )
+    @typed(auth_func)
+    @typed(commenter_permission.require(http_exception=403))
+    def delete(self, comment_uuid: str) -> Tuple[dict[Any, Any], int]:
+        """Endpoint for deleting a comment."""
+        obj = Comment.query.filter(Comment.uuid == comment_uuid).first()
+        if obj:
+            if not current_user.is_admin and current_user.id != obj.author_id:
+                return abort(403, "You cannot delete this comment.")
+            db.session.delete(obj)
+            db.session.commit()
+            return {}, 204
+        return {"message": "Comment not found."}, 404
+
+
+@comment_ns.route("/")
+class CommentsList(Resource):  # type: ignore[misc]
+    @typed(comment_ns.doc("list_comments"))
+    @typed(comment_ns.expect(parser))
+    @typed(comment_ns.marshal_list_with(comment_list_fields))
+    def get(self) -> Tuple[ResultType, int]:
+        """List all comments."""
+        args = parser.parse_args()
+        page = args.pop("page", 1)  # 1-based page index
+        per_page = args.pop("per_page", 10)  # Number of records per page
+
+        # Enforce maximum per_page limit
+        if per_page not in [1, ..., 200]:
+            per_page = 100
+
+        # Calculate the offset based on page and per_page
+        offset = (page - 1) * per_page
+
+        result: ResultType = {
+            "data": [],
+            "metadata": {
+                "count": 0,  # Total number of records matching the filters
+                "page": page,  # Current page number
+                "per_page": per_page,  # Number of records per page
+            },
+        }
+
+        query = Comment.query
+        query = query.filter(Comment.is_published == True)  # noqa: E712
+
+        # Apply filters
+        if args.get("uuid"):
+            query = query.filter(Comment.uuid == args["uuid"])
+        if args.get("author"):
+            query = query.filter(Comment.author.has(login=args["author"]))
+        if args.get("vuln_id"):
+            query = query.filter(
+                Comment.vulnerability.ilike("%" + args["vuln_id"] + "%")
+            )
+        if args.get("date_from"):
+            query = query.filter(
+                func.date(Comment.creation_timestamp) >= args["date_from"]
+            )
+        if args.get("date_to"):
+            query = query.filter(
+                func.date(Comment.creation_timestamp) <= args["date_to"]
+            )
+        if args.get("meta"):
+            # Example of value for meta_query: [{"tags": ["PoC"]}]
+            query = query.filter(Comment.meta.contains(args["meta"]))
+
+        # Order the query by timestamp, descending
+        query = query.order_by(Comment.timestamp.desc())
+
+        # Get total record count
+        total = query.count()
+
+        # Apply pagination
+        results = query.offset(offset).limit(per_page).all()
+
+        # Populate the result
+        result["data"] = results
+        result["metadata"]["count"] = total
+
+        return result, 200
+
+    @typed(
+        comment_ns.doc(description="Create a comment related to a security advisory.")
+    )
+    @typed(
+        comment_ns.doc(
+            responses={
+                201: "Success.",
+                400: "JSON validation failed or incorrect payload to instantiate a comment.",
+                403: "Commenter permission required or not the author of the comment.",
+            }
+        )
+    )
+    @typed(comment_ns.expect(comment))
+    @typed(comment_ns.marshal_list_with(comment_list_fields, code=201))
+    @typed(auth_func)
+    @typed(commenter_permission.require(http_exception=403))
+    def post(self) -> Tuple[ResultType, int]:
+        """Create a new comment related to a security advisory (vulnerability)."""
+        result: ResultType = {
+            "data": [],
+            "metadata": {
+                "count": 0,
+                "page": 0,
+                "per_page": 10,
+            },
+        }
+
+        current_time = datetime.now(timezone.utc)
+        comment = comment_ns.payload
+        comment["uuid"] = comment.get("uuid", str(uuid.uuid4()))
+        comment["vulnerability_lookup_origin"] = local_instance_uuid
+        comment["creation_timestamp"] = current_time.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        comment["timestamp"] = current_time.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        # Find security advisories IDs in the description and add the result to the related vulnerabilities
+        comment.setdefault("related_vulnerabilities", [])
+        comment.get("related_vulnerabilities", []).extend(
+            find_cve_ids(comment.get("description", ""))
+        )
+        comment.get("related_vulnerabilities", []).extend(
+            find_ghsa_ids(comment.get("description", ""))
+        )
+        comment.get("related_vulnerabilities", []).extend(
+            find_pysec_ids(comment.get("description", ""))
+        )
+        # Remove duplicates
+        comment["related_vulnerabilities"] = list(
+            set(comment["related_vulnerabilities"])
+        )
+        # Strip leading, trailing, and inner spaces
+        comment["related_vulnerabilities"] = list(
+            map(lambda s: "".join(s.split()), comment["related_vulnerabilities"])
+        )
+
+        # Validate the JSON payload
+        try:
+            validate_json(comment, "circl_comment")
+        except Exception:
+            logger.warning("JSON validation failed.")
+            return abort(400, "JSON validation failed.")
+
+        obj = Comment.query.filter(Comment.uuid == comment["uuid"]).first()
+        if obj:
+            # edit an existing comment
+            if not current_user.is_admin and obj.author_id != current_user.id:
+                # only administrators can update a comment from another user
+                return abort(400, "You are not the author of this comment.")
+            obj.title = comment["title"]
+            obj.description = comment["description"]
+            obj.description_format = comment.get("description_format", "markdown")
+            obj.related_vulnerabilities = comment.get("related_vulnerabilities", [])
+            obj.meta = comment.get("meta", {})
+            obj.timestamp = comment["timestamp"]
+            result["data"] = obj
+            result["metadata"]["count"] = 1
+        else:
+            # creation of a new comment
+            try:
+                new_comment = Comment(
+                    **comment,
+                    is_published=(
+                        True
+                        if current_user.is_admin
+                        else (
+                            current_user.is_trustworthy()
+                            if application.config.get("COMMENTS_MODERATION", True)
+                            else True
+                        )
+                    ),
+                    author_id=current_user.id,
+                )
+                db.session.add(new_comment)
+                if new_comment.is_published:
+                    result["data"] = new_comment
+                result["metadata"]["count"] = 1
+            except Exception:
+                db.session.rollback()
+                return abort(400, "Comment creation failed.")
+
+            if not current_user.is_admin:
+                # Send a notification to the admin
+                try:
+                    if not current_user.is_trustworthy():
+                        notifications.new_comment_to_moderate(current_user)
+                    else:
+                        notifications.new_comment_automatically_published(new_comment)
+                except Exception:
+                    logger.warning(
+                        "Problem when sending notification of new comment to moderate."
+                    )
+
+        db.session.commit()
+        return result, 201

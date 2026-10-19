@@ -1,0 +1,247 @@
+[build-system]
+requires = ["poetry-core>=2.0"]
+build-backend = "poetry.core.masonry.api"
+
+
+[project]
+name = "vulnerabilitylookup"
+version = "3.0.1"
+description = "Vulnerability-Lookup facilitates quick correlation of vulnerabilities from various sources, independent of vulnerability IDs, and streamlines the management of Coordinated Vulnerability Disclosure (CVD)."
+authors = [
+    {name = "Alexandre Dulaunoy", email = "alexandre.dulaunoy@circl.lu"},
+    {name = "Raphaël Vinot", email = "raphael.vinot@circl.lu"},
+    {name = "Cédric Bonhomme", email = "cedric.bonhomme@circl.lu"}
+]
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+keywords = ["Vulnerability-Lookup", "Vulnerability", "CVE", "GCVE", "CVD", "CSAF"]
+# classifieres is dynamic because we want to create Python classifiers automatically
+dynamic = ["classifiers"]
+
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "redis [hiredis] (>=5.0.8)",
+    "gunicorn [gevent] (>=23.0.0)",
+    "flask-restx (>=1.3.2)",
+    "werkzeug (>=3.1.5)",
+    "requests (>=2.32.5)",
+    "gitpython (>=3.1.43)",
+    "bootstrap-flask (>=2.4.0)",
+    "pyyaml (>=6.0.2)",
+    "orjson (>=3.10.7)",
+    "feedgen (>=1.0.0)",
+    "sqlalchemy (>=2.0.45)",
+    "flask-principal (>=0.4.0)",
+    "flask-login (>=0.6.3)",
+    "flask-sqlalchemy (>=3.1.1)",
+    "flask-migrate (>=4.0.7)",
+    "validate-email (>=1.3)",
+    "flask-wtf (>=1.2.1)",
+    "wtforms (>=3.1.2)",
+    "email-validator (>=2.2.0)",
+    "flask-paginate (>=2024.4.12)",
+    "pyotp (>=2.9.0)",
+    "qrcode [pil] (>=7.4.2)",
+    "pyvariot (>=0.2.0)",
+    "markdown (>=3.7)",
+    "the-big-username-blacklist (>=1.5.4)",
+    "cvss (>=3.1)",
+    "xmltodict (>=0.14.0)",
+    "feedparser (>=6.0.11)",
+    "pycountry (>=24.6.1)",
+    "pymispwarninglists (>=1.5)",
+    "bleach (>=6.3.0)",
+    "sqlalchemy-schemadisplay (>=2.0,<3.0)",
+    "beautifulsoup4 (>=4.11.2)",
+    "gcve (>=0.11.0,<1.0.0)",
+    "pylookyloo (>=1.31.1,<2.0.0)",
+    "pytz (>=2025.2,<2026.0)",
+    "flask-limiter[cli] (>=4.1.0,<5.0.0)",
+    "psycopg[binary] (>=3.3.2,<4.0.0)",
+]
+
+
+[project.urls]
+Homepage = "https://github.com/vulnerability-lookup/vulnerability-lookup"
+Repository = "https://github.com/vulnerability-lookup/vulnerability-lookup"
+Documentation = "https://www.vulnerability-lookup.org/documentation"
+Changelog = "https://github.com/vulnerability-lookup/vulnerability-lookup/blob/main/CHANGELOG.md"
+
+
+[project.scripts]
+start = "bin.start:main"
+stop = "bin.stop:main"
+update = "bin.update:main"
+shutdown = "bin.shutdown:main"
+run_backend = "bin.run_backend:main"
+start_website = "bin.start_website:main"
+feeders_manager = "bin.feeders_manager:main"
+restart_website = "bin.restart_website:main"
+cisa_known_exploited = "bin.cisa_known_exploited:main"
+cnw_known_exploited = "bin.cnw_known_exploited:main"
+nvd_importer = "bin.nvd_fetcher:main"
+cvelist_importer = "bin.cvelist:main"
+gsd_importer = "bin.gsd:main"
+pysec_importer = "bin.pysec:main"
+emb3d_importer = "bin.emb3d:main"
+jvndb_importer = "bin.jvndb:main"
+github_importer = "bin.github:main"
+tailscale_importer = "bin.tailscale:main"
+certfr_avis_importer = "bin.certfr_avis:main"
+certfr_alerte_importer = "bin.certfr_alerte:main"
+variot_importer = "bin.variot:main"
+ossf_malicious_importer = "bin.ossf_malicious:main"
+bitnami_vulndb_importer = "bin.bitnami_vulndb:main"
+cleanstart_importer = "bin.cleanstart:main"
+drupal_importer = "bin.drupal:main"
+csaf_certbund_importer = "bin.csaf_certbund:main"
+csaf_ncscnl_importer = "bin.csaf_ncscnl:main"
+csaf_trustsource_importer = "bin.csaf_trustsource:main"
+csaf_siemens_importer = "bin.csaf_siemens:main"
+csaf_redhat_importer = "bin.csaf_redhat:main"
+csaf_suse_importer = "bin.csaf_suse:main"
+csaf_opensuse_importer = "bin.csaf_opensuse:main"
+csaf_cisa_importer = "bin.csaf_cisa:main"
+csaf_cisco_importer = "bin.csaf_cisco:main"
+csaf_sick_importer = "bin.csaf_sick:main"
+csaf_ox_importer = "bin.csaf_ox:main"
+csaf_nozominetworks_importer = "bin.csaf_nozominetworks:main"
+csaf_abb_importer = "bin.csaf_abb:main"
+csaf_se_importer = "bin.csaf_se:main"
+cwec_importer = "bin.cwec:main"
+capec_importer = "bin.capec:main"
+vulnrichment_importer = "bin.vulnrichment:main"
+fkie_nvd_importer = "bin.fkie_nvd:main"
+csaf_microsoft_importer = "bin.csaf_microsoft:main"
+gcve_vl_importer = "bin.gcve_vl:main"
+cnvd_importer = "bin.cnvd:main"
+fstec_importer = "bin.fstec:main"
+osv_ossfuzz_importer = "bin.osv_ossfuzz:main"
+osv_rustsec_importer = "bin.osv_rustsec:main"
+dump = "bin.dump:main"
+index_cwe = "bin.index_cwe:main"
+
+
+[tool.poetry]
+requires-poetry = ">=2.0"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Topic :: Security",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)"
+]
+packages = [
+    { include = "bin" },
+    { include = "vulnerabilitylookup" }
+]
+
+
+[tool.poetry.group.dev.dependencies]
+ipython = "^8.26.0"
+pre-commit = "^3.8.0"
+mypy = "^1.11.2"
+types-redis = "^4.6.0.20240819"
+types-requests = "^2.32.0.20240712"
+types-pyyaml = "^6.0.12.20240808"
+pytest = "^8.3.2"
+pytest-env = "^1.1.3"
+pyvulnerabilitylookup = "^2.10.1"
+types-xmltodict = "^0.13.0.3"
+types-openpyxl = "^3.1.5.20250919"
+
+
+[tool.poetry.group.docs.dependencies]
+sphinx-book-theme = "^1.1.4"
+sphinxcontrib-openapi = "^0.8.4"
+pydot = "^4.0.1"
+
+
+[tool.poetry.group.docs]
+optional = true
+
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+ignore_errors = false
+ignore_missing_imports = false
+strict_optional = true
+no_implicit_optional = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+warn_unreachable = true
+
+show_error_context = true
+pretty = true
+
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
+env = [
+    "TESTING=gh_action",
+]
+
+
+[tool.pylsp.plugins.pylsp_lint]
+exclude = [
+    "logs",
+    ".mypy_cache/",
+    ".pytest_cache/",
+    "cache/",
+    "storage/",
+    "csaf_distribution/",
+    "vulnerabilitylookup/feeders/gsd/*",
+    "vulnerabilitylookup/feeders/github/*",
+    "vulnerabilitylookup/feeders/pysec/*",
+    "vulnerabilitylookup/feeders/emb3d/*",
+    "vulnerabilitylookup/feeders/cvelistv5/*",
+    "vulnerabilitylookup/feeders/ossf_malicious_packages/*",
+    "vulnerabilitylookup/feeders/vulnrichment/*",
+    "vulnerabilitylookup/feeders/fkie_nvd/*",
+    "vulnerabilitylookup/feeders/csaf_*"
+]
+
+
+[tool.pylsp.plugins]
+pyflakes.enabled = false
+pycodestyle.enabled = false
+mccabe.enabled = false
+flake8.enabled = false
+pydocstyle.enabled = false
+rope_completion.enabled = true
+jedi_completion.enabled = true
+
+[tool.ruff]
+extend-exclude = [
+    "logs",
+    ".mypy_cache/",
+    ".pytest_cache/",
+    "cache/",
+    "storage/",
+    "csaf_distribution/",
+    "vulnerabilitylookup/feeders/gsd",
+    "vulnerabilitylookup/feeders/github",
+    "vulnerabilitylookup/feeders/pysec",
+    "vulnerabilitylookup/feeders/emb3d",
+    "vulnerabilitylookup/feeders/cvelistv5",
+    "vulnerabilitylookup/feeders/ossf_malicious_packages",
+    "vulnerabilitylookup/feeders/vulnrichment",
+    "vulnerabilitylookup/feeders/fkie_nvd",
+    "vulnerabilitylookup/feeders/csaf_*"
+]
+line-length = 140
+fix = true

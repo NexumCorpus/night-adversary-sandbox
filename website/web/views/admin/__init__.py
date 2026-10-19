@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+import uuid
+
+from flask import (
+    Blueprint,
+    jsonify,
+    redirect,
+    render_template,
+    url_for,
+)
+from flask_login import (  # type: ignore[import-untyped]
+    current_user,
+    login_required,
+)
+from werkzeug import Response as WerkzeugResponse
+
+from vulnerabilitylookup.default import get_config, get_homedir
+from website.lib.gcve_utils import (
+    load_local_gcve_registry,
+    sync_organizations,
+    verify_local_registry_integrity,
+)
+from website.lib.utils import exec_cmd_no_wait
+from website.models import (
+    Bundle,
+    Comment,
+    KEVEntry,
+    Notification,
+    Organization,
+    Sighting,
+    User,
+    VulnerabilityDisclosure,
+)
+from website.web.bootstrap import vulnerabilitylookup
+from website.web.permissions import admin_permission
+
+admin_bp = Blueprint("admin_bp", __name__, url_prefix="/admin")
+
+
+@admin_bp.route("/")
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def index() -> WerkzeugResponse:
+    """Redirects (HTTP 302) the user to the admin dashboard."""
+    return redirect(url_for("admin_bp.dashboard"))
+
+
+@admin_bp.route("/dashboard", methods=["GET"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def dashboard() -> str:
+    """Returns a dashboard with various settings of the instance."""
+    new_disclosures = VulnerabilityDisclosure.query.filter(
+        VulnerabilityDisclosure.state == "reported"
+    ).count()
+    local_instance_uuid = get_config("generic", "local_instance_uuid")
+    nb_local_kev_entries = KEVEntry.query.filter(
+        KEVEntry.vulnerability_lookup_origin == uuid.UUID(local_instance_uuid.lower())
+    ).count()
+    return render_template(
+        "admin/dashboard.html",
+        nb_users=User.query.count(),
+        nb_comments=Comment.query.count(),
+        nb_bundles=Bundle.query.count(),
+        nb_sightings=Sighting.query.count(),
+        nb_kev_entries=KEVEntry.query.count(),
+        nb_local_kev_entries=nb_local_kev_entries,
+        nb_notifications=Notification.query.count(),
+        nb_organizations=Organization.query.count(),
+        nb_disclosures=VulnerabilityDisclosure.query.count(),
+        GNAs=load_local_gcve_registry(),
+        gcve_registry_integrity=verify_local_registry_integrity,
+        new_disclosures=new_disclosures,
+        local_instance_uuid=local_instance_uuid,
+        local_instance_name=get_config("generic", "local_instance_name"),
+        storage_info=vulnerabilitylookup.get_info(),
+    )
+
+
+@admin_bp.route("/command/backup_database", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def backup_database() -> WerkzeugResponse:
+    exec_cmd_no_wait("poetry run flask --app website.app db_backup")
+    return jsonify({"message": "Command executed."})
+
+
+@admin_bp.route("/command/update_warninglists", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def update_warninglists() -> WerkzeugResponse:
+    exec_cmd_no_wait("poetry run flask --app website.app update_warninglists")
+    return jsonify({"message": "Command executed."})
+
+
+@admin_bp.route("/command/dump_feeds", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def dump_feeds() -> WerkzeugResponse:
+    exec_cmd_no_wait("poetry run dump --all")
+    return jsonify({"message": "Command executed."})
+
+
+@admin_bp.route("/command/dump_sightings", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def dump_sightings() -> WerkzeugResponse:
+    """Trigger the backup of the sightings in a dedicated process."""
+    exec_cmd_no_wait("poetry run dump --sightings")
+    return jsonify({"message": "Command executed."})
+
+
+@admin_bp.route("/command/update_documentation", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def update_documentation() -> WerkzeugResponse:
+    """Trigger the update of the documentation in a dedicated process."""
+    cwd = get_homedir().joinpath("docs/").absolute().as_posix()
+    exec_cmd_no_wait("poetry install --only docs")
+    exec_cmd_no_wait("poetry run make html", cwd=cwd)
+    return jsonify({"message": "Command executed."})
+
+
+@admin_bp.route("/command/update_local_gcve_registry", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def update_local_gcve_registry() -> WerkzeugResponse:
+    """Trigger the update of the local GCVE registry in a dedicated process."""
+    exec_cmd_no_wait("poetry run flask --app website.app update_gcve_registry")
+    return jsonify({"message": "Command executed."})
+
+
+@admin_bp.route("/command/index_cwe", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def index_cwe() -> WerkzeugResponse:
+    exec_cmd_no_wait("poetry run index_cwe")
+    return jsonify({"message": "Command executed."})
+
+
+@admin_bp.route("/command/sync_gcve_organizations", methods=["POST"])
+@login_required  # type: ignore[untyped-decorator]
+@admin_permission.require(http_exception=403)  # type: ignore[untyped-decorator]
+def sync_gcve_organizations() -> WerkzeugResponse:
+    """Synchronize the organizations against the GCVE registry."""
+    sync_organizations(current_user.login)
+    return jsonify({"message": "Command executed."})

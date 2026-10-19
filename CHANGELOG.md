@@ -1,0 +1,1525 @@
+Vulnerability-Lookup Changelog
+==============================
+
+
+## 3.0.1 (2026-02-04)
+
+### Changes
+
+- chg: [kev] Added NDJSON export format for KEV catalogs
+  [c895f6c](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/c895f6c)
+- chg: [templates] Improved navigation in the various KEV catalogs and the export option of KEV entries.
+  [7ef6c57](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/7ef6c57)
+- chg: [website] Display KEV evidence in collapsible accordion on vulnerability pages
+  [b332b9f](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/b332b9f)
+- chg: [website] Added a link to the kev entry detail view from the vulnerability page.
+  [8fcd1be](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/8fcd1be)
+
+### Fixes
+
+- fix: [website] Fix vendor parameter in RSS/ATOM feed for vendor vulnerabilities
+  [58c62f3](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/58c62f3)
+- fix: [kev] Resolve TypeError in KEV catalog RSS/Atom feed generation (2 days ago)
+  [d387ec1](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/d387ec1)
+- fix: [website] Fix vendor parameter in RSS/ATOM feed for vendor vulnerabilities
+  [58c62f3](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/58c62f3)
+
+#### Security
+
+- [GCVE-1-2026-0012](https://vulnerability.circl.lu/vuln/GCVE-1-2026-0012) @cedric
+  [ce2d6e7](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/ce2d6e7)
+- [GCVE-1-2026-0013](https://vulnerability.circl.lu/vuln/GCVE-1-2026-0013) @claude
+  [ec4c3e7](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/ec4c3e7)
+- [GCVE-1-2026-0014](https://vulnerability.circl.lu/vuln/GCVE-1-2026-0014) @claude
+  [1771b42](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/1771b42)
+
+
+## 3.0.0 (2026-02-02)
+
+### What's New
+
+#### GCVE-BCP-07: Known Exploited Vulnerabilities (KEV) Catalogs Integration
+
+This release implements comprehensive support for GCVE-BCP-07, enabling seamless integration with multiple Known Exploited Vulnerabilities (KEV) catalogs from different Global Numbering Authorities (GNAs).
+
+- new: [gcve] Dynamic KEV catalog menu in navigation using context processor. The menu automatically displays all available KEV catalogs from GCVE references, with the local instance always shown first.
+  [473dc04](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/473dc04)
+  [2bba2d8](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2bba2d8)
+
+- new: [gcve] Dynamic KEV catalog badges in vulnerability templates. Badges are now generated automatically from GCVE references, showing which KEV catalogs include the vulnerability.
+  [68d86ac](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/68d86ac)
+
+- new: [gcve] Automatic injection of `x_gcve` field in API responses. All vulnerability API endpoints now include the GCVE advisory reference in `containers.cna.x_gcve` with structure `[{recordType: "advisory", vulnId: "<vuln_id>"}]`.
+  [e0c6d2d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e0c6d2d)
+  [227da00](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/227da00)
+
+
+**Tools**
+
+- CISA KEV and ENISA CNW EUVD to **GCVE BCP-07 Converter**: https://github.com/gcve-eu/gcve-eu-kev
+  ```bash
+  $ gcve-from-cisa --push
+  $ gcve-from-enisa --push
+  ```
+- **BCP Validator**: https://github.com/gcve-eu/bcp-validator
+  ```bash
+  $ python gcve_bcp05_validate.py --url https://vulnerability.circl.lu/api/vulnerability/recent?source=gna-1
+  OK: https://vulnerability.circl.lu/api/vulnerability/recent?source=gna-1
+  ```
+- GCVE **Python client**: https://github.com/gcve-eu/gcve
+  ```bash
+  $ gcve references --list
+  {
+    "kev": [
+        {
+        "uuid": "405284c2-e461-4670-8979-7fd2c9755a60",
+        "short_name": "CISA KEV",
+        "url": "https://www.cisa.gov/known-exploited-vulnerabilities-catalog",
+        "automation_url": "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+        "description": "For the benefit of the cybersecurity community and network defenders\u2014and to help every organization better manage vulnerabilities and keep pace with threat activity\u2014CISA maintains the authoritative source of vulnerabilities that have been exploited in the wild. Organizations should use the KEV catalog as an input to their vulnerability management prioritization framework."
+        },
+        {
+        "uuid": "1a89b78e-f703-45f3-bb86-59eb712668bd",
+        "short_name": "CIRCL",
+        "gcve_gna_id": 1,
+        "description": "CIRCL provides a known-exploited vulnerability and supporting the different status_reason described in GCVE BCP-07."
+        },
+        {
+        "uuid": "cce329bf-df49-4c6e-a027-80be2e6483bd",
+        "short_name": "EUVD KEV",
+        "gcve_gna_id": 2,
+        "automation_url": "https://github.com/enisaeu/CNW/raw/refs/heads/main/kev.csv",
+        "description": "ENISA via the CSIRTs network provides list of known-exploited seen in the CSIRTs network."
+        }
+    ]
+  }
+  ```
+
+
+#### New Vulnerability Sources
+
+- new: [feeders] OSV importer for Drupal security advisories. Imports vulnerabilities from the Drupal security team's OSV feed.
+  [14177ab](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/14177ab)
+
+- new: [feeders] OSV importer for CleanStart security advisories. Imports vulnerabilities from CleanStart's OSV feed.
+  [14177ab](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/14177ab)
+
+- new: [feeders] Bitnami Vulnerability Database importer. Imports vulnerabilities from Bitnami's OSV-formatted vulnerability database, covering their application catalog.
+  [165e99d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/165e99d)
+
+### Changes
+
+- chg: [gcve] Updated GCVE Python client with improved type hints and bug fixes.
+  [78dbfc1](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/78dbfc1)
+  [5ddf74d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/5ddf74d)
+
+- chg: [gcve] KEV catalog menu now handles production instances that have their own GNA ID. When a local instance (e.g., CIRCL - GNA-1) exists in the GCVE KEV catalog list, it's marked as local without creating duplicates.
+  [2bba2d8](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2bba2d8)
+
+- chg: [api] Extended x_gcve injection to all vulnerability list endpoints: VulnerabilitiesList, Recent, Last, and LastLegacy. This ensures consistent GCVE integration across all API endpoints.
+  [227da00](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/227da00)
+
+- Various graphical improvements.
+
+### Fixes
+
+- fix: [gcve] Resolved circular import in gcve_utils module.
+  [e7aa364](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e7aa364)
+
+- 'Ghost CVEs' toggle is wonky
+  [#303](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/303)
+
+- Fix CVSS 4.0 parsing crash in web filters
+  [#304](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/304)
+
+- Fix blacklist bypass vulnerability in username validation
+  [#314](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/314/commits)
+
+- Support YYYYMMDD date format in API since parameter
+  [#315](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/315)
+
+
+
+
+## 2.21.0 (2026-01-23)
+
+### What's New
+
+- new: [core] Added a product-level index and a product search API.
+  [f906064](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f906064)
+- new: CSAF feeder for Schneider Electric.
+  [e43fa03](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e43fa03)
+- new: [registration] Added `MESSAGE_ABOUT` and `MESSAGE_SIGNUP` and the
+  `ACCEPTED_DOMAINS_FOR_REGISTRATION` configuration variables to customize
+  the signup/about pages and restrict accepted email domains. Closes #297.
+  [3855838](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/3855838)
+  [bfc82cf](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/bfc82cf)
+
+
+### Changes
+
+- chg: [notifications] Added the publication date in email notifications and
+  a special icon for new vulnerabilities. Closes #299.
+  [64bc631](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/64bc631)
+- chg: [dependencies] Updated Python and dev/docs dependencies.
+  [510233c](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/510233c)
+  [b08c381](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/b08c381)
+- chg: [config] Updated default value for `ACCEPTED_DOMAINS_FOR_REGISTRATION`.
+  [6563f8a](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/6563f8a)
+- chg: [templates] Simplified titles for vuln and sightings pages; added
+  Open Graph meta tag.
+  [19c9a69](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/19c9a69)
+  [27eb6bf](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/27eb6bf)
+- chg: [documentation] Updated installation instructions.
+  [152212d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/152212d)
+
+
+### Fixes
+
+- fix: [api] Preserve typing for flask-restx decorators (mypy).
+  [f5f31c5](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f5f31c5)
+- fix(cvss): Safely handle CVSS 4.0 vectors in Jinja filters. Closes #305.
+  [5a303bb](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/5a303bb)
+- fix: [templates] Fix Bootstrap switch click handling (moved popover to
+  help icon). Closes #303.
+  [19a8c54](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/19a8c54)
+- fix: [bin] Corrected the script name for the CSAF Schneider Electric importer.
+  [1386a76](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/1386a76)
+- fix: [templates] Fixed an issue with batch deletion of users.
+  [839345b](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/839345b)
+- fix: [templates] Fixed a tag id in vulnerability_templates.html.
+  [bc0d329](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/bc0d329)
+
+
+## 2.20.0 (2025-12-19)
+
+### What's New
+
+- new: [gcve] Updated Vulnogram in order to define relationships (https://gcve.eu/bcp/gcve-bcp-05/#relationships-field) in the x_gcve field.
+  [2f39bf8](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2f39bf8659aeda081780db65d0c6f9e769427110)
+- new: [sightings] Added a new heat map to visualize the sightings with a filtering option (on dates and type of sightings).
+  [56a66e0](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/56a66e0ef045e299e8fcd41fa85afa16068e1d56)
+
+
+### Changes
+
+- chg: [CVE template] CVE Tags are now displayed below the vulnerability ID.
+  [e59bd52](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e59bd52d2797626234efed37cfcd7785d8b93508)
+- chg: [CVE template] The title is now displayed just before the description (summary).
+  [22695e8](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/22695e8d5f3de8bee273eea5701413fc99d7bf37)
+- chg: [vulnerability disclosure] A message is now displayed to unauthenticated users when submitting a new disclosure.
+  [90787db](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/90787db278f7a856f3d3fb18193d39b9c73ed87f)
+- chg: [product] product.find_vulnerabilities now returns more result.
+  [a31f6c3](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a31f6c3689f1c53d0e2678f761ae01734a1ad858)
+- allow triggering password recovery based on case insensitive username
+  [#290](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/290)
+
+
+### Fixes
+
+- fix: Ignore temp files in ossf/malicious-packages
+  [6bc93b1](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/6bc93b1608606b274bf25f7ef341f4a57627630b)
+- fix: [website] Fixed the route used to delete a vulnerability disclosure.
+  [e2ecb2a](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e2ecb2a33952b034a5bbbeac3d9eed8568ad3958)
+- fix: [website] Vulnerability ID of a disclosure is optional.
+  [5bd5353](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/5bd5353462afbd4164e7d825976964c03d1dc49a)
+
+
+## 2.19.0 (2025-12-09)
+
+### What's New
+
+#### GCVE: Global CVE Allocation System
+
+We’re pleased to announce the publication of
+[GCVE-BCP-02 – Practical Guide to Vulnerability Handling and Disclosure](https://gcve.eu/bcp/gcve-bcp-02/),
+now available in its version 1.3.
+
+This Best Current Practice document provides actionable guidance for organisations,
+researchers, and GCVE Numbering Authorities (GNAs) on managing and disclosing
+vulnerabilities effectively, both **within the GCVE ecosystem and beyond**.
+
+Read it here: https://gcve.eu/bcp/gcve-bcp-02/
+
+Vulnerability-Lookup fully supports these best practices for vulnerability disclosure,
+helping to promote responsible and effective handling of security issues.
+
+#### Graphical improvements
+
+- Added Credits section for cvelistv5 format (used by GCVE) and the OpenSSF Malicious Packages.
+  [686e518](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/686e518df1d770c548e2f9ad645186b50aa92952),
+  [3b39016](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/3b39016fa044123e210a2a75695cc25ce1273bf0),
+  [7e9bf4f](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/7e9bf4f8db43c5caf4a6e2409686907b59a1192a)
+- Show CVE description on hover in /recent page (and for the card box of the index page). [#289](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/289).
+- Many templates have been improved, including the vulnerability detail page, the recent vulnerabilities list,
+  severity score displays, and all HTML tables, allowing more information to be shown while keeping the interface clean and user-friendly.
+
+
+### Changes
+
+- chg: [website] Reorganized and improved all Jinja filters especially the filters related to the parsing of CVE data.
+  [f912ef4](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f912ef4505a50bbaffa68a14917c73d81d08f188)
+- chg: [templates] Improved the display of the severity related information for CVE and GitHub sources in the /recent page.
+  [629dc7a](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/629dc7a1294412d08480a215533870d7b68ad35c)
+- chg: [website] New layout for severity implemented for PySec advisories.
+  [74387cd](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/74387cd9614f94f2f6424d09cf427c886d6d0ba8)
+- chg: [website] Added VLAI Severity score for PySec advisories.
+  [3cfcc8d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/3cfcc8d337a6350dbd30f1509837899a15b4bcbc)
+- chg: [website] Extract and display credits from OSSF Malicious Packages sources.
+  [3b39016](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/3b39016fa044123e210a2a75695cc25ce1273bf0)
+- chg: [templates] Improved display of various tables.
+  [88b73f1](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/88b73f1e48f04d8b5d22699d7a67801af87086b3)
+- chg: [website] Display more data in the vulnerability evolution charts. The growth is now displayed in a tooltip box.
+  [b986dd3](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/b986dd3fd34b14fa59d4514f6d862c5fea8ddd1a)
+
+
+### Fixes
+
+- fix: [backend] Remove notifications of users to be deleted.
+  [3ad413f](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/3ad413f)
+- chg: [templates] Fixed a display issue for Tailscale ids.
+  [ef8a4a8](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/ef8a4a8)
+- fix: [templates] Handle single object case for the references section of record from the JVNDB.
+  [f36689b](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f36689b)
+
+#### Security
+
+- fix: [security] Unconfirm user accounts when their email address changes and send a password-reset token to the original email.
+  [46f30a0](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/46f30a0)
+- fix: [security] Remove all items from the session dict on logout
+  [e2c54f7](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e2c54f7)
+- fix: [security] Regenerate session ID after a user updates their password.
+  [2403fa6](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2403fa6)
+- fix: [security] Updating the password now requires the user to provide the current password.
+  [a902f91](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a902f91)
+- fix: [security] Sanitize related_vulnerabilities field of bundles (in backend) and avoid injecting raw HTML when building the DOM (in frontend) when displaying.
+  [1811ef9](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/1811ef9) - [GCVE-1-2025-0035](https://vulnerability.circl.lu/vuln/GCVE-1-2025-0035)
+- fix: [security] All state changing endpoints are now using POST HTTP requests with a CSRF token.
+  [a6c568d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a6c568d) - [GCVE-1-2025-0034](https://vulnerability.circl.lu/vuln/GCVE-1-2025-0034)
+- fix: [security] The number of failed OTP attemprs is now recorded. The user account is blocked after 5 attempts. Admins have the possibility to monitor failed 2FA via the admin panel (list of users).
+  [113b1fe](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/113b1fe) - [GCVE-1-2025-0033](https://vulnerability.circl.lu/vuln/GCVE-1-2025-0033)
+
+
+## 2.18.0 (2025-11-14)
+
+### What's New
+
+#### Integration with Rulezet
+
+[Rulezet](https://github.com/ngsoti/rulezet-core) is an open-source platform for sharing, evaluating, improving, and managing **cybersecurity detection rules** (YARA, Sigma, Suricata, etc.).
+Its goal is to foster collaboration among professionals and enthusiasts to enhance the quality and reliability of detection rules.
+
+Vulnerability-Lookup can now be configured to interface with the API of any Rulezet instance, providing insights into existing detection rules related to security vulnerabilities.  
+The default Rulezet instance enabled in Vulnerability-Lookup is hosted at https://rulezet.org and currently offers more than 122,000 security rules.
+
+Detection rules related to vulnerabilities are displayed on the vulnerability details page (in a dedicated tab) and on bundle details pages.
+
+[#280](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/280)
+
+Examples:
+
+- https://vulnerability.circl.lu/vuln/CVE-2022-26134#detection-rules
+- https://vulnerability.circl.lu/vuln/CVE-2014-6271#detection-rules
+
+
+#### Indexing Information Related to Assigners (CNA)
+
+Information about security advisory assigners is now indexed. CNAs from the official CVE Program source (cvelistv5) are indexed in Kvrocks, with GNAs planned for the future.  
+The API exposes this data via a new **assigners** endpoint. From an API perspective, both CNAs and GNAs are treated as assigners, though they are stored in dedicated indexes.
+
+Updates include:
+- Enhanced search capabilities related to assigners.
+- Improved `/stats` page.
+- Updated vulnerability details page: display the assigner name with a link.
+- A new page listing assigners, similar to the existing CWE list.
+
+[PR #283](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/283)
+
+
+#### Website
+
+- new: [website] Add PROTECT_USER_PAGES option to restrict user profile pages to authenticated users. Closes #277
+  [e324d41](https://github.com/vulnerability-lookup/vulnerability-lookup/commits/e324d41b0392451ae292f3ae12f60d4a009b2f04)
+
+#### Vulnerability Sources
+
+- Added ABB CSAF feed
+  [0d984a8](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0d984a82771348adb70140b578541a9564f71d4c) by @neutrinoguy
+- It now possible to enable a list of enabled feeders via the config/modules.cfg file.
+  [e4a1acb](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e4a1acbff8fd5b40f972e982dc22cbc8f8b861a4)
+
+
+### Changes
+
+- chg: [website] Account creation via the API is now rate-limited to 3 registrations per hour per IP.
+- Additional validation checks have been added to reject email addresses that are disposable (MISP list), from blocked domains, or with invalid MX records.
+  [3a12de2](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/3a12de293039bef5f77c33b1e61f843a698c60be)
+- chg: [website] Improved email address check in both the API endpoint and in the form controller.
+  [bb090fc](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/bb090fcd64011bd99354d15f4008feff20dbf126)
+- chg: [website] user.last_seen is now updated after successful login.
+  [fb5796e](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/fb5796e774aaada70cc65ab775b0884d066abf5b)
+- chg: [API] Improved date parsing for sightings
+  [d7bc9fd](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/d7bc9fde169f9d2c17ded8f35cd103dd32be6dcc)
+- chg: [website] Harmonization of the templates for the details views of bundles and comments.
+  [c7f90aa](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/c7f90aa4b1fad866e941e6c2cf78b419544b38bb)
+- chg: [feeders] Improved use of the kvrocks counters for vendors and cwe rankings.
+  [1205670](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/120567051da0e68bdec449ef3b908859d6a16967)
+- chg: [notifications] add random jitter to reschedule execution times
+  [d974315](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/d974315229678aff3880e264f966bd68ff5b6651)
+- various minor improvements to the backend, user interface and documentation.
+
+
+### Fixes
+
+- fix: [website] Redirect the user to the user_bp.watchlist view if notifications are found.
+  [4f6e0bc](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/283/commit/4f6e0bcdeab737f668ef9b0898330f6240128c6d)
+- fix: [API] Delete notifications of the user to delete.
+  [2371962](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/283/commit/23719629c8507f13ee5c5b35c08bc39d707e8373)
+- Rename flatpickr to flatpickr.js and update template reference
+  [8dcc804](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/283/commit/8dcc8049c3a842563c92a869d21a9eb449db06b1) by @DocArmoryTech
+
+
+## 2.17.0 (2025-10-13)
+
+### What's New
+
+- Add a Public PoC sighting [#245](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/245)
+- Integration of the ENISA KEV Catalog [#237](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/237)
+- New Sighting: Metasploit [#228](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/228)
+- New Sighting: Sploitus RSS [#227](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/227)
+- new: [API] add bulck DELETE endpoints for sightings [a514920](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a51492060051b70096832fd56e4638f0093d7a8b)
+
+
+### Changes
+
+- chg: [commands] Provide a way to delete sightings matching a regex [0859260](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/085926082eca30e7b02023c39e2b01a8e36d3a21)
+- chg: [models] Require full match of the regexes when creating a sighting. [71387fc](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/71387fc8c03828e5b5a2ba748f04584e6568ba3d)
+
+
+### Fixes
+
+- fix: [security] Fixed Reflected XSS due to insecure use of Markup, as reported by @Wachizungu [378ccdf](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/378ccdf95882d1a02576552e26ce222cde0bd636)
+- fix: [security] Potential self XSS in in admin cpe add as reported, as reported by @Wachizungu [5403660](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/540366000f2fa27b08bbcc42b1e89927b68b9df6)
+- fix: [API] Fixed an issue in the /api/search endpoint. [#248](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/248)
+- fix: [API] correct inconsistent max vendor limit for /vendors/ranking endpoint [b958bdb](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/b958bdbf10947120a952439952a8e61c04982628)
+- fix: [API] Fixed an issue in the vulnerability endpoint when requesting metadata or sightings for an unknown vulnerability. [5eaf644](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/5eaf64416a1e7c75d2154b0621a6bb9d04ecc0c2)
+- fix: [website] Use correct HTTP client error code in views/vulnerability_disclosure.py. [4622436](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/4622436a678b56d1c5467eea05238086d9a46bf2)
+- fix: [website] Removed a duplicate SQLAlchemy Or filter in admin_organization blueprint. [ef1e9d7](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/ef1e9d7d31d78796252c90efda01038e3770a02f)
+- fix: [CPE] require logged in session to access CPE management pages [PR #261](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/261)
+- fix: [minor] ilike usage (for searches) can lead to unexpected results, due to wildcards not being escaped [#260](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/260)
+- fix: Set is_confirmed to False when a user update the email address, as reported by @Wachizungu [326ce42](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/326ce42d8661603b4b3b3c5d45992758de0f804a)
+- Duplicate route decorators in system api endpoints [#258](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/258)
+- No form validation for vulnerability_disclosure process_edit [#254](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/254)
+- Viewing a product without a linked organisation using /product/<uuid> leads to internal server error [#253](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/253)
+- Inconsistency in cpesearch feed time delta [#252](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/252)
+- Markdown header for /api/stats/vendors/ranking?output=markdown is mentioning CWE instead of vendor [#250](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/250)
+- Wrong id used for certfr-avis and certfr-alerte advisories in the related vulnerabilities [#239](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/239)
+- Inconsistencies in the chevron icons used on the vulnerability details page. [#238](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/238)
+- check the default timeout of the requests library and eventually enforce one. [#234](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/234)
+- potential discrepancy in user deletion [#233](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/233)
+- trying to delete a user who has a vuln report gives internal server error [#232](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/232)
+
+Huge thanks to [https://github.com/Wachizungu](Jeroen Pinoy) for the great code review!
+
+
+## 2.16.1 (2025-09-25)
+
+### Fix
+
+Sanitize user input in comments, bundles, and sightings
+
+- Escaped untrusted data in templates and tables to prevent XSS
+- Replaced unsafe innerHTML assignments with createElement/textContent
+- Encoded dynamic URLs using encodeURIComponent
+- Improved validation in Comment, Bundle, and Sighting models
+
+Credit: [@Wachizungu](https://github.com/wachizungu)
+
+Reference: https://vulnerability.circl.lu/vuln/GCVE-1-2025-0004
+
+
+## 2.16.0 (2025-09-19)
+
+### What's New
+
+#### Backend
+
+- Introduced **source-scoped kvrocks counters** and **source-scoped sorted indexes** for
+  vulnerability advisories by state (`published`, `updated`, `reserved`).
+  ([#211](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/211),
+  [PR #215](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/215))  
+  Examples of newly available queries:
+  - `GET published:count:github:2025-09`
+  - `ZREVRANGE index:csaf_certbund:published 0 9 WITHSCORES`
+  - `ZREVRANGE vendors:ranking:2025-08 0 9 WITHSCORES`
+
+- Added feeders for **CERT-FR Avis** and **CERT-FR Alerte**.
+  ([b99291f](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/b99291fcc2a239fa66637b783ff019434e34cab6))
+
+#### API
+
+The **Stats API endpoint** now delivers statistics on **CVE publications**, with
+filters available by source, date, and advisory state. These new endpoints leverage the new
+indexes provided by the kvrocks backend. The result can be returned as JSON (default) or Markdown table.
+([0d153ed](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0d153edea14e98b31d18017807cdb33b1d953b8e))
+
+#### Frontend
+
+- Added **a new statistics page** displaying various insights on CVE publications.
+  This new page features several interactive charts powered by the new Stats API endpoints.
+  ([0d153ed](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0d153edea14e98b31d18017807cdb33b1d953b8e),
+  [c842876](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/c842876a11d85f67d8324f360b477396a339e852))
+
+- Added **XSLT support** for various RSS/Atom feeds.
+  The XSLT is injected immediately after feed generation, before delivery to the user.
+  ([241c6ca](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/241c6cadb7d7e4a8af19892399eae7b0d8b0c8a7))
+
+
+#### Migration Notes
+
+- To reset the indexes, you can execute ```bin/index_vulnerabilities.py``` which is using various
+  reindexing utilities. This will delete indexes and counters! Alternatively, you can rerun the
+  appropriate feeder with the ``--reimport`` parameter.
+
+
+### Changes
+
+- Improved **search page**:
+  ([82b9f95](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/82b9f95e298ba6f2c495b1987b5183bfec2e7e03),
+  [f9f5c58](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f9f5c588fa23f876b0fdc1f1b46c67871f73bb1a))
+  - Filtering on sources, vendors, and products.  
+  - Sorting based on advisory state (reserved, published, updated) and order (ascending/descending).
+  - Displaying all vulnerabilities related to a vendor with pagination (without specifying a product).
+
+- Improved **recent page**: vulnerabilities from multiple sources can now be sorted by publication or update date.
+  ([df1e472c](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/df1e4725cc23d90a64b84ebe7cdf909580bf58bb))
+
+- Improved **admin dashboard** for user management.
+  ([#221](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/221))
+
+- Improved **Vulnerability API endpoint**: The GET List endpoint now provides more advanced filtering by source and advisory state.
+  ([0d153ed](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0d153edea14e98b31d18017807cdb33b1d953b8e))
+
+- Various improvements related to the vulnerability description pages.
+
+### Fixes
+
+- NDJSON data dumps: fixed an issue where dumps did not actually contain newlines.
+  ([#218](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/218))
+- Prevent reimport of already ingested vulnerabilities from flaky CSAF sources.
+  ([#1848619](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/1848619cda244e98f65a65d8d7e13236e7c51384))
+- Various minor fixes.
+
+
+## 2.15.0 (2025-08-22)
+
+### What's New
+
+- **[core]** Detection of vulnerabilities known only by sighting (Unpublished advisories detected with sighting tools).  
+  [Issue #197](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/197)
+- **[website]** Updated "Evolution for the last month" table on the main page with a new select list to display
+  sightings based on their type or related advisory type.  
+  [Issue #197](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/197)
+- **[website]** Add batch user delete with checkbox selection and confirmation modal, including CSRF protection.  
+  [Issue #190](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/190)
+
+
+### Changes
+
+- Improved logging of access, warnings, and errors in the web app, including HTTP codes for unexpected events.  
+  [Issue #199](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/199)  
+  [Commit a6b99bf](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a6b99bf35405383ab985ce1220e89dd0b5fd54f7)  
+  [Commit 9c37e7e](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/9c37e7ede5e7fc7500b8138aeb5c8bce5e9a463d)  
+  [Commit d2e826f](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/d2e826f13bd9c7a3f6546cb17de19be651c49b92)
+- Improved `get_vendor_product_vulnerabilities` with pipelines and pagination. Added a Bootstrap pagination component to the search page when vendor and product are specified. It is now much faster.  
+  [Commit aeb6ae0](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/aeb6ae0337fcc3b7efebeb94348a9ca82e0cc490)
+- **[API]** Added `advisory_status` parameter to `/sighting` endpoint.  
+  [Commit de5873c](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/de5873ce2ae555ceaafdaf67e0fefab42c402ad7)
+- **[core]** Enhanced `find_vulnerabilities` (Product class) for finding vulnerabilities matching all vendor/product CPE combinations.
+  It is now way faster.  
+  [Commit 67d2516](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/67d25162432531de07e77e3129be5a33c58f9eb8)
+- **[website]** Various graphical and logical improvements to the search page.  
+  [Commit 82c6f2d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/82c6f2d9089fa3be41f08edf164954317d87709c)  
+  [Commit 0f249d1](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0f249d16bbc61d054b5ddeda7e3c624b73821f77)  
+  [Commit 94e53c0](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/94e53c062d11407b864b1222aa2a65e762966582)
+- **[website]** Improved about page. Better handling of GNAs and link to the recent page.  
+  [Commit 70308f5](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/70308f5778d0559a880ff8e3cfcecf44ea7967d0)  
+  [Commit 168fcff](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/168fcff8101340951c04a7cb5b11e727ec1c8b62)
+- Various dashboard improvements related to recently imported vulnerabilities and new filters in the "Evolution for the last month" table.
+
+
+### Fixes
+
+- **[website]** Respect `is_active` checkbox on notifications.  
+  [Issue #193](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/193) by @oh2fih
+- **NVD Feeder**: HTTPError 404.  
+  [Issue #187](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/187) by @Rafiot
+- Typo **vulnerabilites** corrected to **vulnerabilities**.  
+  [PR #204](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/204) by @P-T-I
+- **Vuln-to-Product-association** barely works when looking for vulnerable OS (fkie_nvd interpretation bug).  
+  [Issue #205](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/205) by @Rafiot
+- **[API]** Fixed a typo in the OpenAPI documentation.  
+  [Commit aa1af85](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/aa1af85098841f3bfed5fec91e8ab6057efccc6a)
+
+
+
+## 2.14.0 (2025-07-25)
+
+### What's New
+
+- Introduced a watchlist view mirroring the structure of email notifications.
+  This interface enables users to review monitored products and their related vulnerabilities directly in the browser.  
+  The displayed data reflects vulnerabilities published or updated within the past 7 days and is generated on demand,
+  without relying on scheduled execution times. Authenticated RSS and Atom endpoints are available.
+  ([#181](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/181))
+- Added a way to verify whether a Vulnerability-Lookup instance is operated by a GNA.
+  ([#179](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/179))
+- Added an option to disable the CVD process in Vulnerability-Lookup.
+  ([#178](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/178))
+
+
+### Changes
+
+- Users who have defined at least one notification are now redirected to the new watchlist after authentication.
+  ([c4b10aa](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/c4b10aa7e245eca8936e1947e1146d293572bf84))
+- VLAI for related vulnerabilities - If the variable ML_GATEWAY is not defined
+  (or set to an empty string) in the configuration file website.py, no call to ML-Gateway will be made.
+  ([#170](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/170))
+
+
+### Fixes
+
+- How do you change the local_instance_name after already starting vulnerability-lookup for the 1st time?
+  ([#185](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/185))
+- Empty email notification
+  ([#180](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/180))
+- Normalize CWE mitigations in the CWE endpoint.
+  ([f053185](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f053185651fd43cd24b351df8e79794ad5485478))
+
+
+
+## 2.13.0 (2025-07-11)
+
+### What's New
+
+- Added support for VLAI Severity Classification in Chinese.
+  For vulnerabilities originating from the CNVD source, Vulnerability-Lookup now requests
+  inference from the [ML-Gateway](https://github.com/vulnerability-lookup/ML-Gateway) using the
+  [CIRCL/vulnerability-severity-classification-chinese-macbert-base](https://huggingface.co/CIRCL/vulnerability-severity-classification-chinese-macbert-base) model.
+  ([0b85b2d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0b85b2d1affb36e3a096120aee0cce797aa52ac3))
+- Mitigations derived from CWE are now displayed on the vulnerability details page.
+  ([#172](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/172))
+- The */vulnerability/last* API endpoint now supports filtering vulnerabilities by CWE.
+  ([#148](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/148))
+
+
+### Changes
+
+- Added reverse mapping for CWEs.
+  ([84608bb](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/84608bb4785b569497d661b673b1852ca15b60ca))
+- CWEs are now stored in the dedicated kvrocks sets for vulnerabilities added via the Vulnogram interface.
+  ([5d52048](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/5d5204817f55b12e36d4e1c150e5d38c41b3d85d))
+- Improved loading of custom Jinja filters.
+  ([f14c262](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f14c2621371cffac8fb22536c484232be1551a04))
+- Various improvements to the vulnerability details page.
+- Various enhancements to the OpenAPI documentation.
+
+
+### Fixes
+
+- Fixed the creation and editing of notifications (with organization and product names) when the specified organization or product does not exist.
+  ([#141](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/141))
+- The `POST /vulnerability` endpoint now sets vendor and product names in kvrocks for vulnerabilities created via the Vulnogram web interface.
+  ([9cc2a5b](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/9cc2a5b29409e87a5b0fb17209096d8c992cf045))
+- CSAF feeders now correctly detect vulnerability updates.
+  ([49c831a](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/49c831a3c3db69fef00e00ac0a6b18641cbabaa0))
+
+
+## 2.12.0 (2025-06-20)
+
+### What's New
+
+**CWE statistics - Public Access to CWE Statistics by Period**  
+  Users can now access CWE occurrence statistics by year and optionally by month.  
+  The vulnerability detail page also displays the associated CWE, with a direct link to the CWE detail page, which now includes potential mitigations. New Kvrocks indexes are used for the lookup.
+  ([#140](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/140)) by [Léa](https://github.com/3LS3-1F)
+
+
+### Changes
+
+- Adding optional pull before update and optimized imports
+  ([#164](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/164)) by [P-T-I](https://github.com/P-T-I)
+- chg: [website] Provide a way to filter GNAs organization for unauthenticated users.
+  ([f537d56](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f537d56c522640033867a486bdc6900260fd6745))
+- chg: [website] Display a message when the EPSS score is not yet available from FIRST.
+  ([1ef42b7](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/1ef42b7c931c54a01e54c0ff5c38fb94de855d4b))
+- Various minor user interface improvements.
+- Updated various dependencies.
+
+
+## 2.11.0 (2025-06-13)
+
+### What's New
+
+**GCVE-BCP-03 - Decentralized Publication Standard**  
+  The [GCVE-BCP-03](https://gcve.eu/bcp/gcve-bcp-03) Decentralized Publication Standard has now been implemented for the first time.
+  This standard enables GNA (Global Numbering Authority) organizations to publish their vulnerability information directly—without relying on a centralized system.  
+  Version 2.10.0 of Vulnerability-Lookup introduced support for maintaining a local copy of the GCVE registry.
+  With the latest release, it's now possible to synchronize the list of local organizations in a Vulnerability-Lookup instance with this local GCVE registry.  
+  This new capability provides a simple way to maintain an up-to-date list of GNA organizations in any Vulnerability-Lookup deployment.
+  Administrators can then choose which advisories, published by these GNA organizations, they want to import into their instance. This is possible thanks to a new feeder. ([151](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/151))
+
+
+### Changes
+
+- Added pagination in the API to the endpoint which list EMB3D objects.
+  ([a669461](https://github.com/vulnerability-lookup/vulnerability-lookup/commits/a669461cdfe4c671d860ede1b5ce3daa46c959aa))
+- Vendor and Product management in vulnerability-lookup
+  ([#105](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/105))
+- Improvements to the view of recent vulnerabilities.
+  The navigation menu is now automatically updated based on the list of GNAs the local instance is subscribed to.
+- Various improvements to the admin dashboard.
+- Various improvements to the documentation.
+
+
+### Fixes
+
+- Multiple comments share same UUID
+  ([#158](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/158))
+- GCVE data/feed is missing
+  ([#155](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/155))
+- Dockerfile change by @P-T-I
+  ([#153](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/153))
+- Fixes to installation instructions by @jeroenh
+  ([#154](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/154))
+- doc fix by @jeroenh
+  ([#156](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/156))
+- Small fixes on containers by @claudex
+  ([#157](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/157))
+- Fixed a test in the disculosure.html template. The description of approved diclosures was never displayed.
+  ([1ec3e55](https://github.com/vulnerability-lookup/vulnerability-lookup/commits/1ec3e55d5d3171f96a02443106243d9ca6bfc33f))
+
+
+## 2.10.1 (2025-05-27)
+
+### Changes
+
+- Account deletion and token generation requests must now be confirmed by entering the user's password in a Bootstrap modal.
+  The request is submitted via an HTTP POST form and includes a CSRF token.
+  Thanks to Devansh Chauhan for reporting the issue and helping improve the security of the platform.
+  ([cf9000e](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/cf9000ec0bb17b5d2ff8fe5177e5bd14d666bd08),
+  [GCVE-1-2025-0001](https://vulnerability.circl.lu/vuln/GCVE-1-2025-0001))
+- Improved layout of the public user profile page.
+  ([9028c53](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/9028c536f5ad22a440158dd5da01fd8aeec664ec))
+
+
+## 2.10.0 (2025-05-22)
+
+### What's New
+
+- **AI-Powered Enrichment of Vulnerability Data**  
+  Vulnerability-Lookup now enhances vulnerability advisories using our in-house
+  [AI models](https://www.vulnerability-lookup.org/user-manual/ai/).  
+  This feature is powered by our new project,
+  [ML-Gateway](https://github.com/vulnerability-lookup/ML-Gateway) — a FastAPI-based service
+  designed to load and serve pre-trained NLP models via a clean, RESTful API.
+
+
+- **Monitor Your Local GCVE Registry with Vulnerability-Lookup**  
+  Thanks to the integration of the GCVE client, administrators of a Vulnerability-Lookup
+  instance can now manage and monitor a local GCVE registry.  
+  GNAs are retrieved from [gcve.eu](https://gcve.eu), and the integrity of the data is
+  automatically verified. In a future release, this will allow administrators of a
+  Vulnerability-Lookup instance to choose which GNA feeds to pull.
+
+
+### Changes
+
+- Send notifications to admins and users when new comments are added to a disclosure.
+  ([58b6b60](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/58b6b60))
+- Improved admin notification system for published comments.
+  ([2d2b917](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2d2b917))
+- Added a new API endpoint to verify the integrity of the local GCVE registry.
+  ([a4416c6](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a4416c6),
+  [27cdb50](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/27cdb50),
+  [92c3c1b](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/92c3c1b))
+- Introduced a new Flask/Click command to update the local GCVE registry in the background
+  using data from gcve.eu. This can also be triggered from the HML dashboard.
+  ([0a35027](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0a35027))
+- Queries the backend to retrieve the vendor/product information for hovered vulnerability
+  IDs in the charts and the table of the main public dashboard.
+  Related to [#136](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/136)
+  ([9f138a7](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/9f138a7))
+- Enhanced the vulnerability sightings correlation graph.
+  Related to [#136](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/136)  
+  ([ac17667](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/ac17667))
+- Various graphical improvements to the admin dashboard.
+  ([7c4e549](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/7c4e549))
+
+
+### Fixes
+
+- Allowed `gna_id` to be null for organizations.
+  ([569bfa2](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/569bfa2))
+- Fixed typos in HTML templates.
+  ([e301a7f](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e301a7f))
+
+
+
+### New contributor
+
+We’re pleased to welcome [Léa](https://github.com/3LS3-1F) as a new contributor to the project!
+
+
+## 2.9.0 (2025-05-06)
+
+### What's New
+
+- **Adversarial Techniques from MITRE EMB3D**  
+  The Adversarial Techniques from [MITRE EMB3D](https://emb3d.mitre.org)
+  are now integrated into Vulnerability-Lookup
+  as a new source and are correlated with existing security advisories.  
+  This feature was contributed by
+  [Piotr Kaminski](https://www.linkedin.com/in/piotr-kaminski-1336b012/) during the  
+  last [Hack.lu hackathon](https://hackathon.lu).  
+  ([#129](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/129))
+
+- **Global CVE Allocation System (GCVE)**  
+  GCVE identifiers are now supported in HTML templates and URL parameters,  
+  thanks to the [GCVE Python client](https://pypi.org/project/gcve).  
+  These identifiers can now be used when disclosing a new vulnerability as part of
+  the Coordinated Vulnerability Disclosure (CVD) process, in alignment with NIS 2 requirements.
+
+- **Trustworthy Level for Members**  
+  Members of a Vulnerability-Lookup instance now have a dynamically calculated  
+  trustworthy level based on profile completeness and verification.  
+  Members affiliated with FIRST.org or European CSIRTs (CNW) are automatically  
+  trusted for operations that would otherwise require administrator approval  
+  (e.g., creating comments).
+
+
+### Changes
+
+- Improved the vulnerability disclosure page.  
+  ([ccfb6b1](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/ccfb6b1baffc73756ee692e5ac59249097939825))
+
+- Added page arguments to the `vulnerability/last` endpoint.  
+  ([ce75a7a](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/ce75a7a55e8c8c2103fefbca3385930bf97ad6ec))
+
+- Notification emails now include a random signoff.  
+  ([#119](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/119))
+
+- Various graphical enhancements.  
+  ([0878a31](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0878a314b94ba21ce7c024e4563770e9a65e7761))
+
+
+### Fixes
+
+- Fixed editing of notifications for Organization/Product.  
+  ([#124](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/124))
+
+
+### New contributor
+
+We welcome [Piotr](https://github.com/Tengrom) as a new contributor!
+
+
+
+## 2.8.0 (2025-04-10)
+
+### What's New
+
+- **Simplified Vulnerability Reporting (aligned with NIS 2 requirements)**  
+  Members of a Vulnerability-Lookup instance can now easily report vulnerabilities as
+  *preliminary advisories* in the context of NIS 2. Operators can review these notifications
+  and, if deemed relevant, generate a security advisory directly from Vulnerability-Lookup.
+  The advisory will then be made publicly accessible, similar to those from other sources.
+  ([#114](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/114))
+- **CodeClarity as a new Sighting source**  
+  During the [Hack.lu hackathon](https://hackathon.lu), [Cédric Herzog](https://github.com/CedricHerzog)
+  released a new version of [CodeClarity](https://www.codeclarity.io), which now supports pushing
+  analysis results as Sightings into Vulnerability-Lookup.
+- **Dockerized version of Vulnerability-Lookup**  
+  Thanks to [Dawid Czarnecki](https://github.com/dawid-czarnecki), Vulnerability-Lookup now has a fully dockerized setup.
+  Kvrocks, Valkey, and PostgreSQL are each configured as separate containers.
+  ([#116](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/116))
+
+
+### Changes
+
+- Pages dedicated to Organizations and Projects now displays the various CPE vendor and product names.
+  ([3aa40a3](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/3aa40a34f71f750777da818634cb5a7713ae41e5))
+- Updated 'vulnerability' namespace with new predicate 'origin' (Hardware, Software, Service, Procedural Implementation).
+  ([42a6ab4](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/42a6ab45c24b49722f15b958de72d32b98f938a4))
+- Added new badge for user's profile for vulnerability reporter.
+  ([c58d00b](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/c58d00be5bf1b0e2ea9b778e46cf6aa292e7ec3e))
+- Various improvements to the user interface.
+  ([0330998](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/033099863c5b4b687224961b0b929f06efc0ba09))
+
+
+### New contributor
+
+We welcome [Dawid](https://github.com/dawid-czarnecki) as a new contributor!
+
+
+## 2.7.1 (2025-04-05)
+
+- Fixed a stored XSS vulnerability in user bios. Thanks to Dawid Czarnecki for reporting the issue and helping improve the security of the platform.
+
+
+## 2.7.0 (2025-03-27)
+
+### What's New
+
+- **Vendor and Product Management**  
+  Added support for extending or aliasing CPE names, allowing vendor and product names to be mapped.
+  This addresses the issue of CPE fragmentation or inconsistency, where an organization might have multiple vendor names,
+  or a single product is referenced by different CPE identifiers (e.g., `"cpe:/a:oracle:java"` vs. `"cpe:/a:sun:java"` for the same product).
+
+  The solution introduces organizations as unified containers, consolidating known CPE vendor names under a single entity.
+  Related products are linked to this entity. Additionally, a curated list of CPE product name
+  synonyms helps resolve naming discrepancies.
+
+  A point of contact (email/URL) can be added to an organization.
+  ([#110](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/110))
+
+- **Organization Membership**  
+  Users can now be part of one or multiple organizations in Vulnerability-Lookup.
+  ([#110](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/110))
+
+- **New API endpoints**  
+  Introduced new endpoints to retrieve information about organizations and products.
+  It is as well possible to get all CPE information related to a product or an organization, as a JSON file.
+  (``/organization/<uuid>/export_cpe_information`` and ``/product/<uuid>/export_cpe_information``)
+  ([#110](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/110))
+
+
+### Changes
+
+- Users can now create notifications based on Organization/Product or Vendor/Product.
+  Notifications linked to an Organization and a Product will leverage the new CPE vendor/product aliasing mechanism.
+  ([#110](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/110))
+- Improved validations of models and forms.
+  ([0be8544](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0be8544d899ec77596c1af4407025c670aa668e4))
+- Various graphical improvements to the user's notifications page and main menu.
+
+### Fixes
+
+- Do not load the reusable modals with the Vulnogram editor.
+  ([84a5273](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/84a5273809dac3a2590733d38efb4a332be52919))
+
+
+## 2.6.0 (2025-02-14)
+
+### What's New
+
+- **New centralized monitoring service**  
+  This feature adds log and process heartbeat reporting to a Valkey datastore,
+  enabling centralized monitoring of Vulnerability Lookup’s system health and its various components.
+  ([#106](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/106))
+  This new feature is essential for monitoring our expanding suite of tools used to collect vulnerability-related information.
+  It also supports our new email notification service, which alerts platform users about newly discovered vulnerabilities.
+  Additionally, a new admin view has been introduced, allowing real-time monitoring of the collected logs.
+- **CWE and CAPEC**  
+  The CAPEC and CWE datasets are now accessible through the API.
+  ([#98](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/98))
+
+
+### Changes
+
+- [API] Added a new 'since' argument to the /api/vunerability/search/<vendor>/<product> endpoint
+  ([833d799](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/833d799591b2b92b15964c2bf9bc003984e0b7b7))
+- [Web] Improved administration dashboard
+  ([a732ff3](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a732ff3c7f9eb4d12ad4efebe5e21985dafa0338),
+  [0258b24](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0258b24d191b3042307c8cfb2d8058d827027e1e),
+  [04f3772](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/04f377220c5b631f90755b7f92f191576c2c5685))
+
+
+### Fixes
+
+- Missing description on some description from Microsoft feeds
+  ([#107](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/107))
+- Removed duplicate occurences of the string cvssV4_0 in various Jinja filters.
+  ([73c4111](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/73c4111))
+- Few minor fixes.
+
+
+## 2.5.0 (2025-02-07)
+
+### What's New
+
+- **Email Notifications (Product Watch List)**  
+  Users can now create watch lists for specific vendors and products.
+  They will receive notifications—hourly, daily, or weekly—when new or updated vulnerabilities match their defined criteria.
+  ([#101](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/101))
+  Notifications are sent in both HTML and plain text formats, with CSV attachments containing detailed vulnerability information.
+  When new sightings or comments related to these vulnerabilities are available, additional CSV attachments for sightings and comments will be included.
+- **Fraunhofer FKIE NVD**  
+  The FKIE NVD feeder is now a standalone source.
+  ([b1e86d8](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/b1e86d830836e0aefbba05bbb0ef3c5124f4eceb))
+- **Sightings**  
+  Sightings can now be exported and imported directly from the admin interface.
+  ([23cfed2](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/23cfed23dc73017a04f99a368748c1a532dfcf69))
+- [API] A new API endpoint allows you to retrieve recently added or updated vulnerabilities since a specified date
+  ([eccd34d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/eccd34d8933a9d03cab3cd5d4a1d9dc630c9bce6))
+
+
+### Changes
+
+- Harmonized pagination mechanism of the API and made it more simple to use (using page numbers instead of using offsets)
+  ([46ce344](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/46ce344f347c4d4f94ab907347e8c95f4c8c045a))
+- The evolution chart is now taking advantage of the pagination in order to get more data
+  ([ada62e2](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/ada62e252262291e2de6d154c7e53731b59bb045))
+- Added an input integer slider in order to let the user dynamically set the minimum number of sightings in the evolution table
+  ([cea65b7](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/cea65b7e3fb8b9c1483574d6db679df397203078))
+- Implemented a function to check if a domain name exists in the block list, as defined in the website's configuration file
+  ([a2e04b3](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a2e04b3903a93db5b97e7979042990aa5424fe49))
+- Various improvements to the home page
+  ([48cbaed](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/48cbaed2afa2b439daedca9495d809b23e1cddef))
+- log entry when a shutdown key is present on start
+  ([fd18d45](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/fd18d45ec15f860214dd2773630430cd24aa1f3f))
+- Various improvements to the API
+
+### Fixes
+
+- The list of impacted products will now unfold onyly when the user clicks on the chevron
+  ([a6bfe88](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a6bfe88f3bd0adf300fc1f2aef69bbb7614b3dd6))
+- [API] Fixed query filter when comparing ``date_to`` to Sighting.creation_timestamp
+  ([d659976](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a6bfe88f3bd0adf300fc1f2aef69bbb7614b3dd6))
+
+
+## 2.4.0 (2025-01-10)
+
+### What's New
+
+- **New Dashboard**  
+  The home page now includes a table displaying the top sighted vulnerabilities for the past month. The entire dashboard can be filtered and updated in real-time using a date picker.
+  ([2574f33](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2574f33), [88d9b26](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/88d9b26), [b8fec62](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/b8fec62), [dffc041](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/dffc041), [f93033e](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f93033e))
+- **New Correlations Graph**  
+  A graph displaying correlations using sightings data.
+  ([fdfa67f](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/fdfa67f), [fbcba54](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/fbcba54), [2dc811b](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2dc811b))
+- **New CSAF Microsoft Importer**  
+  Adds support for importing CSAF data from Microsoft.
+  ([#84](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/84))
+- **New FKIE NVD Importer**  
+  Introduces an importer for FKIE NVD data.
+  ([6f0541e](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/6f0541e1ba45a9966380db5c1e98529c732302c4))
+- **New RSS/Atom Feeds for Sightings**  
+  Provides feeds for CPE sightings over the last month, sorted for easier access.
+  ([2f96b0d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2f96b0d), [f8e45cd](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f8e45cd))
+- **New Sighting Tool for GitHub Gists**  
+  [GistSight](https://github.com/CIRCL/GistSight) now offers a tool for tracking GitHub Gist sightings.
+
+### Changes
+
+- **New `vulnerability-lookup` CVE Container**: Adds metadata enrichment such as sightings, comments, bundles, meta.
+  ([6b77b52](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/6b77b52))
+- **Admin Feature for Sightings**: Admin users can now update existing sightings.
+  ([7153aa1](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/7153aa1))
+- **[API] CPESearch Update**: The API now returns a `dict[str, list[dict[str, Any]]]` for easier parsing, replacing the previous `dict[str, list[tuple[str, dict[str, Any]]]]`.
+  ([3651e4b](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/3651e4b))
+- Various improvements to HTML templates for better usability.
+- General cleanup and improvements to the API and its documentation.
+
+### Fixes
+
+- **CSAF Report IDs**: Fixed the issue with incorrect IDs for CSAF reports.
+  ([4879ceb](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/4879ceb))
+- **Improved JVND Timeout Handling**: Requests to JVND now timeout more efficiently.
+  ([c669123](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/c669123), [476c6b7](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/476c6b7))
+- Various minor graphical fixes for enhanced user experience.
+
+
+
+## 2.3.0 (2024-12-17)
+
+### What's New
+
+- **Pub/Sub Mechanism**  
+  A streaming service implemented using a Publish/Subscribe (Pub/Sub) pattern powered by Valkey.
+  Available channels: vulnerability, comment, bundle, and sighting.
+  For more details, see the documentation
+  ([#92](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/92)).
+  - [FediVuln](https://github.com/CIRCL/FediVuln) now supports streaming information from a Valkey Pub/Sub service or an authenticated HTTP event-stream (both provided by Vulnerability-Lookup internals) to the Fediverse. Templates are used to render statuses, with the appropriate template selected based on the channel where the event originates.
+
+- **CISA Vulnrichment importer (as meta for CVE)**  
+  The CISA Vulnrichment project is the public repository of CISA's enrichment
+  of public CVE records through CISA's ADP (Authorized Data Publisher) container.
+  In this phase of the project, CISA is assessing new and recent CVEs and adding
+  key [Stakeholder-Specific Vulnerability Categorization (SSVC)](https://www.cisa.gov/stakeholder-specific-vulnerability-categorization-ssvc)
+  decision points. Once scored, some higher-risk CVEs will also receive
+  enrichment of CWE and/or CVSS data points, where possible.
+  The web interface will highlight this information related to the CVEs in the next release
+  [More information](https://github.com/cisagov/vulnrichment).
+  ([#42](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/42))
+
+- **CWE (Common Weakness Enumeration) and CAPEC (Common Attack Pattern Enumeration and Classification) importers**
+  ([#97](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/77))
+
+- **New NCSC-NL CSAF Importer**:
+  ([#94](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/94))
+
+- **New Route**:
+  `/api/vulnerability/cpesearch/<string:cpe>` to retrieve vulnerabilities by CPE (Common Platform Enumeration).
+  ([41f8471](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/41f84710452861ddcb7388ecc3fa0d7b5bf44f5f))
+
+- **New Website**:
+  A brand-new website featuring announcements and official documentation:
+  [https://www.vulnerability-lookup.org](https://www.vulnerability-lookup.org)
+
+
+### Changes
+
+- Improved lookup for the `cvelistv5_view` macro description.
+  ([f4a929c](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f4a929c351de641626d092b0d6be03404b91d16b))
+
+- Added the ability for users to specify a source for sightings.
+  ([2be4eef](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2be4eef2b4283fe05b81a48eddd911d959e11808))
+
+- Updated `kvrocks` configuration with Docker support.
+  ([f864138](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f8641386aaa727c17c9685caa9cf12562a8f5ddc))
+
+-  Added new with_linked, with_comments, with_bundles, and with_sightings arguments to the Vulnerability resource for the GET method.
+-  ([8cb595](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/8cb59544777a674fce41a612c56c67b252399afe))
+
+### Fixes
+
+- Fail fast if Valkey/Redis fails to start.
+  ([#93](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/93))
+
+- Fixed various minor issues in the HTML templates.
+
+
+
+## 2.2.0 (2024-11-28)
+
+### What's New
+
+- **Identity**:
+  - Vulnerability-Lookup now has a beautiful new logo.
+
+- **New Statistics Namespace**:
+  The API now offers a dedicated namespace for statistics. Two new endpoints are currently available:
+  - `/api/stats/vulnerability/most_sighted`
+  - `/api/stats/vulnerability/most_commented`
+  Both endpoints provide the option to return results in a Markdown table format.
+  ([7a2b8ed](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/7a2b8edf717d492452efb100158678606c7ac9de),
+  [d95b49c](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/d95b49c6c421cf34a2817afb3a7c1ef690752e50))
+
+  You can use the API output directly to generate PDF reports:
+  ```bash
+  $ curl -s -X 'GET' 'https://vulnerability.circl.lu/api/stats/vulnerability/most_sighted?date_from=2024-07-01&output=markdown' | pandoc --from=markdown --to=pdf -o semestrial-report.pdf
+  ```
+
+- **New Client for KEV Sightings**:
+  A new Python client, [KevSight](https://pypi.org/project/kevsight/), is available to generate sightings for Vulnerability-Lookup using the [Known Exploited Vulnerabilities (KEV) catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog).
+  For more details, refer to the [Vulnerability-Lookup documentation](https://vulnerability.circl.lu/documentation/sightings.html#automation) on sightings automation and the available clients.
+
+
+### Changes
+
+- **API Enhancements**:
+  - Numerous improvements and harmonization across the API while maintaining
+    compatibility with previous versions.
+    [PyVulVulnerabilityLookup](https://github.com/vulnerability-lookup/PyVulnerabilityLookup) has been updated.
+    ([f9a03fb](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f9a03fba029935bfe255f637a9fc6ac5a3ba91f9),
+    [79cc46d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/79cc46d295b33e677ea1327af289a97e800b9c06))
+
+- **Improved Views**:
+  - `/recent`: Enhanced for greater consistency and readability.
+  - `/vuln`: Improved display for vulnerabilities from the CVE List v5 and NVD sources.
+    The versions of the impacted products is now displayed in a third column.
+    ([9308772](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/9308772e3156d2535b31f38ea78831d2b2cca3e3),
+    [5f9826a](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/5f9826ae4e248fc9e3e9b8e3d7a16050793670e6),
+    [f71da45](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f71da4578461726e3a08d31c7d48cf54e623db93),
+    [54ad96e](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/54ad96ee18a54247af8e71d7dae8c9b565080869),
+    [e8ae16e](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e8ae16e8a2829e1172a60e6cdad04e5e6d711cb4))
+  - We have enhanced the layout and accessibility of various views as part of our ongoing
+    commitment to creating  software that is inclusive and usable for everyone.
+
+- **Documentation**:
+  - The documentation is now exposed by a dedicated Flask Blueprint which is serving static HTML
+    files generated with Sphinx. Updating the documentation is possible via a simple buttom in the dashboard of Vulnerability-Lookup.
+    ([e27ac9f](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e27ac9f353384f5d61d2635be584cd8560319b95),
+    [6f38ccf](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/6f38ccf36a48ec6d67b118b8f9370549150b34a4))
+
+- **Backend**:
+  - Harmonization of datetime objects by ensuring that all dates use UTC-aware timestamps
+    ([8ea2554](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/8ea25544f334a3be7bdf9483cab317b64d99a8d7),
+    [a4defc2](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a4defc272c77e4c9ab118fc5ed02be46110c1185))
+  - Gunicorn is now by default using Gevent
+    ([c79f997](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/c79f9977702346d6f59962b66367569e4f33d580))
+
+
+### Fixes
+
+- **Date Parameters in API**:
+  - The `date_from` and `date_to` parameters in the API no longer have default values.
+    It is now the client’s responsibility to specify these values.
+    ([036ca3a](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/036ca3a358eef5f740c363480fb082984741d80b))
+
+
+- **CVE Lookup Endpoint**:
+  - We fixed the API endpoint for searching CVEs by vendor and product.
+    ([0867fac](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0867fac80f772878278c90790db9b9644beba88b))
+
+
+## 2.1.0 (2024-11-14)
+
+### News
+
+- A new API endpoint allows sightings to be created programmatically.
+  Using dedicated tools, we gather observations from three main sources:
+  - The Fediverse with [FediVuln](https://github.com/CIRCL/FediVuln),
+    a client to collect vulnerability-related information from the Fediverse
+  - MISP with [MISPSight](https://github.com/vulnerability-lookup/MISPSight),
+    a client that retrieves vulnerability observations from a MISP server and pushes them to a Vulnerability-Lookup instance
+  - RSS and Atom [feeds](https://www.newspipe.org/category/140)
+- Combined sightings for bundles:
+  The page displaying bundle details now shows the combined sightings for all vulnerabilities within the bundle
+  ([48610fc](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/48610fcccd0bbb42bc2ed5c89c00bbfe5ba06184))
+- New RSS/Atom endpoints for sightings have been added, allowing parameters such as the sighting source to be used
+  and the id of a vulnerability. This enables users to subscribe to activity on unpublished vulnerabilities.
+  ([6020294](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/6020294bec8da413eab0352ba99d89846851e946))
+- Provide the possibility to comment not yet published vulnerabilities
+  ([f88f239](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f88f23923354e62c741ed1f988e2132a7c0aaafc))
+
+
+### Changes
+
+- Make drawBarChartHomePage faster
+  ([fa95945](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/fa95945e0756b118d2321bb74a64a5d59a079ea3))
+- Added a function in order to provide a small description about the vulnerabilities listed in the bundle page
+  ([8f04be1](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/8f04be1903c87e79e5c693cae6bb688a14032e81))
+- Various enhancements to the home page and the charts based on user sightings
+- Improved the API and the OpenAPI Swagger documentation
+- Various improvements were made to the user interface
+
+
+### Fixes
+
+- Fixed an issue in the Marshalling for the Sightings in the API
+  ([5ccdbe2](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/5ccdbe240e218a45d881377f9678c523d8af2f8d))
+- Fixed the title of the RSS/Atom feed
+  ([311d2c4](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/311d2c4b3c2ef570caf4d98e9c7c3b421353538d))
+- Keep non-sensitive case search even if our ids are lowercase.
+  ([9fae6ea](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/9fae6ead1d9e98b5e65105c8da4ca393ff4e83e1))
+
+
+## 2.0.0 (2024-10-18)
+
+### News
+
+- Sightings: enable users to add observations to vulnerabilities with different types of sightings, such as:
+  _seen_, _exploited_, _not exploited_, _confirmed_, _not confirmed_, _patched_, and _not patched_.
+  ([#76](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/76))
+
+
+### Changes
+
+- Enhanced the homepage with simple charts displaying trending vulnerabilities based on user sightings.
+  ([ba7a64d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/ba7a64d0f35755d5b7ab489dc4f2138aed67d84c),
+  [946eaaf](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/946eaafc6598f8721237e8fefb0163810ac3c537))
+- The dump command can now export the sightings.
+  ([d070c58](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/d070c585a252d42224b85bf0bc8c4e5ca919f5e9))
+- Added a UUID attribute to the User model. A migration script will generate UUIDs for all existing users.
+  ([713a9a8](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/713a9a8e2cabb1eccf4fcfa1670900afc97f6ee1))
+- Improved /recent view for CSAF vulnerabilities.
+  ([f31b56](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f31b56bec4814a28f1d59f16086a8ec99f48ac66))
+- Improved /recent view for JVNDB vulnerabilities.
+  ([478faaf](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/478faaf3f25df698a4af34d2c99b512b843b7892))
+- Improved /recent view for OpenSSF Malicious Packages vulnerabilities.
+  ([1a2728d](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/1a2728dbf7fe24fdd08f691992eba3aaa320f32a))
+- Improved /recent view for PySec vulnerabilities.
+  ([f5d8b21](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f5d8b212c71bcc0656f0b5add2b1dea9308ec439))
+- Improved /recent view for GitHub vulnerabilities.
+  ([e60b81a](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e60b81a30e8dacfedf0a37abf434ccfabd2ef22e))
+- Various graphical and accessibility improvements.
+
+
+### Fixes
+
+- Get bigger chunks of variot data at a time
+  ([e9e6fce](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/e9e6fce05af0e4b9c5528a82769e6177bc63c34f))
+- [CISA feed] Exception when storing CWE entries as list
+  ([78236d5](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/78236d5c2b62628ab3851d67faf3c40d6621a376))
+
+
+## 1.7.0 (2024-10-02)
+
+### News
+
+- The sign-up process now verifies that the user is not using a disposable email address,
+  thanks to the MISP warning list of disposable emails.
+  ([177f6a9](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/177f6a90a1b648b61e692f4bfe5e0343c626c68e))
+- Added a Flask command to update the local MISP Warning Lists. This function is triggered
+  automatically when the Vulnerability-Lookup instance is updated.
+  ([5370aa5](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/5370aa54d0cbd9b3a66adf0258498db3a258d41c))
+- Implemented a mechanism to execute maintenance background jobs directly from the admin panel.
+  ([f36053b](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f36053b777a17f514b1f74687d58998aa8201fca))
+- Integration of the Exploit Prediction Scoring System (EPSS) score.
+  ([9e54b71](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/9e54b7195c2b2490785c564a78eedbd4c36ba5a1),
+  [27b4487](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/27b44876d48b146cf0239cd0ca3d53b42004214e),
+  [2e021ed](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2e021ed41ef927fb6fb683fb7d918b595073c527)).
+- A theme switcher button with two modes: light mode (default) and dark mode.
+  ([09ab04a](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/09ab04aa64fbee98dad93d1e2177806ea800d7a2),
+  [2e12ddf](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2e12ddfa08ac44dfc49094eaa41b9071687bfdeb))
+
+
+### Changes
+
+- Enhanced the formatting of comments and bundle descriptions using JavaScript.
+  ([ddedfca](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/ddedfca2c53cbadbcaee69bcfb113a470792c468))
+- All admin views were improved with better search capabilities.
+- Admins are now notified when a new comment is awaiting moderation.
+  ([9739292](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/9739292ed8e11e5c875151a95f5dafdf8eb1c1b9))
+
+
+### Fixes
+
+- Make the GET List (with filters) for Bundles in the API case insensitive.
+  ([32c9bb4](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/32c9bb4c0028201ab86021521a77c0746fdb769a))
+- The search form must post the search to /search and not search.
+  ([4ce5227](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/4ce5227563d10ba05bdd9903e02d848e583e26b4))
+
+
+
+## 1.6.0 (2024-09-16)
+
+### News
+
+- Importer for Tailscale vulnerabilities
+  [#68](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/68)
+- New user profile page with more information and detection of the country
+  during user sign-up using the CIRCL MMDB service
+  [#73](https://github.com/vulnerability-lookup/vulnerability-lookup/pull/73)
+- Added the ability to filter comments by any taxonomy tags by clicking on the corresponding badge
+  ([b3e0bdf](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/b3e0bdf6e15b5821c3e7a4e574fa452857fd0410))
+- Implemented a function to back up the database using pg_dump. This function is automatically triggered by the
+  project's update command, ensuring a backup is created before any database upgrades take place.
+  ([75ee913](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/75ee9132beb9df1c5a847eb11488dd5241f3ee1f))
+
+
+### Improvements
+
+- [API] Enhanced detection of CVE, GHSA, and PySec IDs within bundle descriptions and comments.
+  This enables automatic identification of related vulnerabilities linked to a comment or a bundle.
+  ([2c00695](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2c00695864dafc20de6394dc0fe7e3d02ff570f1),
+  [162a599](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/162a599ac12482e3cfb6e0d6d9d1566ef10dab01),
+  [401d780](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/401d78081f4aa6c14664a74aaf4e3c4398d05a33)).
+- Added more validation to the various attributes of the User model.
+  ([758e571](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/758e5710282434e30ba61ed9efeea070d94407c1),
+  [3a1cc60](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/3a1cc604ca1a2ba642ead2b68f9e36ee6a641326))
+- Simplified search page
+  ([f2c55bc](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f2c55bc9f7e53caca4d011e06678989c490e9ba2))
+- Improved display of tables and lists generated from Markdown (in comments and bundles)
+  ([24fa4f9](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/24fa4f95ed4e0266424e71d5d985ae693f22e9e1),
+  [15fe9b2](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/15fe9b2c673ecf1ab14065e4925869d061dccebe))
+- The ranking of the users is now taking into account the contributions of comments and bundles.
+  Users who have never contributed are sorted by *last_seen*, after the processed result.
+  ([4e4a436](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/4e4a436ea6052bb23b7bad373c010bf161fff05e))
+- Various graphical and accessibility improvements.
+
+### Fixes
+
+- Do not iterate over meta tags when never defined in an object
+  ([93f9966](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/93f9966ad4009d8bbe8b54b7efb87a19886e3605))
+
+
+## 1.5.0 (2024-08-30)
+
+### News
+
+- new: Import JVN DB (Japan database of vulnerability countermeasure information).
+  Closes [#67](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/67)
+- new: [commands] The dump command can now dump comments (--comments) and bundles (--bundles).
+  Closes [#65](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/65).
+- [new: [website] Is now possible to assign tags related to a comment.](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/55205889dd10ba793f9d51d8a0a7440885e1829c)
+  Tags are automatically stored in the meta field of the comment. The default taxonomy used for the tags is defined in the MISP project: https://www.misp-project.org/taxonomies.html#_vulnerability_3
+
+
+### Improvements
+
+- [chg: [API] Added a new argument in order to let the user filter comments based on data in the meta JSON field.](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/00be25c7cb965c574f5393e5388e853f49cc0b65)
+- [chg: [website] Filtering the list of public comments by their type (in the future with a taxonomy)](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/c908d000e9108ed136daf980fe5911e8da72a170)
+- [chg: [website] Added references from the NVD meta section in the details view](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/44466d2e78fff9adc418b8cc559be1832ada04bd)
+- [chg: [API] Added the possibility to filter bundles with a query on the meta JSONB field via the API.](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/b0603793e980dc21490edb6024d98f9253ce4243)
+
+
+### Fixes
+
+- [fix: [website] Ensures that the vulnerability id has been specified by the user.](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/5706b0fda7c3018fd84373e52b99ad1a1b5b0d0a)
+  even when the user is an administrator.
+
+
+## 1.4.0 (2024-08-02)
+
+### News
+
+- [new: [webservice] Display severity informations for vulnerabilities from GitHub, NVD and Pysec.](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/56de1fb49dec90e0a06f6366db1c7b56c2f66544)
+- [new: [API] Added an endpoint to let the user regenerate the API key.](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/06c78af3b8c1038fe1e34468703323fc1445dcd2)
+- [new: [API] New endpoint to let an administrator delete a user and a new endpoint in order to return information about the currently authenticated user (GET /user/me)](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2cbcbc5df390563f17e9120cfc8d3dd753a333da)
+- [new: [API] Added new endpoint (/configInfo) which returns non-sensitive information about the configuration of the system.](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/92cef5bfd1f2fe566bc51dbe39f314b9a3850c19)
+
+
+### Improvements
+
+- chg: [website] Reorganization and improvements to diffenrent views that are dedicated to administrators. (27088c9)
+- test suite improvements (a51a144, 88f6e25, 46775e7)
+- a boolean in the config file can now specify whether two-factor authentication is enforced or not (fedf631)
+
+### Fixes
+
+- [Spaces in vulnerability id in the main search box doesn't work.](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/64)
+- [empty recent](https://github.com/vulnerability-lookup/vulnerability-lookup/issues/54)
+
+
+## 1.3.0 (2024-07-26)
+
+### Improvements
+
+- we have made significant enhancements to the vulnerabilities details page.
+  It now presents more relevant information, and the layout has been substantially
+  improved for better user experience.
+- various improvements to the API were made.
+- [UI] Hidde edition/action buttons when not logged
+  (https://github.com/vulnerability-lookup/vulnerability-lookup/issues/57)
+- [improvements were made to the various importers](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/37d3a6d0e6bd3ecd2e7af72e04981a6bc861c3d6)
+
+### Fixes
+
+- [Bug] Custom vulnerability not correctly displayed
+  (https://github.com/vulnerability-lookup/vulnerability-lookup/issues/58)
+- [New vuln] Can't create a new vulnerability without a CVE number
+  (https://github.com/vulnerability-lookup/vulnerability-lookup/issues/56)
+- fix: [webservice] Fixed the sort of the contributors vs the users.
+  (https://github.com/vulnerability-lookup/vulnerability-lookup/commit/46195d17d757f38af3fd25a2dd7cbd6a0f6f53be)
+- various minor fixes.
+
+
+## 1.2.0 (2024-07-17)
+
+### Notable changes
+
+#### Bundles Management
+
+- Introduced a new SQLAlchemy model, **Bundle**, for the website.
+  - Included [migration script](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/8ecca68891e7f8956f97ffe6e9a4412b41b5a9e4)
+    and automatic execution of migrations via the app `update` script.
+    Details [here](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/b324aad5152e19eb82d9ff3b632bfb69ce7d6fda).
+- Added a new API endpoint for managing bundles:
+  - Only administrators can create, edit, and delete bundles.
+  - Bundles are always public.
+- Added a third tab in the `vulnerability_view` page (`/vuln/vuln-id`) to list bundles referencing the current vulnerability.
+- Introduced a new view (`/bundle/<bundle-uuid>`) presenting bundle details with a share button (Reddit, Newspipe, Pinboard).
+
+#### User Profile Page
+
+- Implemented a new column-based layout with data loaded via the API.
+- Displayed recent comments and bundles owned by a user in two columns with dedicated RSS/ATOM feeds.
+- Added new RSS/ATOM feeds to publish user activity (`/user/<login>.atom` or `/user/<login>.rss`).
+
+### Minor Fixes
+
+- [Fixed: Name of vendors returned by `get_vendors` are now lowercase](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/0443b1a18d2e73b655f42af0cd6ebd5b844f9b86), addressing an issue in vendor search.
+- [Fixed: `vulnerabilitylookup.get_vendors` returns lowercase results](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/a79680e9054588f80b4827b0cc9fceea39588cf3).
+- Various other minor fixes.
+
+### Minor Changes
+
+- [Enabled CSRF globally](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/2caab5613612915fd4c3334c409cbe1f65c76dbe).
+- [Added a datalist refresh system in JavaScript for the freetext input field on the home page](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/282f045ec7796d24a3f7cc556e624b031430eb5e).
+- [Rendered Markdown code from GitHub, PySec, and VarIoT advisories](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/f9af561306684b82bae88c639e58aebf461869ec).
+- [Backend no longer validates JSON vulnerability data sent from an admin](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/aa4a5c02405267b47851a50d4cb614f268143f42).
+- [Implemented a blocklist for usernames to prevent undesirable words](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/4aae7957f03b6644ecd418d6074b562023c4b6f9).
+- [Replaced `moment.js` with `Luxon`](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/24ca9244f900b8e4463b632a72d29518d4a081af).
+- [Added the option to specify a vendor ID in the feed of recent vulnerabilities](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/4a107126b8d020d1a3d926d621dbfbed80f95c40).
+- [Displayed the number of elements in each tab on the `/vuln/<vuln-id>` page](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/c42aa87d8013dd6a875c002744948a53b2f0fc0c).
+- [Improved the About page](https://github.com/vulnerability-lookup/vulnerability-lookup/commit/1a2a6a9d0af036ff345b5b7f5235a16b6e8a8646).
+
+### Additional Improvements
+
+- Enhanced the display of the `/recent` pages with better column sizing for easier readability.
+- Harmonized the format and data of various RSS/ATOM feeds.
+- Made improvements to the users directory page.
+- Made various improvements to the API, including harmonization of query parameters, result marshaling, and pagination.
+- Other small changes and enhancements.
+
+
+## 1.1.0 (2024-07-04)
+
+### Main Changes
+
+- **Comments Tab:** Added a new tab for viewing and managing comments on vulnerabilities.
+- **RSS/ATOM Feed:** Linked vulnerabilities now include an RSS/ATOM feed link.
+- **Admin Comments Management:** Administrators can now validate or delete comments via a dedicated page.
+- **All Comments Page:** A new page listing all comments is available at `/comments`.
+- **User Model Update:** User model now includes fields for storing names and organization.
+- **User Management API:** Added a new endpoint (`/api/user/`) for managing users, including listing and creating user accounts.
+- **User Profiles:** Users now have individual profile pages at `/user/<login>`.
+
+### Graphical Improvements
+
+- **Nav-Tabs Component:** Introduced a nav-tabs component with tabs for related vulnerabilities and comments.
+- **Enhanced Pages:** Improved the design of the login, signup, and password recovery pages.
+- **Recent Vulnerabilities Table:** Made minor enhancements to the table displaying recent vulnerabilities at `/recent`.
+
+
+## 1.0.0 (2024-06-19)
+
+### News
+
+- **New User Management Interface:**
+  - Added functionality for creating, validating, and managing users.
+
+- **New VARIoT Sources:**
+  - Integrated [VARIoT source](https://www.variotdbs.pl/) into vulnerability-lookup (API key is required).
+
+### Improvements
+
+
+- **Enhanced Vulnerability Editor:**
+  - New local source feature to easily copy, edit, and publish vulnerabilities on the vulnerability-lookup instance using [Vulnogram](https://github.com/Vulnogram/Vulnogram).
+
+- **Bug Fixes and Improvements:**
+  - Numerous bug fixes and small enhancements to improve overall performance and stability.
+
+
+![image](https://github.com/vulnerability-lookup/vulnerability-lookup/assets/3309/8eecf2e0-250c-40db-8ef0-fcc27d7d3342)
+
+
+## 0.7.0 (2024-04-17)
+
+### News
+
+* News feed by @cedricbonhomme in https://github.com/vulnerability-lookup/vulnerability-lookup/pull/30
+* Support for CSAF sources (CERT Bund, RedHat, Siemens, CISA, CISCO, Nozomi Networks, OpenXchange, SICK)
+* OSSF Malicious packages repository
+* Pagination for recent vulnerabilities (API & Web)
+
+### Improvements
+
+* build(deps): bump actions/cache from 3 to 4 by @dependabot in https://github.com/vulnerability-lookup/vulnerability-lookup/pull/19
+* Many UI improvements
+* Add tests for website
+
+### New Contributors
+
+* @cedricbonhomme made their first contribution in https://github.com/vulnerability-lookup/vulnerability-lookup/pull/30
+
+**Full Changelog**: https://github.com/vulnerability-lookup/vulnerability-lookup/compare/v0.6.0...v0.7.0
+
+
+## 0.5.0 (2023-07-02)
+
+### News
+
+- A fast lookup API to search for vulnerabilities.
+- Modular system to import different vulnerability sources.
+- An API for adding new vulnerability including ID assignent, state and disclosure.
+
+#### Feeders
+
+- NIST NVD CVE importer (via API 2.0)
+- Cloud Security Alliance - [GSD-Database](https://github.com/cloudsecurityalliance/gsd-database/) (via git submodule repository)
+- GitHub [Advisory Database](https://github.com/github/advisory-database) (via git submodule repository)

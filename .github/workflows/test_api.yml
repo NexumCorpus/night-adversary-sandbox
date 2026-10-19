@@ -1,0 +1,108 @@
+name: API Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13' , '3.14']
+    name: Python ${{ matrix.python-version }} sample
+
+    steps:
+    - uses: actions/checkout@v6
+    - name: Checkout pysec submodule only
+      run: |
+        git submodule init vulnerabilitylookup/feeders/pysec
+        git submodule update vulnerabilitylookup/feeders/pysec
+
+    - name: Install poetry
+      run: pipx install poetry
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: ${{matrix.python-version}}
+        cache: 'poetry'
+
+    - name: Clone Valkey
+      uses: actions/checkout@v6
+      with:
+        repository: valkey-io/valkey
+        path: valkey-tmp
+        ref: '8.0'
+
+    - name: Install and setup valkey
+      run: |
+        mv valkey-tmp ../valkey
+        pushd ..
+        pushd valkey
+        make -j $(nproc)
+        popd
+        popd
+
+    - name: Install KvRocks
+      run: |
+        wget https://github.com/RocksLabs/kvrocks-fpm/releases/download/202510222/kvrocks_2.13.0-1_amd64.deb -O kvrocks.deb
+        sudo dpkg -i kvrocks.deb
+
+    - name: Setup PostgreSQL
+      uses: Harmon758/postgresql-action@v1.0.0
+      with:
+        postgresql db: 'vulnlookuptest'
+        postgresql user: 'postgres'
+        postgresql password: 'password'
+
+    - name: Install with poetry
+      run: |
+        python -m pip install --upgrade pip poetry
+        poetry install --with dev
+        echo VULNERABILITYLOOKUP_HOME=`pwd` > .env
+
+    - name: Clone PyVulnerabilityLookup
+      uses: actions/checkout@v6
+      with:
+        repository: vulnerability-lookup/PyVulnerabilityLookup
+        path: PyVulnerabilityLookup
+
+    - name: Run API tests
+      run: |
+        export PKGVER=`git describe --tags`
+        poetry run pip install -e PyVulnerabilityLookup/
+        cp config/website.py.sample  config/website.py
+        cp config/generic.json.sample  config/generic.json
+        cp config/stream.json.sample  config/stream.json
+        cp config/logging.json.sample  config/logging.json
+        poetry run flask --app website.app db_init
+        poetry run flask --app website.app db stamp head
+        poetry run flask --app website.app create_admin --login admin --password admin --email admin@local.host
+        export API_KEY=`poetry run flask --app website.app user_get_api_key --login admin`
+        timeout 1m poetry run run_backend --start
+        poetry run pysec_importer &
+        poetry run start_website &
+        sleep 60
+
+        export INSTANCE_URL="http://127.0.0.1:10001"
+        poetry run pytest PyVulnerabilityLookup/tests/test_web.py
+
+        poetry run stop
+      env:
+        TESTING: gh_action
+
+    - name: Cache / Valkey logs
+      if: ${{ always() }}
+      run: |
+        cat cache/cache.log
+
+    - name: Storage / Kvrocks logs
+      if: ${{ always() }}
+      run: |
+        ls storage
+        cat storage/*log*

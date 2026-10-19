@@ -1,0 +1,58 @@
+[submodule "gsd"]
+    path = vulnerabilitylookup/feeders/gsd
+    url = https://github.com/cloudsecurityalliance/gsd-database.git
+    ignore = all
+[submodule "github"]
+    path = vulnerabilitylookup/feeders/github
+    url = https://github.com/github/advisory-database.git
+    ignore = all
+[submodule "pysec"]
+    path = vulnerabilitylookup/feeders/pysec
+    url = https://github.com/pypa/advisory-database.git
+    ignore = all
+[submodule "emb3d"]
+	path = vulnerabilitylookup/feeders/emb3d
+	url = https://github.com/mitre/emb3d.git
+    ignore = all
+[submodule "cvelistv5"]
+    path = vulnerabilitylookup/feeders/cvelistv5
+    url = https://github.com/CVEProject/cvelistV5.git
+    ignore = all
+[submodule "ossf_malicious_packages"]
+    path = vulnerabilitylookup/feeders/ossf_malicious_packages
+    url = https://github.com/ossf/malicious-packages.git
+    ignore = all
+[submodule "vulnrichment"]
+    path = vulnerabilitylookup/feeders/vulnrichment
+    url = https://github.com/cisagov/vulnrichment.git
+    branch = develop
+    ignore = all
+[submodule "fkie_nvd"]
+	path = vulnerabilitylookup/feeders/fkie_nvd
+	url = https://github.com/fkie-cad/nvd-json-data-feeds.git
+    ignore = all
+[submodule "cnvd"]
+	path = vulnerabilitylookup/feeders/cnvd
+	url = https://helga.circl.lu/vulnerability-lookup/CNVD-Dump.git
+    ignore = all
+[submodule "fstec"]
+    path = vulnerabilitylookup/feeders/fstec
+    url = https://helga.circl.lu/vulnerability-lookup/FSTEC-Dump.git
+    ignore = all
+[submodule "bitnami_vulndb"]
+	path = vulnerabilitylookup/feeders/bitnami_vulndb
+	url = https://github.com/bitnami/vulndb.git
+    ignore = all
+[submodule "cleanstart"]
+	path = vulnerabilitylookup/feeders/cleanstart
+	url = https://github.com/cleanstart-dev/cleanstart-security-advisories.git
+[submodule "drupal"]
+	path = vulnerabilitylookup/feeders/drupal
+	url = https://github.com/DrupalSecurityTeam/drupal-advisory-database.git
+[submodule "osv_ossfuzz"]
+	path = vulnerabilitylookup/feeders/osv_ossfuzz
+	url = https://github.com/google/oss-fuzz-vulns.git
+[submodule "osv_rustsec"]
+	path = vulnerabilitylookup/feeders/osv_rustsec
+	url = https://github.com/rustsec/advisory-db.git
+	branch = osv

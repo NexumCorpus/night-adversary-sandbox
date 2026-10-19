@@ -1,0 +1,49 @@
+{% extends "main.html" %}
+{% from 'bootstrap5/form.html' import render_form %}
+{% block styles %}
+<!-- Bootstrap CSS -->
+{{ bootstrap.load_css() }}
+<style>
+.logo-img {
+  max-height: 140px;
+}
+</style>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/theme.css') }}" />
+{% endblock %}
+{% block title %}Account recovery{% endblock %}
+{% block content %}
+<div class="row">
+  <div class="col d-flex justify-content-center align-items-center vh-15">
+    <img
+      id="vulnerability-lookup-logo-login"
+      src="{{ url_for('static', filename='img/VL-hori-coul.png') }}"
+      alt="Vulnerability-Lookup"
+      title="Vulnerability-Lookup"
+      class="logo-img me-2 img-fluid"
+    />
+  </div>
+</div>
+<div class="row justify-content-center mt-3">
+  <div class="col-md-4">
+    {{ render_form(form, extra_classes="form-control") }}
+  </div>
+</div>
+
+<script>
+  if (getCookie("theme") == 'light') {
+    document.getElementById('vulnerability-lookup-logo-login').src = '/static/img/VL-hori-coul.png';
+  } else {
+    document.getElementById('vulnerability-lookup-logo-login').src = '/static/img/VL-hori-white-coul.png';
+  }
+  document.addEventListener("DOMContentLoaded", function() {
+    document.getElementById('btnThemeSwitch').addEventListener('click',()=>{
+      if (document.documentElement.getAttribute('data-bs-theme') == 'dark') {
+        document.getElementById('vulnerability-lookup-logo-login').src = '/static/img/VL-hori-coul.png';
+      }
+      else {
+        document.getElementById('vulnerability-lookup-logo-login').src = '/static/img/VL-hori-white-coul.png';
+      }
+    })
+  });
+</script>
+{% endblock %}

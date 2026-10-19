@@ -1,0 +1,147 @@
+{% extends "main.html" %}
+{% block head %}
+{{ super() }}
+<style>
+.table-nowrap td,
+.table-nowrap th {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+</style>
+{% endblock %}
+{% block title %}Sightings{% endblock %}
+{% block content %}
+<div class="row">
+  <div class="col-md-9">
+    <h1>Sightings</h1>
+  </div>
+  <div class="col-md-3">
+    <form class="align-items-center" method="GET">
+        <label class="visually-hidden" for="sightingInput">Search term</label>
+        <div class="input-group">
+          <input type="text" class="form-control" id="sightingInput" name="query" placeholder="Search term" />
+          <button type="submit" class="btn btn-primary input-group-text">Submit</button>
+        </div>
+    </form>
+  </div>
+</div>
+<div class="row">
+  <div class="col text-end">
+    <a class="icon-link" href="{{ url_for('sightings_bp.feed_sightings', format='atom') }}" type="application/atom+xml" title="Atom feed">{{ render_icon('rss') }}</a>
+    <a class="icon-link" href="{{ url_for('sightings_bp.feed_sightings', format='rss') }}" type="application/atom+xml" title="RSS feed">{{ render_icon('rss-fill') }}</a>
+</div>
+</div>
+
+<div class="table-responsive table-nowrap">
+  <table id="table-sightings" class="table table-hover">
+    <thead>
+      <tr>
+        <th>Author</th>
+        <th>Source</th>
+        <th>Vulnerability</th>
+        <th>Type</th>
+        <th>Date</th>
+        <th>Other</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for sighting in sightings %}
+      <tr vulnerability-id="{{ sighting.vulnerability }}">
+        <td>
+          <a href="{{ url_for('user_bp.profile', login=sighting.author.login) }}">
+            {{ sighting.author.login }}
+          </a>
+        </td>
+        <td class="text-truncate" style="max-width:300px;">
+          {% if sighting.source | is_url %}
+            <a href="{{ sighting.source }}" target="_blank" rel="noreferrer" class="text-truncate d-block">
+              {{ sighting.source }}
+            </a>
+          {% else %}
+            {{ sighting.source }}
+          {% endif %}
+        </td>
+        <td>
+          <a href="{{ url_for('home_bp.vulnerability_view', vulnerability_id=sighting.vulnerability) }}">
+            {{ sighting.vulnerability.upper() }}
+          </a>
+        </td>
+        <td>{{ sighting.type }}</td>
+        <td title="{{ sighting.creation_timestamp | datetimeformat('%Y-%m-%d %H:%M:%S %z') }}">
+          {{ sighting.creation_timestamp | datetimeformat('%Y-%m-%d %H:%M:%S') }}
+        </td>
+        <td>
+          <a class="btn btn-sm btn-primary" href="{{ url_for('sighting_bp.correlations', sighting_uuid=sighting.uuid) }}" title="Correlations">
+            {{ render_icon('bezier') }}
+          </a>
+          <a class="btn btn-sm btn-warning" href="{{ url_for('sighting_bp.export', sighting_uuid=sighting.uuid) }}" title="Export">
+            {{ render_icon('download') }}
+          </a>
+        </td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="row">
+    <div class="col">
+        {{ pagination.links }}
+    </div>
+</div>
+<div class="row">
+  <div class="col">
+      {{ pagination.info }}
+  </div>
+</div>
+<div class="row">
+  <div class="col">
+    <br />
+    <p>If a line is highlighted in yellow, it indicates that the vulnerability advisory has not yet been published.</p>
+    <p><a href="https://www.vulnerability-lookup.org/tools/#sightings" rel="noreferrer" target="_blank">Sightings Sources</a>.</p>
+  </div>
+</div>
+<script>
+  document.addEventListener("DOMContentLoaded", function() {
+    const table = document.getElementById("table-sightings");
+
+    // Check if the table exists
+    if (!table) {
+      console.error("Table with ID 'table-sightings' not found.");
+      return;
+    }
+
+    // Get all <tr> elements with the 'sighting-id' attribute within the table
+    const rows = table.querySelectorAll("tr[vulnerability-id]");
+
+    // Iterate over each <tr> element
+    rows.forEach(row => {
+      const vulnerabilityId = row.getAttribute("vulnerability-id");
+
+      fetch(`/api/cve/${vulnerabilityId}`)
+      .then(response => {
+        if (!response.ok) {
+          throw new Error(`Network response was not ok: ${response.statusText}`);
+        }
+        return response.json(); // Assuming the API returns JSON
+      })
+      .then(data => {
+        if (data === null) {
+          row.classList.add("table-warning");
+        }
+        // else {
+        //   console.log(`Data for sighting-id ${vulnerabilityId}:`, data);
+        //   // Optionally, update the row with the fetched data
+        //   // e.g., row.querySelector(".some-class").textContent = data.someProperty;
+        // }
+      })
+      .catch(error => {
+        console.error(`Fetch error for sighting-id ${vulnerabilityId}:`, error);
+      });
+    });
+
+  })
+</script>
+{% endblock %}

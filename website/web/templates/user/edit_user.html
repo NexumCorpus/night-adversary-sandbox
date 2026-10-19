@@ -1,0 +1,133 @@
+{% extends "main.html" %}
+{% from 'bootstrap5/form.html' import render_form %}
+{% block head %}
+{{ super() }}
+<script src="{{ url_for('static', filename='js/easymde.min.js') }}"></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/easymde.min.css') }}" />
+{% endblock %}
+{% block title %}{{ action }}{% endblock %}
+{% block content %}
+<h1>Profile</h1>
+{{ render_form(form, extra_classes="form-control") }}
+<br /><hr />
+<div class="row">
+    <div class="col">
+      <h2>Your API key</h2>
+        <div class="input-group">
+            <span class="input-group-text">API key</span>
+            <input type="text" class="form-control" id="inlineFormInputGroupAPIKey" value="{{ current_user.apikey }}" readonly>
+            <button class="btn btn-outline-primary" type="button" onclick="copyToClipboard()">{{ render_icon('clipboard', title='Copy to clipboard') }}</button>
+            <a href="#" class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#confirmationModal" data-action="{{ url_for('user_bp.generate_apikey', user_id=user.id) }}" data-title="Generate a new API key" data-button="Generate">Generate new API key</a>
+        </div>
+        <p class="pt-3">This API key can be used for authenticated requests to the <a href="{{ url_for('apiv1.doc') }}">API</a>.</p>
+  </div>
+</div>
+
+<div class="row">
+    <div class="col">
+      <h2>Your Feed key</h2>
+        <div class="input-group">
+            <span class="input-group-text">Feed key</span>
+            <input type="text" class="form-control" id="inlineFormInputGroupAPIKey" value="{{ current_user.feedkey }}" readonly>
+            <button class="btn btn-outline-primary" type="button" onclick="copyToClipboard()">{{ render_icon('clipboard', title='Copy to clipboard') }}</button>
+            <a href="#" class="btn btn-outline-primary" data-bs-toggle="modal" data-bs-target="#confirmationModal" data-action="{{ url_for('user_bp.generate_feedkey', user_id=user.id) }}" data-title="Generate a new feed key" data-button="Generate">Generate new feed key</a>
+        </div>
+        <p class="pt-3">This feed key can be used for authenticated access to RSS/Atom feeds, such as those related to <a href="{{ url_for('user_bp.watchlist') }}">your watchlist</a>.</p>
+  </div>
+</div>
+
+<hr />
+
+<h2>Delete account</h2>
+<a href="#" class="btn btn-warning" data-bs-toggle="modal" data-bs-target="#confirmationModal" data-action="{{ url_for('user_bp.delete_account') }}" data-title="Delete your account" data-button="Delete">Delete your account</a>
+{% if not config["ENFORCE_2FA"] %}
+<a href="{{ url_for('user_bp.toggle_2FA') }}" class="btn btn-warning">{% if user.is_two_factor_authentication_enabled %}Disable{% else %}Enable{% endif %} 2FA</a>
+{% endif %}
+<br /><br />
+<p>Deleting your account will not impact any of the contributions you have previously made.</p>
+
+<!-- Confirmation Modal -->
+<div class="modal fade" id="confirmationModal" tabindex="-1" aria-labelledby="confirmationModalLabel" aria-hidden="true">
+  <div class="modal-dialog">
+    <form method="post" id="confirmationForm">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}" />
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="confirmationModalLabel">Confirm Action</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <p id="confirmationMessage">Are you sure you want to proceed?</p>
+          <div class="mb-3">
+            <label for="passwordInput" class="form-label">Enter your password to continue</label>
+            <input type="password" class="form-control" id="passwordInput" name="password" required>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="submit" class="btn btn-primary" id="confirmationSubmit">Submit</button>
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+    const confirmationModal = document.getElementById("confirmationModal");
+    const confirmationForm = document.getElementById("confirmationForm");
+    const confirmationTitle = document.getElementById("confirmationModalLabel");
+    const confirmationMessage = document.getElementById("confirmationMessage");
+    const confirmationSubmit = document.getElementById("confirmationSubmit");
+
+    confirmationModal.addEventListener("show.bs.modal", function (event) {
+        const button = event.relatedTarget;
+        const action = button.getAttribute("data-action");
+        const title = button.getAttribute("data-title");
+        const buttonLabel = button.getAttribute("data-button");
+
+        confirmationForm.action = action;
+        confirmationTitle.textContent = title;
+        confirmationMessage.textContent = `Are you sure you want to ${buttonLabel.toLowerCase()}?`;
+        confirmationSubmit.textContent = buttonLabel;
+    });
+
+    const passwordInput = document.getElementById("password");
+    const passwordConfirm = document.getElementById("current_password");
+
+    if (passwordInput && passwordConfirm) {
+        passwordInput.addEventListener("input", function () {
+            if (passwordInput.value.length > 0) {
+                passwordConfirm.disabled = false;
+            } else {
+                passwordConfirm.disabled = true;
+                passwordConfirm.value = "";
+            }
+        });
+    }
+});
+
+function copyToClipboard() {
+  const copyText = document.getElementById("inlineFormInputGroupAPIKey").value;
+  const textArea = document.createElement('textarea');
+  textArea.textContent = copyText;
+  // document.body.append(textArea);
+  // textArea.select();
+  navigator.clipboard.writeText(textArea.value).then(function() {
+        /* clipboard successfully set */
+        alert('API key copied to your clipboard.');
+      }, function() {
+        /* clipboard write failed */
+  });
+}
+
+easyMDE = new EasyMDE({
+  element: document.getElementById('bio'),
+  autoRefresh: { delay: 300 },
+  toolbarButtonClassPrefix: "mde",
+  toolbar: [
+    "bold", "italic", "heading", "|", "unordered-list", "ordered-list", "|", "preview", "side-by-side", "fullscreen"
+  ]
+});
+</script>
+{% endblock %}

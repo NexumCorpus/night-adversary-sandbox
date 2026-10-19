@@ -1,0 +1,153 @@
+import logging
+from typing import Tuple
+
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+    fields,
+    reqparse,
+)
+
+from website.models import Organization, Product
+from website.web.api.v1.common import (
+    metada_params_model,
+    uuid_type,
+)
+from website.web.api.v1.types import ResultType
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+product_ns = Namespace("product", description="Product related operations.")
+
+# Argument Parsing
+parser = reqparse.RequestParser()
+parser.add_argument(
+    "page",
+    type=int,
+    default=1,
+    help="Number of the page.",
+)
+parser.add_argument(
+    "per_page",
+    type=int,
+    default=1000,
+    help="Maximum number of elements to return.",
+)
+parser.add_argument("uuid", type=uuid_type, help="UUID of the product.")
+parser.add_argument(
+    "name",
+    type=str,
+    help="The name of the product.",
+)
+parser.add_argument(
+    "organization_name",
+    type=str,
+    help="The name of the organization related to the product.",
+)
+parser.add_argument(
+    "organization_id",
+    type=str,
+    help="The id of the organization related to the product.",
+)
+parser.add_argument(
+    "organization_uuid",
+    type=str,
+    help="The uuid of the organization related to the product.",
+)
+
+# Response marshalling
+product_params_model = {
+    "id": fields.String(description="Product id."),
+    "uuid": fields.String(description="Product uuid."),
+    "name": fields.String(description="Product name."),
+    "description": fields.String(description="Description."),
+    "creation_timestamp": fields.DateTime(
+        description="Creation time of the product.", readonly=True
+    ),
+    "updated_timestamp": fields.DateTime(
+        description="Updated time of the product.", readonly=True
+    ),
+}
+product = product_ns.model("Product", product_params_model, skip_none=True)
+metadata = product_ns.model("metadata", metada_params_model)
+
+product_list_fields = product_ns.model(
+    "ProductsList",
+    {
+        "metadata": fields.Nested(
+            metadata, description="Metada related to the result."
+        ),
+        "data": fields.List(
+            fields.Nested(product, skip_none=True), description="List of products."
+        ),
+    },
+)
+
+
+@product_ns.route("/")
+class ProductsList(Resource):  # type: ignore[misc]
+    @typed(product_ns.doc("list_products"))
+    @typed(product_ns.expect(parser))
+    @typed(product_ns.marshal_list_with(product_list_fields))
+    def get(self) -> Tuple[ResultType, int]:
+        """List all products."""
+        args = parser.parse_args()
+        page = args.pop("page", 1)  # 1-based page index
+        per_page = args.pop("per_page", 10)  # Number of records per page
+
+        # Enforce maximum per_page limit
+        if per_page > 100:
+            per_page = 100  # Adjust as needed for your use case
+
+        # Calculate the offset based on page and per_page
+        offset = (page - 1) * per_page
+
+        result: ResultType = {
+            "data": [],
+            "metadata": {
+                "count": 0,  # Total number of records matching the filters
+                "page": page,  # Current page number
+                "per_page": per_page,  # Number of records per page
+            },
+        }
+
+        query = Product.query
+
+        # Apply filters
+        if args.get("uuid"):
+            query = query.filter(Product.uuid == args["uuid"])
+        if args.get("name"):
+            query = query.filter(Product.name.ilike("%" + args["name"] + "%"))
+        if args.get("organization_id"):
+            query = query.filter(
+                Product.organizations.any(Organization.id == args["organization_id"])
+            )
+        if args.get("organization_uuid"):
+            query = query.filter(
+                Product.organizations.any(
+                    Organization.uuid == args["organization_uuid"]
+                )
+            )
+        if args.get("organization_name"):
+            query = query.filter(
+                Product.organizations.any(
+                    Organization.name.ilike("%" + args["organization_name"] + "%")
+                )
+            )
+
+        # Order the query by timestamp, descending
+        query = query.order_by(Product.updated_timestamp.desc())
+
+        # Get total record count
+        total = query.count()
+
+        # Apply pagination
+        results = query.offset(offset).limit(per_page).all()
+
+        # Populate the result
+        result["data"] = results
+        result["metadata"]["count"] = total
+
+        return result, 200

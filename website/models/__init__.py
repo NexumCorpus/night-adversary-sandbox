@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+from typing import Any
+
+import sqlalchemy_schemadisplay as sasd  # type: ignore[import-untyped]
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import class_mapper
+
+from .bundle import Bundle
+from .code import Code
+from .comment import Comment
+from .icon import Icon
+from .notification import Notification
+from .organization import CPEVendor, Organization
+from .product import CPEProduct, Product
+from .sighting import Sighting
+from .user import User
+from .language import Language
+from .license import License
+from .tag import Tag
+from .vulnerability_disclosure import VulnerabilityDisclosure
+from .comment_disclosure import CommentDisclosure
+from .kev_entry import KEVEntry, KEVExploitationStatus
+from .kev_evidence import KEVEvidence, KEVEvidenceType, VALID_SIGNALS
+
+__all__ = [
+    "User",
+    "Bundle",
+    "Comment",
+    "Sighting",
+    "Notification",
+    "Organization",
+    "CPEVendor",
+    "Product",
+    "CPEProduct",
+    "Code",
+    "Icon",
+    "Language",
+    "License",
+    "Tag",
+    "VulnerabilityDisclosure",
+    "CommentDisclosure",
+    "KEVEntry",
+    "KEVEvidence",
+    "KEVExploitationStatus",
+    "KEVEvidenceType",
+    "VALID_SIGNALS",
+]
+
+
+def get_db_info() -> dict[str, Any]:
+    return {
+        "users": User.query.count(),
+        "bundles": Bundle.query.count(),
+        "comments": Comment.query.count(),
+        "sightings": Sighting.query.count(),
+        "notifications": Notification.query.count(),
+        "organizations": Organization.query.count(),
+        "kev_entries": KEVEntry.query.count(),
+        "kev_evidence": KEVEvidence.query.count(),
+    }
+
+
+def db_init(db) -> None:  # type: ignore[no-untyped-def]
+    "Will create the database from conf parameters."
+    db.create_all()
+
+
+def db_create(db, db_config_dict, database_name: str) -> None:  # type: ignore[no-untyped-def]
+    db_conn_format = "postgresql+psycopg://{user}:{password}@{host}:{port}/{database}"
+    db_conn_uri_default = db_conn_format.format(database="postgres", **db_config_dict)
+    engine_default = create_engine(db_conn_uri_default)
+    conn = engine_default.connect()
+    conn.execute(text("COMMIT"))
+    conn.execute(text("CREATE DATABASE %s" % database_name))
+    conn.close()
+
+
+def get_or_create(session: Any, model: Any, **kwargs: str) -> Any:
+    instance = session.query(model).filter_by(**kwargs).first()
+    if instance:
+        return instance
+    else:
+        instance = model(**kwargs)
+        session.add(instance)
+        session.commit()
+        return instance
+
+
+def mappers(*args: Any) -> list[Any]:
+    return [class_mapper(x) for x in args]
+
+
+def generate_models_diagram(output_file_name: str = "model_diagram.png") -> None:
+    graph = sasd.create_uml_graph(
+        mappers(
+            User,
+            Bundle,
+            Comment,
+            Sighting,
+            Notification,
+            Organization,
+            CPEVendor,
+            Product,
+            CPEProduct,
+            Code,
+            Icon,
+            Language,
+            License,
+            Tag,
+            VulnerabilityDisclosure,
+            CommentDisclosure,
+            KEVEntry,
+            KEVEvidence,
+        ),
+        show_operations=False,
+        show_multiplicity_one=True,
+    )
+    graph.write_png(output_file_name)  # write out the file

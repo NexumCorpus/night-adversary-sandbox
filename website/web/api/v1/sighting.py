@@ -1,0 +1,465 @@
+import logging
+import uuid
+from datetime import datetime
+from typing import Any, Optional, Tuple, Union
+
+import dateutil  # type: ignore[import-untyped]
+import pytz  # type: ignore[import-untyped]
+from flask_login import current_user  # type: ignore[import-untyped]
+from flask_restx import (  # type: ignore[import-untyped]
+    Namespace,
+    Resource,
+    abort,
+    fields,
+    reqparse,
+)
+from flask_restx.inputs import date_from_iso8601  # type: ignore[import-untyped]
+from sqlalchemy import func
+
+from vulnerabilitylookup.default import get_config
+from website.models import Sighting
+
+# from website.validators import validate_json
+from website.web.api.v1.common import (
+    auth_func,
+    metada_params_model,
+    user_light_params_model,
+)
+from website.web.api.v1.types import ResultType
+from website.web.bootstrap import db, vulnerabilitylookup
+
+from .decorator_helpers import typed
+
+logger = logging.getLogger(__name__)
+
+sighting_ns = Namespace("sighting", description="Sighting related operations.")
+
+local_instance_uuid = get_config("generic", "local_instance_uuid").lower()
+
+# Argument Parsing
+parser = reqparse.RequestParser()
+parser.add_argument(
+    "page",
+    type=int,
+    default=1,
+    help="Number of the page.",
+)
+parser.add_argument(
+    "per_page",
+    type=int,
+    default=1000,
+    help="Maximum number of elements to return.",
+)
+parser.add_argument("uuid", type=str, help="UUID of the sighting.")
+parser.add_argument(
+    "type",
+    type=str,
+    choices=(
+        "seen",
+        "published-proof-of-concept",
+        "exploited",
+        "not-exploited",
+        "confirmed",
+        "not-confirmed",
+        "patched",
+        "not-patched",
+    ),
+    help="""Type of sightings:
+     - Seen: The vulnerability was mentioned, discussed, or seen somewhere by the user.
+     - Published Proof of Concept: A public proof of concept is available for this vulnerability.
+     - Exploited: This vulnerability was exploited and seen by the user reporting the sighting.
+     - Not exploited: This vulnerability was not exploited or seen by the user reporting the sighting.
+     - Confirmed: The vulnerability is confirmed from an analyst perspective.
+     - Not confirmed: The user expresses doubt about the veracity of the vulnerability.
+     - Patched: This vulnerability was successfully patched by the user reporting the sighting.
+     - Not patched: This vulnerability was not successfully patched by the user reporting the sighting.""",
+)
+parser.add_argument(
+    "vuln_id",
+    type=str,
+    required=False,
+    help="Vulnerability related to the sighting.",
+)
+parser.add_argument(
+    "author",
+    type=str,
+    required=False,
+    help="Author of the sighting (login).",
+)
+parser.add_argument(
+    "date_from",
+    type=date_from_iso8601,
+    required=False,
+    help="The date of the sightings must be bigger or equal than this value. Format: YYYY-MM-DD",
+)
+parser.add_argument(
+    "date_to",
+    type=date_from_iso8601,
+    required=False,
+    help="The date of the sightings must be smaller or equal than this value. Format: YYYY-MM-DD",
+)
+parser.add_argument(
+    "source",
+    type=str,
+    required=False,
+    help="Source of the sighting.",
+)
+parser.add_argument(
+    "advisory_status",
+    type=str,
+    required=False,
+    choices=["unpublished"],
+    # choices=["published", "unpublished", "discarded", "draft"],
+    help="Filter sightings by the status of the related advisory.",
+)
+
+
+# Dedicated parser for deleting sightings
+delete_parser = reqparse.RequestParser()
+delete_parser.add_argument(
+    "author",
+    type=str,
+    required=False,
+    help="Author of the sightings to delete (login). Only the author themselves or an admin can delete.",
+)
+delete_parser.add_argument(
+    "source",
+    type=str,
+    required=False,
+    help="Source of the sightings (supports partial match using ilike).",
+)
+delete_parser.add_argument(
+    "date_from",
+    type=date_from_iso8601,
+    required=False,
+    help="Delete sightings from this date (inclusive). Format: YYYY-MM-DD.",
+)
+delete_parser.add_argument(
+    "date_to",
+    type=date_from_iso8601,
+    required=False,
+    help="Delete sightings up to this date (inclusive). Format: YYYY-MM-DD.",
+)
+
+
+# Response marshalling
+sighting_params_model = {
+    "uuid": fields.String(description="Sighting UUID.", readonly=True),
+    # "vulnerability_lookup_origin": fields.String(
+    #     description="UUID of the Vulnerability-Lookup origin instance.",
+    #     readonly=True,
+    #     default=local_instance_uuid,
+    # ),
+    "creation_timestamp": fields.DateTime(description="Creation time of the sighting."),
+    "type": fields.String(description="Type of the sighting."),
+    "source": fields.String(
+        description="The source of the sighting (Fediverse status URI, link, tool, etc.)."
+    ),
+    "vulnerability": fields.String(description="Vulnerability id."),
+}
+sighting = sighting_ns.model("Sighting", sighting_params_model)
+metadata = sighting_ns.model("metadata", metada_params_model)
+
+sighting["author"] = fields.Nested(
+    sighting_ns.model("User", user_light_params_model), readonly=True
+)
+
+sighting_list_fields = sighting_ns.model(
+    "SightingsList",
+    {
+        "metadata": fields.Nested(
+            metadata, description="Metadata related to the result."
+        ),
+        "data": fields.List(
+            fields.Nested(sighting, skip_none=True), description="List of sightings."
+        ),
+    },
+)
+
+
+def normalize_timestamp(ts: Optional[Union[str, datetime]]) -> datetime:
+    """Convert a timestamp (str or datetime) to a UTC datetime object."""
+    dt: datetime
+
+    if isinstance(ts, str):
+        dt = dateutil.parser.isoparse(ts)
+    elif isinstance(ts, datetime):
+        dt = ts
+    else:
+        dt = datetime.now(pytz.UTC)
+
+    # Convert to UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=pytz.UTC)
+    else:
+        dt = dt.astimezone(pytz.UTC)
+
+    return dt
+
+
+def is_duplicate_sighting(sighting: dict[str, Any]) -> bool:
+    """
+    Check if a sighting already exists for the same vulnerability, source, and UTC day.
+    Returns True if a duplicate exists.
+    """
+    # Normalize timestamp
+    ts = normalize_timestamp(sighting.get("creation_timestamp"))
+    sighting["creation_timestamp"] = ts.isoformat()
+    sighting_date = ts.date()
+
+    # Normalize vulnerability string (strip only, keep ilike for case-insensitive DB matching)
+    vuln = sighting.get("vulnerability", "").strip()
+    source = sighting.get("source")
+
+    if not vuln or not source:
+        return False  # Cannot check duplicates without these
+
+    # Check duplicates in DB
+    duplicate_exists = Sighting.query.filter(
+        Sighting.vulnerability.ilike(vuln),
+        Sighting.source == source,
+        func.date(func.timezone("UTC", Sighting.creation_timestamp)) == sighting_date,
+    ).count()
+
+    return duplicate_exists != 0
+
+
+@sighting_ns.route("/<uuid:sighting_uuid>")
+class SightingItem(Resource):  # type: ignore[misc]
+    @typed(sighting_ns.doc(description="Get a sighting with its UUID."))
+    @typed(sighting_ns.doc(responses={200: "Success.", 404: "Sighting not found."}))
+    @typed(sighting_ns.marshal_with(sighting, skip_none=True))
+    def get(self, sighting_uuid: str) -> Tuple[dict[Any, Any], int]:
+        result = Sighting.query.filter(Sighting.uuid == sighting_uuid).first()
+        if not result:
+            return abort(404, "Sighting not found.")
+        return result, 200
+
+    @typed(sighting_ns.doc(description="Delete a single sighting by its UUID."))
+    @typed(
+        sighting_ns.doc(
+            responses={
+                200: "Sighting deleted successfully.",
+                403: "Not allowed to delete this sighting.",
+                404: "Sighting not found.",
+            }
+        )
+    )
+    @typed(auth_func)
+    def delete(self, sighting_uuid: str) -> Tuple[dict[str, Any], int]:
+        """Delete a single sighting by UUID."""
+        sighting = Sighting.query.filter(Sighting.uuid == sighting_uuid).first()
+        if not sighting:
+            return abort(404, "Sighting not found.")
+
+        # Check permissions
+        if sighting.author_id != current_user.id and not current_user.is_admin:
+            return abort(403, "You are not allowed to delete this sighting.")
+
+        db.session.delete(sighting)
+        db.session.commit()
+        return {"message": "Sighting deleted successfully.", "uuid": sighting_uuid}, 200
+
+
+@sighting_ns.route("")
+@sighting_ns.route("/")
+class SightingsList(Resource):  # type: ignore[misc]
+    @typed(sighting_ns.doc("list_sightings"))
+    @typed(sighting_ns.expect(parser))
+    @typed(sighting_ns.marshal_list_with(sighting_list_fields))
+    def get(self) -> Tuple[ResultType, int]:
+        """List all sightings."""
+        args = parser.parse_args()
+        page = args.pop("page", 1)  # 1-based page index
+        per_page = args.pop("per_page", 1000)  # Number of records per page
+
+        if per_page > 1000:
+            per_page = 1000
+
+        if advisory_status := args.get("advisory_status"):
+            # For performance reasons in this case the limit of results per page is set to 100
+            if per_page > 100:
+                per_page = 100
+
+        offset = (page - 1) * per_page
+
+        result: ResultType = {
+            "data": [],
+            "metadata": {
+                "count": 0,  # Total number of records matching the filters
+                "page": page,
+                "per_page": per_page,
+            },
+        }
+
+        query = Sighting.query
+
+        # Apply SQL filters
+        if args.get("uuid"):
+            query = query.filter(Sighting.uuid == args["uuid"])
+        if args.get("author"):
+            query = query.filter(Sighting.author.has(login=args["author"]))
+        if args.get("source"):
+            query = query.filter(Sighting.source == args["source"])
+        if args.get("vuln_id"):
+            query = query.filter(Sighting.vulnerability.ilike(args["vuln_id"]))
+        if args.get("type"):
+            query = query.filter(Sighting.type == args["type"])
+        if args.get("date_from"):
+            query = query.filter(
+                func.date(Sighting.creation_timestamp) >= args["date_from"]
+            )
+        if args.get("date_to"):
+            query = query.filter(
+                func.date(Sighting.creation_timestamp) <= args["date_to"]
+            )
+
+        # Order by creation timestamp descending
+        query = query.order_by(Sighting.creation_timestamp.desc())
+
+        if advisory_status:
+            # Python-side filtering for advisory_status in KVrocks
+            filtered_results: list[dict[str, Any] | None] = []
+            chunk_size = 1000
+            offset_cursor = 0
+
+            while len(filtered_results) < offset + per_page:
+                chunk = query.offset(offset_cursor).limit(chunk_size).all()
+                if not chunk:
+                    break
+                offset_cursor += len(chunk)
+
+                # Filter chunk in Python
+                chunk = [
+                    s
+                    for s in chunk
+                    if not vulnerabilitylookup.get_vulnerability(s.vulnerability)
+                ]
+                filtered_results.extend(chunk)
+
+            total_count = len(filtered_results)
+            paginated_results = filtered_results[offset : offset + per_page]
+
+        else:
+            # No advisory_status filter → SQL pagination
+            total_count = query.count()
+            paginated_results = query.offset(offset).limit(per_page).all()
+
+        result["data"] = paginated_results
+        result["metadata"]["count"] = total_count
+
+        return result, 200
+
+    @typed(sighting_ns.doc(description="Create a new sighting."))
+    @typed(
+        sighting_ns.doc(
+            responses={
+                201: "Success.",
+                400: "Incorrect payload to instantiate a sighting.",
+                409: "Duplicate sighting.",
+            }
+        )
+    )
+    @typed(sighting_ns.expect(sighting))
+    @typed(sighting_ns.marshal_list_with(sighting_list_fields, code=201))
+    @typed(auth_func)
+    def post(self) -> Tuple[ResultType, int]:
+        """Create a new sighting."""
+        result: ResultType = {
+            "data": [],
+            "metadata": {
+                "count": 0,
+                "page": 0,
+                "per_page": 10,
+            },
+        }
+
+        sighting = sighting_ns.payload
+        sighting["uuid"] = sighting.get("uuid", str(uuid.uuid4()))
+        sighting["vulnerability_lookup_origin"] = local_instance_uuid
+
+        if is_duplicate_sighting(sighting):
+            return abort(409, message="Duplicate sighting.")
+
+        # Validate the JSON payload
+        # try:
+        #     validate_json(sighting, "sighting")
+        # except Exception:
+        #     logger.warning("JSON validation failed.")
+        #     return abort(400, "JSON validation failed.")
+
+        obj = Sighting.query.filter(Sighting.uuid == sighting["uuid"]).first()
+        if obj:
+            return abort(400, "It is not possible to update a sighting.")
+        else:
+            # creation of a new sighting
+            try:
+                new_sighting = Sighting(**sighting, author_id=current_user.id)
+                db.session.add(new_sighting)
+                result["data"] = new_sighting
+                result["metadata"]["count"] = 1
+            except Exception:
+                db.session.rollback()
+                return abort(400, "Sighting creation failed.")
+
+        db.session.commit()
+        return result, 201
+
+    @typed(
+        sighting_ns.doc(
+            description="Delete sightings by filters (author, source, date). At least one filter must be specified."
+        )
+    )
+    @typed(sighting_ns.expect(delete_parser))
+    @typed(
+        sighting_ns.doc(
+            responses={
+                200: "Deleted sightings successfully.",
+                403: "Not allowed to delete these sightings.",
+                404: "No sightings matched the filters.",
+            }
+        )
+    )
+    @typed(auth_func)
+    def delete(self) -> Tuple[dict[str, Any], int]:
+        """Delete sightings by filters (author, source, date). At least one filter must be specified."""
+        args = delete_parser.parse_args(strict=True)
+        if not any(v is not None for v in args.values()):
+            abort(400, "At least one filter argument must be provided.")
+
+        query = Sighting.query
+
+        # Enforce author filter / permissions
+        author = args.get("author")
+        if current_user.is_admin:
+            # Admins can delete any author's sightings
+            if author:
+                query = query.filter(Sighting.author.has(login=author))
+        else:
+            # Non-admins: force restriction to their own sightings
+            if author and author != current_user.login:
+                return abort(
+                    403, "You are not allowed to delete other users' sightings."
+                )
+            query = query.filter(Sighting.author_id == current_user.id)
+
+        # Source filter (regex with ilike)
+        if source := args.get("source"):
+            query = query.filter(Sighting.source.ilike(f"%{source}%"))
+
+        # Date range filter
+        if date_from := args.get("date_from"):
+            query = query.filter(Sighting.creation_timestamp >= date_from)
+        if date_to := args.get("date_to"):
+            query = query.filter(Sighting.creation_timestamp <= date_to)
+
+        # Count sightings to be deleted
+        count = query.count()
+        if count == 0:
+            return {"message": "No sightings matched the filters."}, 404
+
+        # Delete in bulk
+        query.delete(synchronize_session=False)
+        db.session.commit()
+
+        return {"message": f"Deleted {count} sighting(s).", "deleted_count": count}, 200

@@ -1,0 +1,95 @@
+import json
+import uuid
+from typing import Any
+
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import validates
+
+from website.lib.sanitizers import sanitize_html_fragment, sanitize_text
+from website.web.bootstrap import db
+
+
+class Comment(db.Model):  # type: ignore[name-defined, misc]
+    """Represent a comment related to a security advisory (vulnerability)."""
+
+    uuid = db.Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    vulnerability_lookup_origin = db.Column(UUID(as_uuid=True), nullable=False)
+    creation_timestamp = db.Column(
+        db.DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    timestamp = db.Column(
+        db.DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+    title = db.Column(db.String(), nullable=False)
+    description = db.Column(db.String(), nullable=False)
+    description_format = db.Column(db.String(), default="markdown")
+    vulnerability = db.Column(db.String(), nullable=False)
+    related_vulnerabilities = db.Column(JSONB, default=[])
+    meta = db.Column(JSONB, default={})
+
+    is_published = db.Column(db.Boolean(), default=True)
+
+    # foreign keys
+    author_id = db.Column(db.Integer(), db.ForeignKey("user.id"), nullable=False)
+
+    @validates("title")
+    def validates_title(self, key: str, value: str) -> str:
+        assert 3 <= len(value) <= 256, AssertionError("Maximum length for title: 256")
+        value = value.strip()
+        cleaned = sanitize_text(value)
+        return cleaned
+
+    @validates("description_format")
+    def validates_description_format(self, key: str, value: str) -> str:
+        assert value.lower() in ["markdown", "text"], AssertionError(
+            "value must be 'markdown' or 'text'."
+        )
+        return value.lower()
+
+    @validates("description")
+    def validates_description(self, key: str, value: str) -> str:
+        """
+        Sanitize description at storage time:
+         - if description_format == 'text' -> treat as plain text: strip tags and escape
+         - if description_format == 'markdown' -> strip unsafe HTML but keep a safe subset
+        """
+        # Note: SQLAlchemy validators receive the *raw* value but may not see description_format
+        # yet depending on order of attribute assignments. To be safe, we check self.description_format,
+        # but fall back to 'markdown' if unknown.
+        fmt = getattr(self, "description_format", None) or "markdown"
+        value = value or ""
+        value = value.strip()
+
+        if fmt == "text":
+            return sanitize_text(value)
+        else:
+            # markdown: allow markdown syntax but remove unsafe embedded HTML.
+            cleaned = sanitize_html_fragment(value)
+            # Optionally, also linkify safe URLs:
+            # cleaned = bleach.linkify(cleaned)
+            return cleaned
+
+    def as_json(self) -> str:
+        return json.dumps(
+            {
+                "uuid": str(self.uuid),
+                "vulnerability_lookup_origin": str(self.vulnerability_lookup_origin),
+                "author": str(self.author.uuid),
+                "title": self.title,
+                "description": self.description,
+                "description_format": self.description_format,
+                "creation_timestamp": self.creation_timestamp.strftime(
+                    "%Y-%m-%dT%H:%M:%S.%fZ"
+                ),
+                "timestamp": self.timestamp.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                "related_vulnerabilities": self.related_vulnerabilities,
+                "meta": self.meta,
+            }
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return json.loads(self.as_json())

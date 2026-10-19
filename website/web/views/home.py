@@ -1,0 +1,698 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import logging
+import logging.config
+import os
+import sys
+from datetime import timezone
+from itertools import islice
+from typing import Any
+from urllib.parse import quote_plus
+
+from dateutil import parser  # type: ignore[import-untyped]
+from feedgen.feed import FeedGenerator  # type: ignore[import-untyped]
+from flask import (
+    Blueprint,
+    Response,
+    flash,
+    redirect,
+    render_template,
+    request,
+    send_from_directory,
+    url_for,
+)
+from flask_paginate import get_page_args  # type: ignore[import-untyped]
+from markupsafe import Markup, escape
+from sqlalchemy import String, cast, func
+from werkzeug import Response as WerkzeugResponse
+
+from vulnerabilitylookup import __version__
+from vulnerabilitylookup.default import get_config
+from website.decorators import convert_gcve0_to_cve_param
+from website.lib.gcve_utils import get_by_id, verify_gna_public_domain
+from website.lib.utils import inject_xslt
+from website.models import (
+    Bundle,
+    Comment,
+    KEVEntry,
+    Organization,
+    Sighting,
+    get_db_info,
+)
+from website.web.bootstrap import application, vulnerabilitylookup
+
+logging.config.dictConfig(get_config("logging"))
+
+
+home_bp = Blueprint("home_bp", __name__, url_prefix="/")
+
+local_instance_name = get_config("generic", "local_instance_name").lower()
+
+
+@application.errorhandler(404)
+def page_not_found(error: Any) -> tuple[str, int]:
+    return render_template("errors/404.html"), 404
+
+
+@application.errorhandler(500)
+def internal_server_error_500(error: Any) -> tuple[str, int]:
+    return render_template("errors/500.html"), 500
+
+
+@application.errorhandler(503)
+def internal_server_error_503(error: Any) -> tuple[str, int]:
+    return render_template("errors/503.html"), 503
+
+
+@application.route("/public/<path:filename>", methods=["GET"])
+def uploaded_pictures(filename: str) -> WerkzeugResponse:
+    """
+    Exposes public files (media uploaded by users, etc.).
+    """
+    return send_from_directory(
+        os.path.abspath(application.config["UPLOAD_FOLDER"]), filename
+    )
+
+
+@home_bp.route("/", methods=["GET"])
+def index() -> str | WerkzeugResponse:
+    """Returns the index page."""
+    return render_template("index.html")
+
+
+@home_bp.route("/search", methods=["GET", "HEAD"])
+def search() -> str | WerkzeugResponse:
+    if request.method == "HEAD":
+        return "Ack"
+
+    # --- Helpers ---------------------------------------------------------
+    def sanitize(value: str | None, n: int = 256) -> str:
+        return (value or "").strip()[:n]
+
+    def parse_pagination() -> tuple[int, int]:
+        try:
+            page = max(1, int(request.args.get("page", 1)))
+        except Exception:
+            page = 1
+        try:
+            page_size = max(1, min(int(request.args.get("page_size", 30)), 100))
+        except Exception:
+            page_size = 30
+        return page, page_size
+
+    def parse_sorting() -> tuple[str, str]:
+        date_sort = sanitize(request.args.get("date_sort"), 32)
+        if date_sort not in ("published", "updated"):
+            date_sort = "published"
+
+        sort_order = sanitize(request.args.get("sort_order"), 32)
+        if sort_order not in ("asc", "desc"):
+            sort_order = "desc"
+        return date_sort, sort_order
+
+    def get_all_sources() -> list[tuple[str, str]]:
+        base = [
+            ("CVE Program", "cvelistv5"),
+            ("NVD", "nvd"),
+            ("FKIE NVD", "fkie_nvd"),
+            ("CERT-FR Alerte", "certfr_alerte"),
+            ("CERT-FR Avis", "certfr_avis"),
+            ("VARIoT", "variot"),
+            ("JVNDB", "jvndb"),
+        ]
+        # Add GNA orgs from DB
+        gnas = [
+            (f"{o.short_name} (GNA-{o.gna_id})", f"gna-{o.gna_id}")
+            for o in Organization.query.filter(
+                Organization.gcve_pull == True  # noqa: E712
+            ).all()
+        ]
+        base.extend(gnas)
+
+        # Current instance GNA
+        if "gna-" in local_instance_name.lower():
+            try:
+                gna_id = int(local_instance_name.split("-", 1)[1])
+                gcve = get_by_id(gna_id)
+                if gcve:
+                    base.append(
+                        (f"{gcve['short_name']} (GNA-{gna_id})", f"gna-{gna_id}")
+                    )
+            except Exception:
+                pass
+
+        return base
+
+    def template(**kwargs: Any) -> str:
+        """Centralize template rendering with common arguments."""
+        return render_template(
+            "search.html",
+            available_sources=available_sources,
+            vulnerability_assigners=vulnerability_assigners,
+            **kwargs,
+        )
+
+    # --- Parse arguments -------------------------------------------------
+    search_query = sanitize(request.args.get("q"))
+    vendor_arg = sanitize(request.args.get("vendor"), 128)
+    product = sanitize(request.args.get("product"), 128)
+    assigner = sanitize(request.args.get("assigner"), 128)
+
+    date_sort, sort_order = parse_sorting()
+    page, page_size = parse_pagination()
+
+    available_sources = get_all_sources()
+    available_source_ids = [s[1] for s in available_sources]
+
+    # Filters: sources
+    sort_sources = request.args.getlist("sort_sources[]")
+    sort_sources = [s for s in sort_sources if s in available_source_ids]
+
+    vulnerability_assigners = vulnerabilitylookup.get_assigners()
+
+    # --- Query interpretation --------------------------------------------
+    vendor = None
+
+    if search_query:
+        # 1 — Direct vulnerability match
+        if vulnerabilitylookup.get_vulnerability(search_query):
+            return redirect(
+                url_for("home_bp.vulnerability_view", vulnerability_id=search_query)
+            )
+
+        # 2 — Linked vulnerabilities
+        linked = vulnerabilitylookup.get_linked_vulnerabilities(search_query)
+        if linked:
+            flash(
+                f"Nothing found for {search_query}. Displaying related vulnerabilities.",
+                "warning",
+            )
+            return template(vulnerability_id=search_query, linked_vulns=linked)
+
+        # 3 — Vendor via query
+        if search_query.lower() in vulnerabilitylookup.get_vendors():
+            vendor = search_query
+
+    # vendor= argument always overrides
+    if vendor_arg:
+        vendor = vendor_arg
+
+    # Assigners-only search (no vendor/product)
+    if assigner and not vendor and not product:
+        vulns = vulnerabilitylookup.get_assigner_vulnerabilities(
+            assigner=assigner,
+            sources=["cvelistv5"],
+            date_sort=date_sort,
+            order=sort_order,
+            number=page_size,
+            page=page,
+        )
+        return template(
+            vendor="",
+            product="",
+            assigner=assigner,
+            vp_vulnerabilities=vulns.get("results", {}),
+            total_count=vulns["total_count"],
+            page=vulns["page"],
+            page_size=vulns["page_size"],
+            date_sort=date_sort,
+            sort_order=sort_order,
+            sort_sources=sort_sources,
+        )
+
+    # --- Vendor / Product search ----------------------------------------
+    if vendor:
+        known_vendors = vulnerabilitylookup.get_vendors()
+
+        # If product is specified
+        if product:
+            # Default: all sources
+            if not sort_sources:
+                sort_sources = available_source_ids
+
+            vulns = vulnerabilitylookup.get_vendor_product_vulnerabilities(
+                vendor,
+                product,
+                assigner,
+                sort_sources,
+                date_sort,
+                sort_order,
+                number=page_size,
+                page=page,
+            )
+            return template(
+                vendor=vendor,
+                product=product,
+                assigner=assigner,
+                vp_vulnerabilities=vulns["results"],
+                total_count=vulns["total_count"],
+                page=vulns["page"],
+                page_size=vulns["page_size"],
+                date_sort=date_sort,
+                sort_order=sort_order,
+                sort_sources=sort_sources,
+            )
+
+        # Vendor-only (no product)
+        if vendor.lower() in known_vendors:
+            if not sort_sources:
+                sort_sources = ["cvelistv5"]
+
+            vendor_products = vulnerabilitylookup.get_vendor_products(vendor)
+            vulns = vulnerabilitylookup.get_vendor_vulnerabilities(
+                vendor,
+                assigner,
+                sort_sources,
+                date_sort,
+                sort_order,
+                number=page_size,
+                page=page,
+            )
+            return template(
+                vendor=vendor,
+                vendor_products=vendor_products,
+                assigner=assigner,
+                vp_vulnerabilities=vulns["results"],
+                total_count=vulns["total_count"],
+                page=vulns["page"],
+                page_size=vulns["page_size"],
+                date_sort=date_sort,
+                sort_order=sort_order,
+                sort_sources=sort_sources,
+            )
+        else:
+            flash(f"Nothing found in the database for {vendor}.", "warning")
+
+    # Default: empty search page
+    return template()
+
+
+@home_bp.route("/recent", methods=["GET"])
+@home_bp.route("/recent/<int:page>", methods=["GET"])
+def recent(page: int = 1) -> str:
+    """The /recent page displays the most recent entries by source.
+    The list of sources is composed of:
+    - the sources defined in the configuration file
+    - optionally the source corresponding to the local instance
+    - a list of GNA organizations.
+    """
+    default_source = "cvelistv5"
+    date_sort = request.args.get("date_sort", "updated")
+    sort_order = request.args.get("sort_order", "desc")
+
+    sources_to_show = application.config.get("SOURCES_TO_SHOW", {})
+    try:
+        sources_to_show = {key: value["name"] for key, value in sources_to_show.items()}
+    except TypeError:
+        # compatibility
+        pass
+
+    gnas = Organization.query.filter(Organization.gcve_pull == True).all()  # noqa: E712
+    for gna in gnas:
+        sources_to_show.update(
+            {
+                f"gna-{gna.gna_id}": gna.short_name,
+            }
+        )
+
+    recent = {
+        source: vulnerabilitylookup.get_last(
+            source=source, date_sort=date_sort, order=sort_order, page=page
+        )
+        for source in sources_to_show
+    }
+
+    try:
+        p = int(page)
+        if p < 1:
+            page = 1
+    except ValueError:
+        page = 1
+
+    return render_template(
+        "recent.html",
+        recent=recent,
+        default_source=default_source,
+        date_sort=date_sort,
+        sort_order=sort_order,
+        current_page=page,
+        local_instance_name=local_instance_name,
+        sources_to_show=sources_to_show,
+    )
+
+
+@home_bp.route("/cve/<string:vulnerability_id>", methods=["GET"])
+@home_bp.route("/vuln/<string:vulnerability_id>", methods=["GET"])
+@convert_gcve0_to_cve_param("vulnerability_id")
+def vulnerability_view(vulnerability_id: str) -> str | WerkzeugResponse:
+    linked_vulns = vulnerabilitylookup.get_linked_vulnerabilities(vulnerability_id)
+    nb_linked_vulns = sum(len(linked_vulns[source]) for source in linked_vulns)
+    nb_comments = Comment.query.filter(
+        Comment.vulnerability.ilike(vulnerability_id)
+    ).count()
+    nb_bundles = Bundle.query.filter(
+        func.lower(cast(Bundle.related_vulnerabilities, String)).contains(
+            vulnerability_id.lower()
+        )
+    ).count()
+    nb_sightings = Sighting.query.filter(
+        Sighting.vulnerability.ilike(vulnerability_id)
+    ).count()
+
+    # Get KEV catalog entries dynamically from GCVE references
+    gcve_references = application.config.get("GCVE_REFERENCES", {})
+    kev_catalogs_list = gcve_references.get("kev", [])
+    kev_catalog_entries = []
+
+    for catalog in kev_catalogs_list:
+        kev_entry = KEVEntry.query.filter(
+            KEVEntry.vuln_id == vulnerability_id,
+            KEVEntry.vulnerability_lookup_origin == catalog["uuid"],
+        ).first()
+
+        if kev_entry:
+            # Generate tab_id from short_name (slugify: lowercase, replace spaces with hyphens)
+            tab_id = (
+                catalog.get("short_name", "")
+                .lower()
+                .replace(" ", "-")
+                .replace("_", "-")
+            )
+            # Add tab_id to catalog for template use
+            catalog_with_tab = {**catalog, "tab_id": tab_id}
+
+            kev_catalog_entries.append(
+                {
+                    "catalog": catalog_with_tab,
+                    "entry": kev_entry,
+                }
+            )
+
+    if vulnerability := vulnerabilitylookup.get_vulnerability(
+        vulnerability_id, with_meta=True
+    ):
+        source = vulnerabilitylookup.get_vulnerability_source(vulnerability_id)
+        return render_template(
+            "vuln.html",
+            source=source,
+            local_instance_name=local_instance_name,
+            vulnerability_id=vulnerability_id,
+            vulnerability_data=vulnerability,
+            linked_vulns=linked_vulns,
+            nb_linked_vulns=nb_linked_vulns,
+            nb_comments=nb_comments,
+            nb_bundles=nb_bundles,
+            nb_sightings=nb_sightings,
+            kev_catalog_entries=kev_catalog_entries,
+        )
+
+    # Escape for HTML
+    safe_vid = escape(vulnerability_id)  # markupsafe.escape -> safe HTML string
+
+    message = Markup(f"Nothing found in the database for {safe_vid}.")
+
+    # If there are sightings that mention this id, append a safe link.
+    if Sighting.query.filter(
+        Sighting.vulnerability.ilike(f"%{vulnerability_id}%")
+    ).count():
+        # URL-encode the query parameter
+        q = quote_plus(vulnerability_id)
+        # Only this small anchor is intentionally marked as safe HTML
+        link = Markup(
+            f" This vulnerability is referenced by <a href='/sightings?query={q}'>sightings</a>."
+        )
+        message = message + link
+
+        flash(message, "warning")
+        return render_template(
+            "vuln.html",
+            source="",
+            local_instance_name=local_instance_name,
+            vulnerability_id=vulnerability_id,
+            vulnerability_data={},
+            linked_vulns=[],
+            nb_linked_vulns=0,
+            nb_comments=nb_comments,
+            nb_bundles=nb_bundles,
+            nb_sightings=nb_sightings,
+        )
+
+    return redirect(url_for("home_bp.search", q=safe_vid))
+
+
+@home_bp.route("/recent/<string:source>.<string:format>", methods=["GET"])
+def feed_recent(
+    per_page: int = 10, format: str = "atom", source: str = "all"
+) -> Response:
+    """RSS/ATOM feed for recent vulnerabilities per source or all sources."""
+    public_domain = get_config("generic", "public_domain")
+    vulnerability = request.args.get("vulnerability", "")
+    vendor = request.args.get("vendor", "")
+
+    page, per_page, _ = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    per_page = min(per_page, application.config.get("FEED_MAX_PER_PAGE", 50))
+
+    # Initialize feed
+    fg = FeedGenerator()
+    fg.id(f"https://{public_domain}/rss/recent/{source}/{per_page}")
+    fg.title(f"Most recent entries from {source}")
+    fg.author(
+        {
+            "name": "Vulnerability-Lookup",
+            "email": application.config.get("ADMIN_EMAIL", ""),
+        }
+    )
+    fg.link(href=f"https://{public_domain}", rel="alternate")
+    fg.subtitle(f"Contains only the most {per_page} recent entries.")
+    fg.language("en")
+
+    if source == "all":
+        source = ""
+        sources = []
+    else:
+        sources = [source]
+
+    # Fetch vulnerabilities
+    if vulnerability:
+        vulnerabilities = [
+            vulns[0]
+            for _, vulns in vulnerabilitylookup.get_linked_vulnerabilities(
+                vulnerability
+            ).items()
+        ]
+    elif vendor:
+        vendor_vulns = vulnerabilitylookup.get_vendor_vulnerabilities(
+            vendor, "", sources, "published", "desc", per_page, page
+        )
+        vulnerabilities = [
+            (vuln_id, vuln)
+            for source_vulns in vendor_vulns.get("results", {}).values()
+            for vuln_id, vuln in source_vulns
+        ]
+    else:
+        vulnerabilities = vulnerabilitylookup.get_last(
+            source, "published", "desc", number=per_page, page=page
+        )
+
+    # Add entries to feed
+    for vuln_id, entry in vulnerabilities:
+        fe = fg.add_entry()
+        fe.id(f"https://{public_domain}/vuln/{vuln_id}")
+        fe.title(vuln_id)
+        fe.link(href=f"https://{public_domain}/vuln/{vuln_id}")
+
+        # Content / description
+        if source in ["github"]:
+            fe.content(entry.get("summary", ""))
+            fe.summary(entry.get("summary", ""))
+        elif source in ["pysec", "ossf_malicious_packages"]:
+            fe.content(entry.get("details", ""))
+            fe.description(entry.get("details", ""))
+            fe.summary(entry.get("details", ""))
+        elif source == "cvelistv5":
+            fe.content(entry.get("containers", {}).get("cna", {}).get("title", ""))
+            fe.description(entry.get("containers", {}).get("cna", {}).get("title", ""))
+
+        # Set published / updated date (uniform handling)
+        pub_date_str = None
+        if source in ["cvelistv5", "fkie_nvd", "nvd"] or "gna-" in source:
+            pub_date_str = entry.get("cveMetadata", {}).get("datePublished")
+        elif source == "github":
+            pub_date_str = entry.get("published")
+
+        if pub_date_str:
+            try:
+                dt = (
+                    parser.isoparse(pub_date_str)
+                    if isinstance(pub_date_str, str)
+                    else pub_date_str
+                )
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                fe.published(dt)
+                fe.updated(dt)
+            except Exception:
+                # fallback: ignore invalid date formats
+                pass
+
+        fe.description()  # required by feedgen
+
+    # Generate feed with XSLT
+    feed_bytes = inject_xslt(
+        fg.atom_str(pretty=True) if format == "atom" else fg.rss_str(pretty=True)
+    )
+    return Response(feed_bytes, mimetype="application/xml")
+
+
+@home_bp.route("/known-exploited-vulnerabilities.<string:format>", methods=["GET"])
+def feed_kev(per_page: int = 10, format: str = "atom", source: str = "all") -> Response:
+    """RSS/ATOM feed for the Known Exploited Vulnerabilities."""
+    public_domain = get_config("generic", "public_domain")
+
+    page, per_page, _ = get_page_args(
+        page_parameter="page", per_page_parameter="per_page"
+    )
+    feed_max_per_page = 3000
+    if per_page > feed_max_per_page:
+        per_page = feed_max_per_page
+
+    fg = FeedGenerator()
+    fg.id(f"https://{public_domain}/rss/recent/{source}/{per_page}")
+    fg.title(
+        f"Most {feed_max_per_page} recent entries from Known Exploited Vulnerabilities."
+    )
+    fg.author(
+        {
+            "name": "Vulnerability-Lookup",
+            "email": application.config.get("ADMIN_EMAIL", ""),
+        }
+    )
+    fg.link(href=f"https://{public_domain}", rel="alternate")
+    # fg.logo('http://ex.com/logo.jpg')
+    fg.subtitle(
+        f"Contains only the most {feed_max_per_page} recent entries for Known Exploited Vulnerabilities."
+    )
+    fg.language("en")
+
+    for item in vulnerabilitylookup.get_all_entries_from_cisa_known_exploited(
+        per_page, page
+    ):
+        fe = fg.add_entry()
+        fe.id(f"https://{public_domain}/vuln/{item['cveID']}")
+        fe.title(f"{item['cveID']} - {item['vulnerabilityName']}")
+        fe.link(href=f"https://{public_domain}/vuln/{item['cveID']}")
+        fe.content(item["shortDescription"])
+        fe.description(item["shortDescription"])
+
+        try:
+            dt = parser.isoparse(item["dateAdded"]).astimezone(timezone.utc)
+            fe.published(dt)
+            fe.updated(dt)  # Optional but good for Atom consumers
+        except Exception:
+            pass
+
+    if format == "atom":
+        feed_data = fg.atom_str(pretty=True)
+        mime_type = "application/atom+xml"
+    else:
+        feed_data = fg.rss_str(pretty=True)
+        mime_type = "application/rss+xml"
+
+    return Response(feed_data, mimetype=mime_type)
+
+
+@home_bp.route("/about", methods=["GET"])
+def about() -> str:
+    """About page."""
+    storage_info = vulnerabilitylookup.get_info()
+
+    try:
+        is_gna = verify_gna_public_domain()
+        gna_id = get_config("generic", "local_instance_name")
+    except Exception:
+        is_gna = False
+        gna_id = -1
+
+    vuln_sources = application.config.get("SOURCES_TO_SHOW", {})
+    gnas = Organization.query.filter(Organization.gcve_pull == True).all()  # noqa: E712
+    for gna in gnas:
+        vuln_sources.update(
+            {
+                f"gna-{gna.gna_id}": {
+                    "name": f"GNA-{gna.gna_id} ({gna.short_name})",
+                    "url": gna.website,
+                },
+            }
+        )
+
+    return render_template(
+        "about.html",
+        vuln_sources=vuln_sources,
+        contact=application.config.get("ADMIN_EMAIL", "#"),
+        storage_info=storage_info,
+        is_gna=is_gna,
+        gna_id=gna_id,
+    )
+
+
+@home_bp.route("/about/more", methods=["GET"])
+def about_more() -> str:
+    """About page with more technical information about the running instance."""
+    storage_info = vulnerabilitylookup.get_info()
+    storage_info["db_sizes"].update(get_db_info())
+    version = __version__.split("-")
+    if len(version) == 1:
+        software_version = version[0]
+        version_url = "https://github.com/vulnerability-lookup/vulnerability-lookup/releases/tag/{}".format(
+            version[0]
+        )
+    else:
+        software_version = f"{version[0]} - {version[2][1:]}"
+        version_url = f"https://github.com/vulnerability-lookup/vulnerability-lookup/commits/{version[2][1:]}"
+
+    return render_template(
+        "about_more.html",
+        software_version=software_version,
+        version_url=version_url,
+        local_instance_uuid=get_config("generic", "local_instance_uuid"),
+        registration=[application.config["SELF_REGISTRATION"] and "Open" or "Closed"][
+            0
+        ],
+        moderation=[application.config["COMMENTS_MODERATION"] and "On" or "Off"][0],
+        python_version="{}.{}.{}".format(*sys.version_info[:3]),
+        storage_info=storage_info,
+    )
+
+
+@home_bp.route("/robots.txt", methods=["GET"])
+def robots() -> tuple[str, int, dict[str, str]]:
+    """Robots dot txt page."""
+    return (
+        render_template(
+            "robots.txt", contact=application.config.get("ADMIN_EMAIL", "#")
+        ),
+        200,
+        {"Content-Type": "text/plain"},
+    )
+
+
+@home_bp.route("/humans.txt", methods=["GET"])
+def humans() -> tuple[str, int, dict[str, str]]:
+    """Human dot txt page."""
+    return render_template("humans.txt"), 200, {"Content-Type": "text/plain"}
+
+
+@home_bp.route("/.well-known/security.txt", methods=["GET"])
+def security() -> tuple[str, int, dict[str, str]]:
+    """security dot txt page (RFC 9116)."""
+    return (
+        render_template(
+            "security.txt", contact=application.config.get("ADMIN_EMAIL", "#")
+        ),
+        200,
+        {"Content-Type": "text/plain"},
+    )

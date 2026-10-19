@@ -1,0 +1,7 @@
+Dear admin,
+
+A new comment is awaiting moderation.
+
+{{ platform_url }}/admin/comments
+
+{{ signoff }}

@@ -1,0 +1,61 @@
+
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://vulnerability.circl.lu/static/schemas/CIRCL/Sighting.json",
+  "type": "object",
+  "title": "Sighting format.",
+  "description": "This schema specifies the format of a sighting.",
+  "required": [
+    "uuid",
+    "vulnerability_lookup_origin",
+    "author",
+    "vulnerability",
+    "type",
+    "creation_timestamp"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUIDv4 of the sighting.",
+      "readOnly": true,
+      "options": {"hidden": true}
+    },
+    "vulnerability_lookup_origin": {
+      "type": "string",
+      "pattern": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+      "description": "UUIDv4 of the Vulnerability-Lookup instance.",
+      "default": "1a89b78e-f703-45f3-bb86-59eb712668bd",
+      "readOnly": true,
+      "options": {"hidden": true}
+    },
+    "author": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUIDv4 of the author.",
+      "readOnly": true,
+      "options": {"hidden": true}
+    },
+    "source": {
+      "type": "string",
+      "description": "The source of the sighting (Fediverse status URI, link, tool, etc.)."
+    },
+    "creation_timestamp": {
+      "type": "string",
+      "format": "datetime-local",
+      "description": "When the sighting was created",
+      "options": {"hidden": true}
+    },
+    "type": {
+      "type": "string",
+      "enum": ["seen", "published-proof-of-concept", "exploited", "not-exploited", "confirmed", "not-confirmed", "patched", "not-patched"],
+      "default": "seen",
+      "description": "Type of the sighting."
+    },
+    "vulnerability": {
+      "type": "string",
+      "description": "The vulnerability related to the sighting."
+    }
+  }
+}

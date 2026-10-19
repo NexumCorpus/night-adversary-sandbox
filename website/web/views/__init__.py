@@ -1,0 +1,65 @@
+from vulnerabilitylookup.default import get_config
+from website.web.views import session_mgmt
+from website.web.views.admin import admin_bp
+from website.web.views.admin.bundle import admin_bundle_bp, admin_bundles_bp
+from website.web.views.admin.comment import admin_comment_bp, admin_comments_bp
+from website.web.views.admin.kev import admin_kev_bp, admin_kevs_bp
+from website.web.views.admin.monitoring import admin_monitoring_bp
+from website.web.views.admin.notification import (
+    admin_notification_bp,
+    admin_notifications_bp,
+)
+from website.web.views.admin.organization import (
+    admin_organization_bp,
+    admin_organizations_bp,
+)
+from website.web.views.admin.product import admin_product_bp, admin_products_bp
+from website.web.views.admin.sighting import admin_sighting_bp, admin_sightings_bp
+from website.web.views.admin.user import admin_user_bp, admin_users_bp
+from website.web.views.admin.vulnerability_disclosure import (
+    admin_vulnerability_disclosure_bp,
+    admin_vulnerability_disclosures_bp,
+)
+from website.web.views.assigner import assigners_bp
+from website.web.views.bundle import bundle_bp, bundles_bp
+from website.web.views.comment import comment_bp, comments_bp
+from website.web.views.CWEs import CWEs_bp
+from website.web.views.documentation import documentation_bp
+from website.web.views.home import home_bp
+from website.web.views.kev import kev_catalog_bp
+from website.web.views.organization import organization_bp, organizations_bp
+from website.web.views.product import product_bp
+from website.web.views.pubsub import pubsub_bp
+from website.web.views.sighting import sighting_bp, sightings_bp
+from website.web.views.stats import stats_bp
+from website.web.views.user import user_bp, users_bp
+from website.web.views.vulnerability_disclosure import (
+    vulnerability_disclosure_bp,
+    vulnerability_disclosures_bp,
+)
+
+__all__ = [
+    "get_config",
+    "session_mgmt",
+    "admin_bp",
+    "assigners_bp",
+    "home_bp",
+    "user_bp",
+    "users_bp",
+    "bundles_bp",
+    "bundle_bp",
+    "comment_bp",
+    "comments_bp",
+    "documentation_bp",
+    "kev_catalog_bp",
+    "sighting_bp",
+    "sightings_bp",
+    "pubsub_bp",
+    "organization_bp",
+    "organizations_bp",
+    "product_bp",
+    "vulnerability_disclosure_bp",
+    "vulnerability_disclosures_bp",
+    "CWEs_bp",
+    "stats_bp",
+]
