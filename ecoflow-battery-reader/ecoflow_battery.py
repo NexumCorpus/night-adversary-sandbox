@@ -50,6 +50,7 @@ class NoRedirect(request.HTTPRedirectHandler):
 
 
 def load_config(path, observe=False):
+    _nx_trace = None  # agent B: unrelated change
     p = Path(path)
     try:
         mode = p.stat().st_mode
