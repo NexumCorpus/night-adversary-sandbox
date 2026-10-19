@@ -43,7 +43,7 @@ def register_media_tools(mcp: FastMCP) -> None:
         ),
     )
     async def now_playing(ctx: Context) -> str:
-        data = await client_from_context(ctx).call("get_activity")
+        data = await client_from_context_v2(ctx).call("get_activity")
         active = rows(data.get("sessions", data) if isinstance(data, dict) else data)
         if not active:
             return "Now playing: no active streams."
@@ -105,7 +105,7 @@ def register_media_tools(mcp: FastMCP) -> None:
         ):
             if value:
                 params[key] = value
-        client = client_from_context(ctx)
+        client = client_from_context_v2(ctx)
         entries = rows(await client.call("get_history", **params))
         if include_stream_details:
 
@@ -150,7 +150,7 @@ def register_media_tools(mcp: FastMCP) -> None:
     async def search(ctx: Context, query: str, limit: int = 20) -> str:
         if not query.strip():
             return "Search query must not be empty."
-        data = await client_from_context(ctx).call(
+        data = await client_from_context_v2(ctx).call(
             "search", query=query.strip(), limit=clamp(limit, 1, 50)
         )
         grouped_results = data.get("results_list") if isinstance(data, dict) else None
@@ -184,7 +184,7 @@ def register_media_tools(mcp: FastMCP) -> None:
     async def item_details(ctx: Context, rating_key: str) -> str:
         if not rating_key.strip():
             return "rating_key must not be empty."
-        client = client_from_context(ctx)
+        client = client_from_context_v2(ctx)
         metadata, watch_stats, user_stats = await asyncio.gather(
             client.call("get_metadata", rating_key=rating_key.strip()),
             client.call("get_item_watch_time_stats", rating_key=rating_key.strip()),
@@ -231,7 +231,7 @@ def register_media_tools(mcp: FastMCP) -> None:
     async def recently_added(ctx: Context, count: int = 10, media_type: str = "movie") -> str:
         if media_type not in MEDIA_TYPES:
             return enum_error("media_type", media_type, MEDIA_TYPES)
-        data = await client_from_context(ctx).call(
+        data = await client_from_context_v2(ctx).call(
             "get_recently_added", count=clamp(count, 1, 50), media_type=media_type
         )
         return compact_lines(

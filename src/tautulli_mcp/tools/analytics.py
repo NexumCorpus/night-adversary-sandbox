@@ -120,7 +120,7 @@ def register_analytics_tools(mcp: FastMCP) -> None:
             return enum_error("category", category, TOP_CATEGORIES)
         if stat_type not in STAT_TYPES:
             return enum_error("stat_type", stat_type, STAT_TYPES)
-        data = await client_from_context(ctx).call(
+        data = await client_from_context_v2(ctx).call(
             "get_home_stats",
             stat_id=HOME_STATS_IDS[category],
             stats_type=stat_type,
@@ -140,7 +140,7 @@ def register_analytics_tools(mcp: FastMCP) -> None:
         ),
     )
     async def user_stats(ctx: Context, user: str | None = None) -> str:
-        data = await client_from_context(ctx).call(
+        data = await client_from_context_v2(ctx).call(
             "get_users_table", **({"search": user} if user else {})
         )
         users = [
@@ -170,7 +170,7 @@ def register_analytics_tools(mcp: FastMCP) -> None:
             "hour": ("get_plays_by_hourofday", {"time_range": duration}),
         }
         command, params = commands[group_by]
-        client = client_from_context(ctx)
+        client = client_from_context_v2(ctx)
         data = await client.call(command, **params)
         if group_by == "date":
             streams = await client.call("get_plays_by_stream_type", time_range=duration)
@@ -201,7 +201,7 @@ def register_analytics_tools(mcp: FastMCP) -> None:
     ) -> str:
         if view not in QUALITY_VIEWS:
             return enum_error("view", view, QUALITY_VIEWS)
-        client = client_from_context(ctx)
+        client = client_from_context_v2(ctx)
         duration = clamp(days, 1, 365)
         if view == "stream":
             if not row_id and not session_key:
