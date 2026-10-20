@@ -219,4 +219,14 @@ claims / 30 with a Wilson interval. It is reported, not used to correct the rate
 
 ## Amendments
 
-(none)
+**A1, 2026-10-20, before any collection.** Operational points the text above left open, settled while
+writing `collect.py` and before any census PR was fetched:
+
+1. Any answer other than 200 to the PR fetch in step 2, after retries (404, 410, 451, or 403 for a blocked
+   repository), counts as "gone".
+2. If the check-run or status read in step 5 does not return 200, the PR is skipped and counted as
+   `ci_unreadable` in `scan_log.json`. It is not recorded as CI `none`, because "could not read" is not
+   "no CI".
+3. The per-repository cap in step 4 uses the repository's current full name as the API returns it
+   (repositories can be renamed after AIDev was built). `row_id` keeps AIDev's name.
+4. After a restart, the counts toward the target of 75 are recomputed from `data.csv`.
