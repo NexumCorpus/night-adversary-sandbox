@@ -1,0 +1,1 @@
+row_id,agent,repo,pr_number,pr_url,pr_state,merged,author_type,pr_created_at,pr_closed_at,body_last_edited_at,edit_info,head_sha,head_committed_at,claim_rule,claim_snippet,n_claim_lines,ci,ci_core,n_checks,ci_last_completed_at,claim_aligned,checks_json,frame,collected_at,hand_label,hand_note
